@@ -1,0 +1,40 @@
+echo
+start
+memory total 2000 mb noverify
+charge -1.
+title "conf0-hess hessian calculation"
+
+set int:cando_txs f
+set int:cando_nw f
+
+
+geometry nocenter
+ load "conf0.xyz" 
+
+end
+
+basis "ao basis" spherical
+ * library def2-tzvp
+end
+
+basis "cd basis" spherical bse
+ * library def2-universal-jfit
+end
+
+
+dft
+ noio
+ disp vdw 4
+ mult 1
+ xc r2scan
+ grid lebedev 120 14 nodisk
+ maxiter 100
+ convergence energy 1d-7
+ noprint "final vectors analysis"
+end
+
+freq
+ fd_delta 0.0189
+end
+
+task dft frequencies

@@ -1,0 +1,23 @@
+source leaprc.gaff2
+source leaprc.water.spce
+#loadOff atomic_ions.lib
+loadamberparams N88_h.frcmod
+loadamberparams HAH_h.frcmod
+loadamberparams frcmod.ions1lm_1264_spce
+#loadamberparams frcmod.ions234lm_1264_spce
+loadoff N88_h_ptmpsi.lib
+loadoff HAH_h_ptmpsi.lib
+DES = loadpdb DES_343_686.pdb
+Check DES
+charge DES
+#saveAmberParm M01 R1_h_gas.prmtop R1_h_gas.inpcrd
+#addIons DES Br- 1
+Check DES
+charge DES
+#solvateBox M01 SPC 15
+set DES box {150.0 150.0 150.0}
+saveAmberParm DES DES.prmtop DES.inpcrd
+quit
+
+
+

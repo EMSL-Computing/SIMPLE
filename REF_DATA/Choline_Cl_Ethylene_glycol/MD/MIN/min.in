@@ -1,0 +1,9 @@
+Minimization of the entire molecular system
+&cntrl
+ imin=1,
+ maxcyc=5000,
+ ncyc=2500,
+ ntpr=50,
+&end
+
+

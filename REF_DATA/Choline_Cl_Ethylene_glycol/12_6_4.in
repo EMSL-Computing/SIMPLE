@@ -1,0 +1,6 @@
+setOverwrite True
+add12_6_4 :Br watermodel SPCE polfile lj_1264_pol_augmented.dat
+#polfile /home/kimh310/miniconda3/envs/metal/dat/leap/parm/lj_1264_pol.dat
+#polfile lj_1264_pol_augmented.dat
+outparm  DES_1264.prmtop  DES_1264.inpcrd
+quit

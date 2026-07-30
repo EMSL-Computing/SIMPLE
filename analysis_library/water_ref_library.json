@@ -1,0 +1,272 @@
+{
+  "entries": {
+    "co2_tip3p": {
+      "aggregate": {
+        "n_cases": 8,
+        "qoff": {
+          "bootstrap_ci95": {
+            "high": 6.0,
+            "low": 6.0
+          },
+          "delta_g_kcal_mol": 6.0,
+          "propagated_sem_kcal_mol": 0.0
+        },
+        "quality": "warning",
+        "total": {
+          "bootstrap_ci95": {
+            "high": 10.0,
+            "low": 10.0
+          },
+          "delta_g_kcal_mol": 10.0,
+          "propagated_sem_kcal_mol": 0.0
+        },
+        "vdwoff": {
+          "bootstrap_ci95": {
+            "high": 4.0,
+            "low": 4.0
+          },
+          "delta_g_kcal_mol": 4.0,
+          "propagated_sem_kcal_mol": 0.0
+        }
+      },
+      "contributors": {
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_can_use_libr0\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_can_use_libr0\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.040000000000001,
+              "low": 5.945
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.065,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.045,
+              "low": 3.9450000000000003
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_computes_ddg0\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_computes_ddg0\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.045,
+              "low": 5.95
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.06,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.045,
+              "low": 3.9450000000000003
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_single_case_for_w0\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_single_case_for_w0\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.045,
+              "low": 5.945
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.065,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.040125000000001,
+              "low": 3.949874999999999
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_multiple_water_cases_aggr0\\alt\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_multiple_water_cases_aggr0\\alt\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.040000000000001,
+              "low": 5.945
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.06,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.045,
+              "low": 3.9499999999999997
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_multiple_water_cases_aggr0\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_multiple_water_cases_aggr0\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.040000000000001,
+              "low": 5.949999999999999
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.06,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.040000000000001,
+              "low": 3.945
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_reanalyzing_same_water_ca0\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_reanalyzing_same_water_ca0\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.045,
+              "low": 5.945
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.065,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.045,
+              "low": 3.945
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_run_analysis_wizard_runs_0\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_run_analysis_wizard_runs_0\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.045,
+              "low": 5.95
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.065,
+              "low": 9.934999999999999
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.045,
+              "low": 3.95
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        },
+        "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_run_analysis_wizard_runs_1\\water_ref\\co2_tip3p": {
+          "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_run_analysis_wizard_runs_1\\water_ref\\co2_tip3p",
+          "display_name": "co2_tip3p",
+          "qoff": {
+            "bootstrap_ci95": {
+              "high": 6.045,
+              "low": 5.945
+            },
+            "delta_g_kcal_mol": 6.0,
+            "propagated_sem_kcal_mol": 0.02738612787525837
+          },
+          "quality": "warning",
+          "total": {
+            "bootstrap_ci95": {
+              "high": 10.065000000000001,
+              "low": 9.925
+            },
+            "delta_g_kcal_mol": 10.0,
+            "propagated_sem_kcal_mol": 0.038729833462074224
+          },
+          "vdwoff": {
+            "bootstrap_ci95": {
+              "high": 4.045,
+              "low": 3.9499999999999997
+            },
+            "delta_g_kcal_mol": 4.0,
+            "propagated_sem_kcal_mol": 0.02738612787525832
+          }
+        }
+      },
+      "formal_charge": 2,
+      "key": "co2_tip3p",
+      "metal": "Co",
+      "water_model": "tip3p"
+    }
+  }
+}

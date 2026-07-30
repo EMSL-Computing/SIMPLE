@@ -1,0 +1,95 @@
+echo
+start
+charge -1.
+title "RESP conf0"
+set driver:linopt 0
+set int:cando_txs f
+set int:cando_nw f
+
+memory total 2000 mb noverify
+
+
+geometry nocenter 
+C       1.01800000      -0.09000000       0.03100000
+C       2.53700000      -0.07900000       0.02800000
+C       3.09100000       1.23800000      -0.51700000
+C       4.62000000       1.22700000      -0.51300000
+C       5.19900000       2.53000000      -1.05300000
+C       6.73100000       2.58500000      -1.07600000
+O       7.34200000       1.56600000      -0.65300000
+O       7.20000000       3.67100000      -1.52600000
+H       0.64800000      -1.04200000       0.42500000
+H       0.62300000       0.03400000      -0.98200000
+H       0.62100000       0.71500000       0.65700000
+H       2.90200000      -0.91500000      -0.57900000
+H       2.90000000      -0.23900000       1.05000000
+H       2.72500000       2.07300000       0.09200000
+H       2.72500000       1.39700000      -1.53900000
+H       4.98000000       0.38600000      -1.11800000
+H       4.98000000       1.06100000       0.51000000
+H       4.84300000       3.37100000      -0.44500000
+H       4.84300000       2.69400000      -2.07800000
+
+end
+
+
+
+
+xtb
+ acc 0.1
+end
+
+driver
+ maxiter 900
+end
+
+task xtb optimize ignore
+
+basis "ao basis" spherical
+ * library def2-tzvp
+end
+
+basis "cd basis" spherical bse
+ * library def2-universal-jfit
+end
+
+
+dft
+  noio
+  disp vdw 4
+  xc r2scan
+  grid lebedev 120 14 nodisk
+  mult 1
+  maxiter 100
+  convergence lshift 0.1 energy 1d-7
+  noprint "final vectors analysis"
+end
+
+driver
+ maxiter 60
+end
+
+task dft optimize ignore
+
+
+unset "dft:cd*"
+unset "basis:cd*"
+
+basis "ao basis" spherical
+ * library 6-31g*
+end
+
+dft
+ xc hfexch 1.0
+ vectors input atomic
+end
+
+task dft
+
+
+esp
+ 
+ restrain hfree
+end
+
+task esp

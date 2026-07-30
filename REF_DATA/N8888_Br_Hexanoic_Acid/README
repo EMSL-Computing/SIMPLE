@@ -1,0 +1,2 @@
+tleap -f leap.in
+parmed -p DES.prmtop -c DES.inpcrd -i 12_6_4.in

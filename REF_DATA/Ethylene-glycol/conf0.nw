@@ -1,0 +1,86 @@
+echo
+start
+charge 0.
+title "RESP conf0"
+set driver:linopt 0
+set int:cando_txs f
+set int:cando_nw f
+
+memory total 2000 mb noverify
+
+
+geometry nocenter 
+O       0.98800000      -0.03000000       0.09400000
+C       2.41600000      -0.06800000       0.07400000
+C       2.95700000       1.29800000       0.47900000
+O       2.51900000       1.62000000       1.79700000
+H       0.68000000      -0.92000000      -0.15600000
+H       2.74700000      -0.33100000      -0.93500000
+H       2.74000000      -0.83800000       0.78100000
+H       2.58600000       2.08000000      -0.19200000
+H       4.05000000       1.30500000       0.46600000
+H       1.54900000       1.50300000       1.77700000
+
+end
+
+
+
+
+xtb
+ acc 0.1
+end
+
+driver
+ maxiter 900
+end
+
+task xtb optimize ignore
+
+basis "ao basis" spherical
+ * library def2-tzvp
+end
+
+basis "cd basis" spherical bse
+ * library def2-universal-jfit
+end
+
+
+dft
+  noio
+  disp vdw 4
+  xc r2scan
+  grid lebedev 120 14 nodisk
+  mult 1
+  maxiter 100
+  convergence lshift 0.1 energy 1d-7
+  noprint "final vectors analysis"
+end
+
+driver
+ maxiter 60
+end
+
+task dft optimize ignore
+
+
+unset "dft:cd*"
+unset "basis:cd*"
+
+basis "ao basis" spherical
+ * library 6-31g*
+end
+
+dft
+ xc hfexch 1.0
+ vectors input atomic
+end
+
+task dft
+
+
+esp
+ 
+ restrain hfree
+end
+
+task esp

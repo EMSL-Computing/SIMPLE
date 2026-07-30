@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SIMPLE Web GUI</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/vendor/ngl.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <h1>SIMPLE</h1>
+          <p>Metallophore, metalloprotein, DES, and component-library builder</p>
+        </div>
+        <div class="status">
+          <span id="viewer-status">NGL: checking</span>
+          <span id="status-line">Starting</span>
+        </div>
+      </header>
+
+      <section class="top-controls">
+        <div class="field">
+          <label for="job_name">Job name</label>
+          <input id="job_name" type="text" value="simple_gui">
+        </div>
+        <div class="field">
+          <label for="workflow_type">Workflow</label>
+          <select id="workflow_type"></select>
+        </div>
+        <div class="field mode-field" id="met_mode_wrap">
+          <label for="met_mode">Metallophore mode</label>
+          <select id="met_mode">
+            <option value="resp_input">RESP input generation</option>
+            <option value="existing_resp">Existing RESP -> MD input</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="output_root">Output root</label>
+          <input id="output_root" type="text" value="gui_outputs">
+        </div>
+        <div class="global-actions">
+          <button id="finish">Finish + Build Inputs</button>
+          <button id="quit_app" class="danger">Quit</button>
+        </div>
+      </section>
+
+      <section id="library_workspace" class="library-workspace" hidden>
+        <article class="library-pane library-existing-pane">
+          <div class="section-title">Existing DES Library</div>
+          <div class="infobox small">Use the arrow to show or hide component files. Built-in components are read-only and cannot be removed; user-added components can be edited or removed.</div>
+          <div id="library_components" class="library-list">Loading library components...</div>
+          <div class="actions library-bottom-actions">
+            <button id="library_remove" class="danger" type="button" disabled>Remove Selected</button>
+          </div>
+        </article>
+
+        <div class="library-transfer">
+          <button id="library_add" type="button" title="Add the selected candidate to the DES library" disabled>&larr;</button>
+          <span>Add to library</span>
+        </div>
+
+        <article class="library-pane library-candidate-pane">
+          <div class="section-title">Candidate Directory</div>
+          <div class="infobox small">
+            Choose a folder, or select one Amber library file (<code>.lib</code> or <code>.off</code>) and its matching
+            parameter file (<code>.frcmod</code>). The pair must be in the same folder; nested folders are scanned too.
+          </div>
+          <div class="library-path-row">
+            <input id="library_search_path" type="text" placeholder="Directory containing .lib/.off + .frcmod files">
+            <div class="library-path-actions">
+              <button id="library_browse_directory" type="button">Choose Directory...</button>
+              <button id="library_choose_files" type="button">Choose Files...</button>
+              <button id="library_scan" type="button">Scan Path</button>
+            </div>
+          </div>
+          <input id="library_directory_picker" type="file" webkitdirectory directory multiple hidden>
+          <input id="library_file_picker" type="file" accept=".lib,.off,.frcmod" multiple hidden>
+          <div id="library_candidates" class="library-empty-state">
+            <button id="library_scan_empty" type="button">Choose a Library Directory...</button>
+            <span>No candidate directory has been scanned.</span>
+          </div>
+        </article>
+
+        <article class="library-pane library-editor-pane">
+          <div class="section-title">File Editor</div>
+          <div id="library_editor_name" class="file-note">Select a .lib/.off or .frcmod file to inspect it.</div>
+          <textarea id="library_editor" class="library-editor" spellcheck="false" disabled></textarea>
+          <div class="actions library-bottom-actions">
+            <button id="library_save_file" type="button" disabled>Save File</button>
+          </div>
+        </article>
+      </section>
+
+      <main class="workspace">
+        <section class="controls">
+          <nav class="tabs">
+            <button class="tab active" data-tab="setup">Setup</button>
+            <button class="tab" data-tab="solvation">Solvation</button>
+            <button class="tab" data-tab="md">MD / Slurm</button>
+          </nav>
+
+          <section class="tab-panel active" id="tab-setup">
+            <div id="metallophore_panel" class="workflow-panel">
+              <div class="section-title">Metallophore</div>
+              <div id="met_residue_wrap" class="field short-field">
+                <label for="met_residue">Residue name</label>
+                <input id="met_residue" type="text" value="LIG" maxlength="3">
+              </div>
+
+              <div id="met_input_block">
+                <div class="upload-row">
+                  <input id="met_input_path" type="hidden">
+                  <div class="field">
+                    <label for="met_file">Upload molecule</label>
+                    <input id="met_file" type="file" accept=".pdb,.mol2,.sdf,.sd,.smi,.smiles,.txt">
+                  </div>
+                  <div id="met_file_name" class="file-note">No molecule file selected.</div>
+                </div>
+                <div class="field">
+                  <label for="met_smiles">SMILES text</label>
+                  <input id="met_smiles" type="text" placeholder="Optional: one valid SMILES record">
+                </div>
+              </div>
+
+              <div id="met_resp_block" hidden>
+                <div class="grid2">
+                  <div class="field">
+                    <label for="resp_job_dir">RESP job/result folder</label>
+                    <input id="resp_job_dir" type="text" placeholder=".../resp_jobs/resp_job_001">
+                  </div>
+                  <div class="field">
+                    <label for="resp_search_root">RESP search root</label>
+                    <input id="resp_search_root" type="text" value=".">
+                  </div>
+                </div>
+                <div class="actions">
+                  <button id="scan_resp">Scan RESP Folders</button>
+                </div>
+                <div id="resp_candidates" class="tablebox">No RESP candidates loaded.</div>
+              </div>
+
+              <div class="actions">
+                <button id="load_metallophore">Load Preview</button>
+              </div>
+
+              <div class="section-title">Detected Metals and Donors</div>
+              <div id="metals_box" class="tablebox">Load a metallophore to detect supported 12-6-4 metals.</div>
+              <div id="donor_box" class="tablebox">Donor candidates appear here after loading.</div>
+              <div class="section-title">Add Metal</div>
+              <div class="grid3">
+                <div class="field"><label for="met_insert_element">Metal</label><select id="met_insert_element"></select></div>
+                <div class="field"><label for="met_insert_charge">Charge</label><select id="met_insert_charge"></select></div>
+                <div class="field"><label for="met_insert_cn">Target CN</label><select id="met_insert_cn"></select></div>
+              </div>
+              <div class="actions">
+                <button id="add_met_metal">Add Metal Near Donors</button>
+                <button id="remove_met_inserted_metal">Remove Selected Inserted Metal</button>
+              </div>
+              <div id="resp_group_controls" hidden>
+                <div class="section-title">RESP Symmetry Groups</div>
+                <div class="grid2">
+                  <div class="field"><label for="resp_group_mode">Auto group mode</label><select id="resp_group_mode"></select></div>
+                  <div class="field"><label for="resp_group_graph_method">Graph method</label><select id="resp_group_graph_method"></select></div>
+                </div>
+                <div id="resp_group_note" class="infobox small"></div>
+                <div id="resp_group_box" class="tablebox">Load a metallophore to review RESP symmetry groups.</div>
+              </div>
+            </div>
+
+            <div id="protein_panel" class="workflow-panel" hidden>
+              <div class="section-title">MetalloProtein</div>
+              <div class="protein-input-grid">
+                <div class="input-card">
+                  <strong>Load from Input Path / PDB ID</strong>
+                  <div class="field">
+                    <label for="protein_input">Protein input path or PDB ID</label>
+                    <input id="protein_input" type="text" placeholder="1TCA or /path/protein.pdb">
+                  </div>
+                  <button id="load_protein">Load Protein Preview</button>
+                </div>
+                <div class="or-divider">OR</div>
+                <div class="input-card">
+                  <strong>Use Uploaded File</strong>
+                  <div class="field">
+                    <label for="protein_file">PDB file</label>
+                    <input id="protein_file" type="file" accept=".pdb,.ent,.txt">
+                  </div>
+                  <button id="upload_protein">Use Uploaded File</button>
+                </div>
+              </div>
+              <input id="protein_input_mode" type="hidden" value="path">
+              <input id="protein_path" type="hidden">
+              <input id="protein_pdb_id" type="hidden">
+              <div class="grid3">
+                <label class="check"><input id="remove_waters" type="checkbox" checked> Remove waters</label>
+                <label class="check"><input id="remove_hetero" type="checkbox" checked> Remove non-standard molecules</label>
+                <div class="field"><label for="kept_ligands">Keep hetero tokens</label><input id="kept_ligands" type="text" placeholder="HEM,A:LIG:401"></div>
+              </div>
+              <div class="actions">
+                <button id="protein_metal_all">Select All Metals</button>
+                <button id="protein_metal_clear">Clear Metal Actions</button>
+              </div>
+              <div class="section-title">Metal Handling</div>
+              <div id="protein_metal_box" class="tablebox">Load a protein to review metals. Metals are preserved by default.</div>
+              <div class="section-title">Insert Metal</div>
+              <div class="grid3">
+                <div class="field"><label for="protein_insert_element">Metal</label><select id="protein_insert_element"></select></div>
+                <div class="field"><label for="protein_insert_charge">Charge</label><select id="protein_insert_charge"></select></div>
+                <div class="field"><label for="protein_insert_cn">Target CN</label><select id="protein_insert_cn"></select></div>
+              </div>
+              <div class="actions">
+                <button id="protein_use_selected_residues">Use Selected Residues</button>
+                <button id="protein_preview_insert_metal">Preview Inserted Metal</button>
+                <button id="protein_clear_insertions">Clear Insertions</button>
+              </div>
+              <div id="protein_insert_donor_box" class="tablebox">Select residue rows, then load donor candidates.</div>
+              <div id="protein_insert_box" class="infobox small">No inserted metals planned.</div>
+              <div class="section-title">PropKa and Metal Coordination</div>
+              <div class="field short-field"><label for="protein_ph">pH</label><input id="protein_ph" type="number" step="0.1" value="7.0"></div>
+              <div id="propka_state" class="infobox small">Current PropKa choice: run PropKa to review selectable residue-state changes.</div>
+              <div class="actions">
+                <button id="run_propka">Run PropKa</button>
+                <button id="propka_all">Check All PropKa</button>
+                <button id="propka_none">Uncheck All PropKa</button>
+              </div>
+              <div id="propka_box" class="tablebox">Run PropKa to review selectable residue-state changes.</div>
+              <div class="section-title">Disulfide Bonds</div>
+              <div id="disulfide_state" class="infobox small">Load a protein preview to detect CYS-CYS candidate pairs.</div>
+              <div id="disulfide_box" class="tablebox">No CYS-CYS candidates loaded.</div>
+              <div class="actions">
+                <button id="disulfide_all">Check All Disulfides</button>
+                <button id="disulfide_none">Uncheck All Disulfides</button>
+              </div>
+            </div>
+
+            <div id="des_panel" class="workflow-panel" hidden>
+              <div class="section-title">Deep Eutectic</div>
+              <div class="infobox small">Random mix is the fast built-in rigid-body packer. Packmol is slower but performs a more thorough packing optimization.</div>
+              <div id="des_recommended" class="actions"></div>
+              <div id="des_components" class="tablebox always"></div>
+              <div class="grid3">
+                <div class="field"><label for="des_build_mode">Initial packing</label><select id="des_build_mode"><option value="random_mix" selected>Random mix (fast)</option><option value="packmol">Packmol (thorough)</option></select></div>
+                <div class="field"><label for="des_size_mode">Size mode</label><select id="des_size_mode"><option value="ratio_units">Ratio units</option><option value="box_length">Box length</option></select></div>
+                <div class="field"><label for="des_ratio_units">Ratio units</label><input id="des_ratio_units" type="number" step="1" value="100"></div>
+                <div class="field"><label for="des_box_length">Box length A</label><input id="des_box_length" type="number" step="1" value="80"></div>
+                <div class="field"><label for="des_target_density">Initial density g/mL</label><input id="des_target_density" type="number" min="0.1" max="2.5" step="0.05" value="0.40"></div>
+                <div class="field"><label for="des_packmol_tolerance">Packmol tolerance A</label><input id="des_packmol_tolerance" type="number" step="0.1" value="2.0"></div>
+                <div class="field"><label for="des_spacing">Random-mix minimum distance A</label><input id="des_spacing" type="number" min="1.2" step="0.1" value="1.3"></div>
+                <div class="field"><label for="des_c4_parameter_set">12-6-4 set</label><select id="des_c4_parameter_set"><option value="opc_duvail">OPC + Duvail</option><option value="spce_limerz">SPCE + Li/Merz</option></select></div>
+                <label class="check"><input id="des_apply_1264" type="checkbox" checked> Apply 12-6-4 to supported metals and monatomic ions</label>
+                <label class="check"><input id="des_mixing_enabled" type="checkbox" checked> Add 500 K / 50 ns mixing step</label>
+              </div>
+              <div class="section-title">Central Metal</div>
+              <div class="grid3">
+                <label class="check"><input id="des_central_metal" type="checkbox"> Place supported metal at box center</label>
+                <div class="field"><label for="des_metal_element">Metal</label><select id="des_metal_element"></select></div>
+                <div class="field"><label for="des_metal_charge">Charge</label><select id="des_metal_charge"></select></div>
+              </div>
+              <div class="section-title">Additional DES Metals</div>
+              <div class="field short-field">
+                <label for="des_metal_spacing">Minimum metal-metal spacing A</label>
+                <input id="des_metal_spacing" type="number" min="2" step="0.5" value="8.0">
+              </div>
+              <div id="des_metal_sites" class="tablebox always"></div>
+              <div class="actions">
+                <button id="add_des_metal_site" type="button">Add Metal Group</button>
+              </div>
+              <div class="actions">
+                <button id="build_des_preview">Build DES Preview</button>
+              </div>
+              <div id="des_plan_box" class="infobox small"></div>
+            </div>
+            <div id="metal_1264_section">
+              <div class="section-title">Metal 12-6-4</div>
+              <label class="check"><input id="apply_1264_metals" type="checkbox" checked> Apply 12-6-4 parameters to selected supported metal sites</label>
+              <div class="field">
+                <label for="system_c4_parameter_set">12-6-4 parameter set</label>
+                <select id="system_c4_parameter_set"></select>
+              </div>
+              <div id="system_c4_note" class="infobox small">OPC + Duvail is the default for metal MD setup.</div>
+              <div id="system_metal_charges" class="tablebox">Detected metal sites appear here after preview loading.</div>
+              <div id="metallophore_geometry_actions" class="actions post-table-actions">
+                <button id="quick_min">Quick Minimize Donor Geometry</button>
+                <button id="restore_met">Restore Initial Geometry</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="tab-solvation">
+            <div class="section-title">Force Fields and Solvation</div>
+            <div class="grid3">
+              <div class="field"><label for="protein_ff">Protein FF</label><select id="protein_ff"></select></div>
+              <div class="field"><label for="ligand_ff">Ligand FF</label><select id="ligand_ff"></select></div>
+              <div class="field"><label for="water_model">Water model</label><select id="water_model"></select></div>
+              <div class="field"><label for="box_shape">Box shape</label><select id="box_shape"></select></div>
+              <div class="field"><label for="buffer_angstrom">Buffer A</label><input id="buffer_angstrom" type="number" step="0.5" value="10"></div>
+              <div class="field"><label for="salt_mode">Salt mode</label><select id="salt_mode"></select></div>
+              <div class="field" id="neutralization_ion_wrap">
+                <label for="neutralization_ion">Neutralizing counter-ion</label>
+                <select id="neutralization_ion">
+                  <option value="auto" selected>Auto (DES-native)</option>
+                  <option value="salt_default">Use selected salt pair</option>
+                  <option value="Br-">Br-</option>
+                  <option value="Cl-">Cl-</option>
+                  <option value="Na+">Na+</option>
+                  <option value="K+">K+</option>
+                </select>
+              </div>
+              <div class="field" id="salt_kind_wrap" hidden><label for="salt_kind">Salt pair</label><select id="salt_kind"></select></div>
+              <div class="field" id="salt_amount_wrap" hidden>
+                <label id="salt_amount_label" for="salt_amount">Salt amount</label>
+                <div class="inline-input">
+                  <input id="salt_amount" type="number" step="0.01" value="0">
+                  <select id="salt_unit"><option value="M">M</option><option value="mM">mM</option></select>
+                </div>
+              </div>
+            </div>
+            <div id="system_c4_water_warning" class="infobox small warn-box" role="alert" hidden></div>
+            <div id="des_neutralization_note" class="infobox small" hidden>
+              For DES systems, neutralizing and bulk-salt ions are inserted as explicit mixture components before
+              topology generation. Auto uses Br- for [N8888][Br], Cl- for choline chloride, and the selected salt
+              cation for a negatively charged box.
+            </div>
+            <div class="actions">
+              <button id="preview_solvation">Preview Solvation Box</button>
+            </div>
+            <div class="infobox small">Solvation preview is illustrative: the box and ion positions are drawn to help interpret the setup. The exact LEaP solvation box dimensions and ion coordinates may differ, and water molecules are omitted from this preview.</div>
+            <div id="ion_legend" class="infobox small ion-legend">Ion colors appear here after previewing a salted box.</div>
+          </section>
+
+          <section class="tab-panel" id="tab-md">
+            <div class="section-title">MD Protocol</div>
+            <div class="grid3">
+              <div class="field"><label for="md_protocol">Protocol</label><select id="md_protocol"></select></div>
+              <div class="field"><label for="temperature">Temperature K</label><input id="temperature" type="number" step="1" value="300"></div>
+              <div class="field"><label for="pressure">Pressure bar</label><input id="pressure" type="number" step="0.1" value="1"></div>
+              <div class="field"><label for="production_ns">Production ns</label><input id="production_ns" type="number" step="1" value="10"></div>
+            </div>
+            <div id="protocol_summary" class="infobox protocol-box"></div>
+            <div class="section-title">Stage Customization</div>
+            <div id="md_stage_editors" class="stage-list"></div>
+
+            <div class="section-title">Focused Restraint</div>
+            <label class="check"><input id="focused_enabled" type="checkbox"> Enable focused restraint</label>
+            <div id="focused_fields" hidden>
+              <div class="infobox small">Use an AMBER mask such as <code>(:101,102) & !@H=</code>. The weight is a kcal/mol/A^2 harmonic restraint.</div>
+              <div class="grid2">
+              <div class="field"><label for="focused_mask">Mask</label><input id="focused_mask" type="text" placeholder="(:101,102) & !@H="></div>
+              <div class="field"><label for="focused_weight">Weight</label><input id="focused_weight" type="number" step="0.1" value="5.0"></div>
+              </div>
+            </div>
+
+            <div class="section-title">Slurm</div>
+            <div class="grid3">
+              <div class="field"><label for="slurm_profile">Profile</label><select id="slurm_profile"></select></div>
+              <div class="field"><label for="slurm_ntasks">CPU tasks</label><input id="slurm_ntasks" type="number" step="1" value="8"></div>
+              <div class="field"><label for="slurm_gpus">GPUs</label><input id="slurm_gpus" type="number" step="1" value="1"></div>
+              <div class="field"><label for="slurm_walltime">Walltime</label><input id="slurm_walltime" type="text" value="24:00:00"></div>
+            </div>
+            <input id="slurm_binary" type="hidden">
+            <div id="finish_note" class="infobox small"></div>
+          </section>
+        </section>
+
+        <section class="viewer-panel">
+          <div id="warning-panel" class="warning-panel"></div>
+          <div class="viewer-main">
+            <div class="viewer-frame">
+              <div id="viewer" tabindex="0"></div>
+              <div id="viewer-overlay" class="viewer-overlay">Load a system preview.</div>
+              <div id="axis-overlay" class="axis-overlay" aria-hidden="true">
+                <svg viewBox="0 0 72 72" role="img" focusable="false">
+                  <line class="axis-line axis-line-x" x1="36" y1="36" x2="52" y2="36"></line>
+                  <line class="axis-line axis-line-y" x1="36" y1="36" x2="36" y2="20"></line>
+                  <line class="axis-line axis-line-z" x1="36" y1="36" x2="48" y2="24"></line>
+                  <circle class="axis-origin" cx="36" cy="36" r="2.6"></circle>
+                  <text class="axis-label axis-label-x" x="56" y="39">X</text>
+                  <text class="axis-label axis-label-y" x="33" y="16">Y</text>
+                  <text class="axis-label axis-label-z" x="51" y="23">Z</text>
+                </svg>
+              </div>
+              <div class="camera-strip" aria-label="Camera controls">
+                <button data-camera="x">X</button>
+                <button data-camera="y">Y</button>
+                <button data-camera="z">Z</button>
+                <button data-camera="reset">=</button>
+              </div>
+            </div>
+            <aside id="met_resp_options" class="side-card" hidden>
+              <div class="section-title">RESP / Ligand</div>
+              <div class="field"><label for="charge_method">Charge fitting</label><select id="charge_method"></select></div>
+              <div id="am1bcc_notice" class="infobox small warn-box" hidden>AM1-BCC uses AmberTools/Antechamber directly during dry-run; it does not write or run an NWChem RESP input.</div>
+
+              <div id="resp_qm_blocks">
+                <div class="section-title">Geometry Optimization</div>
+                <div class="grid1">
+                  <div class="field"><label for="qm_geometry">Mode</label><select id="qm_geometry"></select></div>
+                  <div class="field nwchem-only"><label for="qm_functional">Method</label><select id="qm_functional"></select></div>
+                  <div class="field nwchem-only"><label for="qm_basis">Basis set</label><select id="qm_basis"></select></div>
+                </div>
+
+                <div class="section-title">RESP Fitting</div>
+                <label class="check nwchem-only"><input id="qm_resp_same" type="checkbox"> Use same method and basis as geometry</label>
+                <div class="grid1">
+                  <div class="field nwchem-only"><label for="qm_resp_functional">Method</label><select id="qm_resp_functional"></select></div>
+                  <div class="field nwchem-only"><label for="qm_resp_basis">Basis set</label><select id="qm_resp_basis"></select></div>
+                </div>
+
+                <div class="section-title">Job Settings</div>
+                <div class="grid2 compact-grid">
+                  <div class="field nwchem-only"><label for="qm_grid">Grid</label><select id="qm_grid"></select></div>
+                  <div class="field nwchem-only"><label for="qm_memory">Memory MB</label><input id="qm_memory" type="number" step="100" value="2000"></div>
+                  <div class="field nwchem-only"><label for="qm_maxiter">Max iter</label><input id="qm_maxiter" type="number" step="10" value="200"></div>
+                  <div class="field"><label for="net_charge">Net charge</label><input id="net_charge" type="number" step="1" value="0"></div>
+                  <div class="field"><label for="multiplicity" title="Spin multiplicity for NWChem. Fe/Cu oxidation and spin states can affect RESP/DFT; MO occupation is not set automatically.">Multiplicity</label><input id="multiplicity" type="number" step="1" value="1" title="Spin multiplicity for NWChem. Fe/Cu oxidation and spin states can affect RESP/DFT; MO occupation is not set automatically."></div>
+                </div>
+                <div id="resp_charge_hint" class="infobox small">For RESP fitting, use a net charge consistent with the atoms included in the RESP input.</div>
+              </div>
+              <div class="actions">
+                <button id="build_resp_assets">Build RESP Assets</button>
+                <button id="export_met_pdb">Export PDB Only</button>
+              </div>
+            </aside>
+            <aside id="protein_residue_options" class="side-card residue-side-card" hidden>
+              <div class="section-title">Residues</div>
+              <div id="protein_residue_summary" class="infobox small">Load a protein preview to populate residue selection.</div>
+              <div id="residue_info_box" class="tablebox always residue-table">Load a protein preview to list residues.</div>
+            </aside>
+          </div>
+            <aside class="viewer-tools">
+              <div class="section-title">Viewer</div>
+            <label id="show_cartoon_wrap" class="check"><input id="show_cartoon" type="checkbox" checked> Protein cartoon</label>
+            <label id="show_labels_wrap" class="check" hidden><input id="show_labels" type="checkbox"> Label</label>
+            <label class="check"><input id="show_lines" type="checkbox"> Line</label>
+            <label class="check"><input id="show_sticks" type="checkbox" checked> Sticks</label>
+            <label class="check"><input id="show_spacefill" type="checkbox"> Spacefill (VDW)</label>
+            <div id="viewer_info" class="infobox small"></div>
+          </aside>
+        </section>
+      </main>
+
+      <dialog id="library_dialog" class="library-dialog">
+        <form method="dialog">
+          <h2 id="library_dialog_title">Library warning</h2>
+          <p id="library_dialog_message"></p>
+          <div id="library_dialog_fields" class="grid2">
+            <div class="field"><label for="library_component_key">Component key</label><input id="library_component_key" type="text"></div>
+            <div class="field"><label for="library_component_label">Display label</label><input id="library_component_label" type="text"></div>
+          </div>
+          <div id="library_dialog_actions" class="actions"></div>
+        </form>
+      </dialog>
+    </div>
+
+    <dialog id="missing_loop_dialog">
+      <form method="dialog" class="dialog-card">
+        <h2>Missing Loops Detected</h2>
+        <p id="missing_loop_message"></p>
+        <div id="missing_loop_summary" class="infobox small"></div>
+        <div class="actions">
+          <button id="missing_loop_repair" value="repair">Repair loops</button>
+          <button id="missing_loop_skip" value="skip">Load without repair</button>
+          <button value="cancel">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+source leaprc.gaff2
+N88 = loadmol2 N88_h.mol2
+check N88
+loadamberparams N88_h.frcmod
+saveoff N88 N88_h.lib
+saveamberparm N88 N88_h.prmtop N88_h.rst
+quit

@@ -1,0 +1,164 @@
+{
+  "cases": {
+    "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_can_use_libr0\\protein_xxx_ti": {
+      "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_can_use_libr0\\protein_xxx_ti",
+      "corrected_total": {
+        "bootstrap_ci95": {
+          "high": 6.3100000000000005,
+          "low": 6.17
+        },
+        "delta_g_kcal_mol": 6.25,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "description": "site 1 (Co at :CO:126)",
+      "display_name": "protein_xxx_ti",
+      "qoff": {
+        "bootstrap_ci95": {
+          "high": 2.045,
+          "low": 1.9449999999999998
+        },
+        "delta_g_kcal_mol": 2.0,
+        "propagated_sem_kcal_mol": 0.027386127875258313
+      },
+      "quality": "ok",
+      "restraint_correction_kcal_mol": 1.25,
+      "snapshot_source": "last",
+      "total": {
+        "bootstrap_ci95": {
+          "high": 5.0600000000000005,
+          "low": 4.92
+        },
+        "delta_g_kcal_mol": 5.0,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "vdwoff": {
+        "bootstrap_ci95": {
+          "high": 3.045,
+          "low": 2.945
+        },
+        "delta_g_kcal_mol": 3.0,
+        "propagated_sem_kcal_mol": 0.0273861278752583
+      }
+    },
+    "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_computes_ddg0\\protein_xxx_ti": {
+      "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_rbfe_computes_ddg0\\protein_xxx_ti",
+      "corrected_total": {
+        "bootstrap_ci95": {
+          "high": 6.3100000000000005,
+          "low": 6.18
+        },
+        "delta_g_kcal_mol": 6.25,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "description": "site 1 (Co at :CO:126)",
+      "display_name": "protein_xxx_ti",
+      "qoff": {
+        "bootstrap_ci95": {
+          "high": 2.045,
+          "low": 1.944875
+        },
+        "delta_g_kcal_mol": 2.0,
+        "propagated_sem_kcal_mol": 0.027386127875258313
+      },
+      "quality": "ok",
+      "restraint_correction_kcal_mol": 1.25,
+      "snapshot_source": "last",
+      "total": {
+        "bootstrap_ci95": {
+          "high": 5.0600000000000005,
+          "low": 4.93
+        },
+        "delta_g_kcal_mol": 5.0,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "vdwoff": {
+        "bootstrap_ci95": {
+          "high": 3.045,
+          "low": 2.9499999999999997
+        },
+        "delta_g_kcal_mol": 3.0,
+        "propagated_sem_kcal_mol": 0.0273861278752583
+      }
+    },
+    "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_single_case_for_b0\\protein_xxx_ti": {
+      "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_analyze_single_case_for_b0\\protein_xxx_ti",
+      "corrected_total": {
+        "bootstrap_ci95": {
+          "high": 6.3149999999999995,
+          "low": 6.175
+        },
+        "delta_g_kcal_mol": 6.25,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "description": "site 1 (Co at :CO:126)",
+      "display_name": "protein_xxx_ti",
+      "qoff": {
+        "bootstrap_ci95": {
+          "high": 2.045,
+          "low": 1.95
+        },
+        "delta_g_kcal_mol": 2.0,
+        "propagated_sem_kcal_mol": 0.027386127875258313
+      },
+      "quality": "ok",
+      "restraint_correction_kcal_mol": 1.25,
+      "snapshot_source": "last",
+      "total": {
+        "bootstrap_ci95": {
+          "high": 5.0649999999999995,
+          "low": 4.925
+        },
+        "delta_g_kcal_mol": 5.0,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "vdwoff": {
+        "bootstrap_ci95": {
+          "high": 3.045,
+          "low": 2.945
+        },
+        "delta_g_kcal_mol": 3.0,
+        "propagated_sem_kcal_mol": 0.0273861278752583
+      }
+    },
+    "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_run_analysis_wizard_runs_1\\protein_xxx_ti": {
+      "case_root": "C:\\Users\\kimh310\\AppData\\Local\\Temp\\pytest-of-kimh310\\pytest-96\\test_run_analysis_wizard_runs_1\\protein_xxx_ti",
+      "corrected_total": {
+        "bootstrap_ci95": {
+          "high": 6.3149999999999995,
+          "low": 6.175
+        },
+        "delta_g_kcal_mol": 6.25,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "description": "site 1 (Co at :CO:126)",
+      "display_name": "protein_xxx_ti",
+      "qoff": {
+        "bootstrap_ci95": {
+          "high": 2.04,
+          "low": 1.9449999999999998
+        },
+        "delta_g_kcal_mol": 2.0,
+        "propagated_sem_kcal_mol": 0.027386127875258313
+      },
+      "quality": "ok",
+      "restraint_correction_kcal_mol": 1.25,
+      "snapshot_source": "last",
+      "total": {
+        "bootstrap_ci95": {
+          "high": 5.0649999999999995,
+          "low": 4.925
+        },
+        "delta_g_kcal_mol": 5.0,
+        "propagated_sem_kcal_mol": 0.03872983346207417
+      },
+      "vdwoff": {
+        "bootstrap_ci95": {
+          "high": 3.04,
+          "low": 2.9499999999999997
+        },
+        "delta_g_kcal_mol": 3.0,
+        "propagated_sem_kcal_mol": 0.0273861278752583
+      }
+    }
+  }
+}

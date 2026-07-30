@@ -1,0 +1,93 @@
+!!index array str
+ "ACN"
+!entry.ACN.unit.atoms table  str name  str type  int typex  int resx  int flags  int seq  int elmnt  dbl chg
+ "C" "c" 0 1 131072 1 6 0.616020
+ "O" "o" 0 1 131072 2 8 -0.560440
+ "C1" "c3" 0 1 131072 3 6 -0.165000
+ "C2" "c3" 0 1 131072 4 6 -0.165000
+ "H" "hc" 0 1 131072 5 1 0.045890
+ "H1" "hc" 0 1 131072 6 1 0.045890
+ "H2" "hc" 0 1 131072 7 1 0.045890
+ "H3" "hc" 0 1 131072 8 1 0.045590
+ "H4" "hc" 0 1 131072 9 1 0.045590
+ "H5" "hc" 0 1 131072 10 1 0.045590
+!entry.ACN.unit.atomspertinfo table  str pname  str ptype  int ptypex  int pelmnt  dbl pchg
+ "C" "c" 0 -1 0.0
+ "O" "o" 0 -1 0.0
+ "C1" "c3" 0 -1 0.0
+ "C2" "c3" 0 -1 0.0
+ "H" "hc" 0 -1 0.0
+ "H1" "hc" 0 -1 0.0
+ "H2" "hc" 0 -1 0.0
+ "H3" "hc" 0 -1 0.0
+ "H4" "hc" 0 -1 0.0
+ "H5" "hc" 0 -1 0.0
+!entry.ACN.unit.boundbox array dbl
+ -1.000000
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+!entry.ACN.unit.childsequence single int
+ 2
+!entry.ACN.unit.connect array int
+ 0
+ 0
+!entry.ACN.unit.connectivity table  int atom1x  int atom2x  int flags
+ 1 2 2
+ 1 3 1
+ 1 4 1
+ 3 5 1
+ 3 6 1
+ 3 7 1
+ 4 8 1
+ 4 9 1
+ 4 10 1
+!entry.ACN.unit.hierarchy table  str abovetype  int abovex  str belowtype  int belowx
+ "U" 0 "R" 1
+ "R" 1 "A" 1
+ "R" 1 "A" 2
+ "R" 1 "A" 3
+ "R" 1 "A" 4
+ "R" 1 "A" 5
+ "R" 1 "A" 6
+ "R" 1 "A" 7
+ "R" 1 "A" 8
+ "R" 1 "A" 9
+ "R" 1 "A" 10
+!entry.ACN.unit.name single str
+ "ACN"
+!entry.ACN.unit.positions table  dbl x  dbl y  dbl z
+ 0.0 -0.076000 0.002000
+ 0.0 -1.284000 0.0
+ 1.305000 0.677000 0.0
+ -1.305000 0.677000 0.0
+ 1.617000 0.860000 -1.028000
+ 1.176000 1.629000 0.515000
+ 2.066000 0.087000 0.511000
+ -1.622000 0.857000 1.027000
+ -1.173000 1.630000 -0.512000
+ -2.063000 0.089000 -0.517000
+!entry.ACN.unit.residueconnect table  int c1x  int c2x  int c3x  int c4x  int c5x  int c6x
+ 0 0 0 0 0 0
+!entry.ACN.unit.residues table  str name  int seq  int childseq  int startatomx  str restype  int imagingx
+ "ACN" 1 11 1 "?" 0
+!entry.ACN.unit.residuesPdbSequenceNumber array int
+ 0
+!entry.ACN.unit.solventcap array dbl
+ -1.000000
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+!entry.ACN.unit.velocities table  dbl x  dbl y  dbl z
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0

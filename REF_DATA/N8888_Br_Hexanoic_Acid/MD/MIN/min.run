@@ -1,0 +1,1 @@
+sander -O -i min.in -p DES_1264.prmtop -c DES_1264.inpcrd -r DES_1264.rst -o log.out

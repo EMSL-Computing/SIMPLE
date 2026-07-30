@@ -1,0 +1,87 @@
+!!index array str
+ "ETO"
+!entry.ETO.unit.atoms table  str name  str type  int typex  int resx  int flags  int seq  int elmnt  dbl chg
+ "C" "c3" 0 1 131072 1 6 0.433750
+ "H" "h1" 0 1 131072 2 1 -0.065870
+ "H1" "h1" 0 1 131072 3 1 -0.065870
+ "O" "oh" 0 1 131072 4 8 -0.673220
+ "H2" "ho" 0 1 131072 5 1 0.386420
+ "C1" "c3" 0 1 131072 6 6 -0.066480
+ "H3" "hc" 0 1 131072 7 1 0.017090
+ "H4" "hc" 0 1 131072 8 1 0.017090
+ "H5" "hc" 0 1 131072 9 1 0.017090
+!entry.ETO.unit.atomspertinfo table  str pname  str ptype  int ptypex  int pelmnt  dbl pchg
+ "C" "c3" 0 -1 0.0
+ "H" "h1" 0 -1 0.0
+ "H1" "h1" 0 -1 0.0
+ "O" "oh" 0 -1 0.0
+ "H2" "ho" 0 -1 0.0
+ "C1" "c3" 0 -1 0.0
+ "H3" "hc" 0 -1 0.0
+ "H4" "hc" 0 -1 0.0
+ "H5" "hc" 0 -1 0.0
+!entry.ETO.unit.boundbox array dbl
+ -1.000000
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+!entry.ETO.unit.childsequence single int
+ 2
+!entry.ETO.unit.connect array int
+ 0
+ 0
+!entry.ETO.unit.connectivity table  int atom1x  int atom2x  int flags
+ 1 2 1
+ 1 3 1
+ 1 4 1
+ 1 6 1
+ 4 5 1
+ 6 7 1
+ 6 8 1
+ 6 9 1
+!entry.ETO.unit.hierarchy table  str abovetype  int abovex  str belowtype  int belowx
+ "U" 0 "R" 1
+ "R" 1 "A" 1
+ "R" 1 "A" 2
+ "R" 1 "A" 3
+ "R" 1 "A" 4
+ "R" 1 "A" 5
+ "R" 1 "A" 6
+ "R" 1 "A" 7
+ "R" 1 "A" 8
+ "R" 1 "A" 9
+!entry.ETO.unit.name single str
+ "ETO"
+!entry.ETO.unit.positions table  dbl x  dbl y  dbl z
+ 0.445000 -2.202000 -5.280000
+ 1.032000 -1.394000 -5.234000
+ -0.151000 -2.228000 -4.477000
+ 1.295000 -3.437000 -5.310000
+ 1.850000 -3.479000 -4.479000
+ -0.394000 -2.141000 -6.522000
+ -0.979000 -2.951000 -6.569000
+ -0.962000 -1.319000 -6.501000
+ 0.202000 -2.114000 -7.325000
+!entry.ETO.unit.residueconnect table  int c1x  int c2x  int c3x  int c4x  int c5x  int c6x
+ 0 0 0 0 0 0
+!entry.ETO.unit.residues table  str name  int seq  int childseq  int startatomx  str restype  int imagingx
+ "ETO" 1 10 1 "?" 0
+!entry.ETO.unit.residuesPdbSequenceNumber array int
+ 0
+!entry.ETO.unit.solventcap array dbl
+ -1.000000
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+!entry.ETO.unit.velocities table  dbl x  dbl y  dbl z
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0

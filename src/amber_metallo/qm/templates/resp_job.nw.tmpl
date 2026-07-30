@@ -1,0 +1,24 @@
+start {title}
+
+title "{title}"
+memory total {memory_mb} mb noverify
+
+set int:cando_txs f
+set int:cando_nw f
+set driver:linopt 0
+
+geometry nocenter
+{geometry_block}
+end
+
+charge {net_charge}
+
+{optimization_step_block}
+
+{resp_reference_block}
+
+esp
+ restrain hfree
+end
+
+task esp

@@ -1,0 +1,27 @@
+Test MD run
+&cntrl
+ imin=0,           ! Perform MD
+ nstlim=50000      ! Number of MD steps
+ ntx=1,            ! Positions and velocities read formatted
+ irest=0,          ! Restart calculation (no)
+ ntc=2,            ! SHAKE on for bonds with hydrogen
+ dt=0.002,         ! Timestep (ps)
+ ntb=2,            ! Constant Pressure
+ ntp=1,            ! Isotropic pressure scaling
+ barostat=1        ! Berendsen
+ taup=0.5          ! Pressure relaxtion time (ps)
+ ntf=2,            ! No force evaluation for bonds with hydrogen
+ ntt=3,            ! Langevin thermostat
+ gamma_ln=2.0      ! Collision Frequency for thermostat
+ ig=-1,            ! Random seed for thermostat
+ temp0=298.15      ! Simulation temperature (K)
+ ntwx= 2500,       ! Write to trajectory file every ntwx steps
+ ntpr= 2500,       ! Print to mdout every ntpr steps
+ ntwr= 5000,      ! Write a restart file every ntwr steps
+ cut=  8.0,        ! Nonbonded cutoff in Angstroms
+ ntxo=1,           ! Write coordinate file in ASCII format
+ ioutfm=0,         ! Write trajectory file in ASCII format
+ iwrap=1,          ! iwrap is turned on
+&end
+
+

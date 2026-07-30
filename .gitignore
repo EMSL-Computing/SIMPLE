@@ -1,0 +1,58 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+
+# Build / packaging outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs and runtime dumps
+*.log
+*.out
+*.err
+
+# Local agent / workspace helper folders
+.agent/
+.agents/
+
+# Temporary folders and files
+tmp/
+tmp_plan-fetch/
+*.tmp
+*.temp
+
+# User-requested exclusions
+tests/
+
+# IDE/editor metadata
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini

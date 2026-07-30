@@ -1,0 +1,69 @@
+!!index array str
+ "MEO"
+!entry.MEO.unit.atoms table  str name  str type  int typex  int resx  int flags  int seq  int elmnt  dbl chg
+ "C" "c3" 0 1 131072 1 6 0.258200
+ "H" "h1" 0 1 131072 2 1 -0.002190
+ "H1" "h1" 0 1 131072 3 1 -0.002190
+ "H2" "h1" 0 1 131072 4 1 -0.002190
+ "O" "oh" 0 1 131072 5 8 -0.629100
+ "H3" "ho" 0 1 131072 6 1 0.377480
+!entry.MEO.unit.atomspertinfo table  str pname  str ptype  int ptypex  int pelmnt  dbl pchg
+ "C" "c3" 0 -1 0.0
+ "H" "h1" 0 -1 0.0
+ "H1" "h1" 0 -1 0.0
+ "H2" "h1" 0 -1 0.0
+ "O" "oh" 0 -1 0.0
+ "H3" "ho" 0 -1 0.0
+!entry.MEO.unit.boundbox array dbl
+ -1.000000
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+!entry.MEO.unit.childsequence single int
+ 2
+!entry.MEO.unit.connect array int
+ 0
+ 0
+!entry.MEO.unit.connectivity table  int atom1x  int atom2x  int flags
+ 1 2 1
+ 1 3 1
+ 1 4 1
+ 1 5 1
+ 5 6 1
+!entry.MEO.unit.hierarchy table  str abovetype  int abovex  str belowtype  int belowx
+ "U" 0 "R" 1
+ "R" 1 "A" 1
+ "R" 1 "A" 2
+ "R" 1 "A" 3
+ "R" 1 "A" 4
+ "R" 1 "A" 5
+ "R" 1 "A" 6
+!entry.MEO.unit.name single str
+ "MEO"
+!entry.MEO.unit.positions table  dbl x  dbl y  dbl z
+ -0.361000 -2.180000 -6.288000
+ -0.878000 -3.029000 -6.400000
+ -0.996000 -1.413000 -6.194000
+ 0.210000 -2.243000 -5.469000
+ 0.510000 -1.963000 -7.490000
+ 1.146000 -2.730000 -7.584000
+!entry.MEO.unit.residueconnect table  int c1x  int c2x  int c3x  int c4x  int c5x  int c6x
+ 0 0 0 0 0 0
+!entry.MEO.unit.residues table  str name  int seq  int childseq  int startatomx  str restype  int imagingx
+ "MEO" 1 7 1 "?" 0
+!entry.MEO.unit.residuesPdbSequenceNumber array int
+ 0
+!entry.MEO.unit.solventcap array dbl
+ -1.000000
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+!entry.MEO.unit.velocities table  dbl x  dbl y  dbl z
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
+ 0.0 0.0 0.0
