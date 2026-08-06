@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import typer
@@ -33,7 +34,7 @@ def _analysis_mode_choices() -> list[WizardChoice]:
         WizardChoice(
             "rbfe",
             "RBFE calculation",
-            "Select one completed bound case and one completed water-reference case, then compute ddG.",
+            "Select one or more completed bound cases and choose a water-reference case for each, then compute ddG.",
         ),
         WizardChoice(
             "extra",
@@ -166,9 +167,22 @@ def _prompt_discovered_cases(
     *,
     prompt_text: str,
     allow_multi: bool = False,
+    preferred: AnalysisCaseDiscovery | None = None,
 ) -> list[AnalysisCaseDiscovery] | None:
     selectable_indices = [index for index, item in enumerate(discoveries, start=1) if item.selectable]
-    default_choice = str(selectable_indices[0]) if selectable_indices else "0"
+    preferred_index = next(
+        (
+            index
+            for index, item in enumerate(discoveries, start=1)
+            if preferred is not None
+            and item.root == preferred.root
+            and item.case_type == preferred.case_type
+            and item.library_key == preferred.library_key
+            and item.selectable
+        ),
+        None,
+    )
+    default_choice = str(preferred_index or (selectable_indices[0] if selectable_indices else "0"))
     while True:
         raw = typer.prompt(prompt_text, default=default_choice).strip()
         if allow_multi and raw.lower() in {"m", "manual"}:
@@ -234,13 +248,24 @@ def _prompt_case_selection(
     title: str,
     prompt_text: str,
     include_library_water: bool = False,
+    preferred_for_bound: AnalysisCaseDiscovery | None = None,
 ) -> AnalysisCaseDiscovery:
     discoveries = discover_analysis_cases(Path.cwd(), case_types=case_types)
     if include_library_water and CASE_TYPE_WATER in case_types:
         discoveries.extend(discover_water_library_cases())
     if discoveries:
         _display_cases(Path.cwd(), discoveries, title=title)
-        selected = _prompt_discovered_cases(discoveries, prompt_text=prompt_text)
+        preferred = (
+            _preferred_water_case(preferred_for_bound, discoveries)
+            if preferred_for_bound is not None and CASE_TYPE_WATER in case_types
+            else None
+        )
+        if preferred is not None:
+            console.print(
+                f"[dim]Default water-reference match for {preferred_for_bound.display_name}: "
+                f"{preferred.display_name} ({preferred.description}).[/dim]"
+            )
+        selected = _prompt_discovered_cases(discoveries, prompt_text=prompt_text, preferred=preferred)
         if selected is not None:
             return selected[0]
     else:
@@ -266,14 +291,88 @@ def _prompt_case_selections(
             return selected
     else:
         console.print("[dim]No matching completed TI cases were detected here, so the launcher will switch to manual path mode.[/dim]")
+    if case_types == {CASE_TYPE_BOUND}:
+        return [_prompt_manual_case_path(case_type=CASE_TYPE_BOUND)]
+    if case_types == {CASE_TYPE_WATER}:
+        return [_prompt_manual_case_path(case_type=CASE_TYPE_WATER)]
     return [_prompt_manual_case_path()]
 
 
-def run_analysis_wizard() -> SingleCaseAnalysisResult | RBFEAnalysisResult | list[SingleCaseAnalysisResult]:
+def _case_metal_signatures(case: AnalysisCaseDiscovery) -> set[tuple[str, int | None]]:
+    signatures: set[tuple[str, int | None]] = set()
+    if case.case_type == CASE_TYPE_WATER:
+        for item in case.metadata.get("metals") or []:
+            if not isinstance(item, dict) or not item.get("element"):
+                continue
+            charge = item.get("formal_charge")
+            signatures.add((str(item["element"]).title(), None if charge is None else int(charge)))
+        metal = str(case.metadata.get("metal") or "").strip()
+        if metal:
+            charge = case.metadata.get("formal_charge")
+            signatures.add((metal.title(), None if charge is None else int(charge)))
+        return signatures
+
+    charge_by_site = case.metadata.get("selected_formal_charges_by_site") or {}
+    for item in case.metadata.get("selected_sites") or []:
+        if not isinstance(item, dict) or not item.get("element"):
+            continue
+        site = item.get("site")
+        charge = item.get("formal_charge")
+        if charge is None and site is not None:
+            charge = charge_by_site.get(str(site), charge_by_site.get(site))
+        signatures.add((str(item["element"]).title(), None if charge is None else int(charge)))
+    batch_element = str(case.metadata.get("batch_element") or "").strip()
+    if batch_element:
+        charge = case.metadata.get("selected_formal_charge")
+        signatures.add((batch_element.title(), None if charge is None else int(charge)))
+    if signatures:
+        return signatures
+
+    description = str(case.metadata.get("selected_metal") or case.description)
+    supported = (
+        "Sc", "Y", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er",
+        "Tm", "Yb", "Lu", "Mn", "Fe", "Co", "Ni", "Cu",
+    )
+    for element in supported:
+        if re.search(rf"(?<![A-Za-z]){element}(?![a-z])", description, flags=re.IGNORECASE):
+            charge = case.metadata.get("selected_formal_charge")
+            signatures.add((element, None if charge is None else int(charge)))
+    return signatures
+
+
+def _preferred_water_case(
+    bound_case: AnalysisCaseDiscovery,
+    water_cases: list[AnalysisCaseDiscovery],
+) -> AnalysisCaseDiscovery | None:
+    bound_signatures = _case_metal_signatures(bound_case)
+    selectable = [item for item in water_cases if item.selectable]
+    if not selectable:
+        return None
+
+    def score(water_case: AnalysisCaseDiscovery) -> tuple[int, int]:
+        water_signatures = _case_metal_signatures(water_case)
+        exact = bool(bound_signatures & water_signatures)
+        same_element = any(
+            bound_element == water_element
+            for bound_element, _bound_charge in bound_signatures
+            for water_element, _water_charge in water_signatures
+        )
+        return (2 if exact else 1 if same_element else 0, -selectable.index(water_case))
+
+    preferred = max(selectable, key=score)
+    return preferred if score(preferred)[0] > 0 else None
+
+
+def run_analysis_wizard() -> (
+    SingleCaseAnalysisResult
+    | RBFEAnalysisResult
+    | list[SingleCaseAnalysisResult]
+    | list[RBFEAnalysisResult]
+):
     _print_step_header(
         1,
         "Choose the Analysis Type",
-        "ABFE now means single-case dG analysis, while RBFE pairs one bound case with one water-reference case to compute ddG.",
+        "ABFE analyzes one or more standalone cases. RBFE accepts one or more bound cases and pairs each with a separately confirmed water-reference case.",
     )
     mode_choices = _analysis_mode_choices()
     _display_choice_table("Analysis menu", mode_choices)
@@ -317,25 +416,30 @@ def run_analysis_wizard() -> SingleCaseAnalysisResult | RBFEAnalysisResult | lis
     if mode == "rbfe":
         _print_step_header(
             3,
-            "Select the Bound Case",
-            "Choose one completed bound case. RBFE will use its TI total plus the stored restraint correction.",
+            "Select Bound Case(s)",
+            "Choose one or more completed bound cases. RBFE will use each TI total plus its stored restraint correction.",
         )
-        bound_case = _prompt_case_selection(
+        bound_cases = _prompt_case_selections(
             case_types={CASE_TYPE_BOUND},
             title="Detected Bound TI Cases",
-            prompt_text="Choose a bound case number (0 = enter a path manually)",
+            prompt_text="Choose bound case number(s) (0 = analyze all ready, M = enter a path manually)",
         )
-        _print_step_header(
-            4,
-            "Select the Water-Reference Case",
-            "Choose one completed water-reference case. RBFE will compute ddG = (dG_bound_ti + restraint_correction) - dG_water.",
-        )
-        water_case = _prompt_case_selection(
-            case_types={CASE_TYPE_WATER},
-            title="Detected Water-Reference TI Cases",
-            prompt_text="Choose a water-reference case number (0 = enter a path manually)",
-            include_library_water=True,
-        )
-        return analyze_rbfe(bound_case, water_case)
+        results: list[RBFEAnalysisResult] = []
+        for index, bound_case in enumerate(bound_cases, start=1):
+            _print_step_header(
+                3 + index,
+                f"Select Water Reference for {bound_case.display_name}",
+                "Choose the completed water-reference case for this bound case. A matching REE identity is "
+                "selected as the default when available.",
+            )
+            water_case = _prompt_case_selection(
+                case_types={CASE_TYPE_WATER},
+                title=f"Water References for {bound_case.display_name}",
+                prompt_text="Choose a water-reference case number (0 = enter a path manually)",
+                include_library_water=True,
+                preferred_for_bound=bound_case,
+            )
+            results.append(analyze_rbfe(bound_case, water_case))
+        return results[0] if len(results) == 1 else results
 
     raise typer.Abort()

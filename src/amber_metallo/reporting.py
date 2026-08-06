@@ -181,6 +181,20 @@ def _plain_workflow_summary(result: dict[str, Any]) -> str:
         ]
         return "\n".join(lines)
 
+    site_resp = result.get("protein_site_resp") or {}
+    if site_resp and site_resp.get("status") in {
+        "reference_pending", "cluster_review_required", "setup_pending", "review_required"
+    }:
+        jobs = site_resp.get("jobs") or []
+        lines = [
+            "Protein-Site RESP Paused",
+            f"Status: {site_resp.get('status')}",
+            f"Output directory: {result.get('output_dir', 'N/A')}",
+            str(site_resp.get("message") or "Review the generated protein-site RESP artifacts."),
+        ]
+        lines.extend(f"Job directory: {job.get('job_dir', 'N/A')}" for job in jobs)
+        return "\n".join(lines)
+
     system = result.get("system") or {}
     metadata = system.get("system_metadata") or {}
     des_plan = metadata.get("des") if isinstance(metadata, dict) else None
@@ -241,6 +255,21 @@ def print_workflow_summary(result: dict[str, Any]) -> None:
         summary.add_row("Slurm script", str(files.get("slurm", "N/A")))
         summary.add_row("Next step", "Run the RESP job and rerun the workflow to apply the generated charges.")
         console.print(Panel(summary, title="[bold]RESP Setup Complete[/bold]", border_style="green"))
+        return
+
+    site_resp = result.get("protein_site_resp") or {}
+    if site_resp and site_resp.get("status") in {
+        "reference_pending", "cluster_review_required", "setup_pending", "review_required"
+    }:
+        summary = Table(box=None, show_header=False)
+        summary.add_column("Key", style="bold white")
+        summary.add_column("Value", style="cyan", overflow="fold")
+        summary.add_row("Status", str(site_resp.get("status")))
+        summary.add_row("Output directory", str(result.get("output_dir", "N/A")))
+        summary.add_row("Next step", str(site_resp.get("message") or "Review the protein-site RESP artifacts."))
+        for index, job in enumerate(site_resp.get("jobs") or [], start=1):
+            summary.add_row(f"Job {index}", str(job.get("job_dir", "N/A")))
+        console.print(Panel(summary, title="[bold]Protein-Site RESP Paused[/bold]", border_style="yellow"))
         return
 
     system = result.get("system") or {}

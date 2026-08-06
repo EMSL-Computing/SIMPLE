@@ -8,17 +8,24 @@ from typing import Any
 
 import typer
 
-from amber_metallo.amber.leap import build_system_with_tleap
+from amber_metallo.amber.leap import (
+    build_protein_site_resp_reference_with_tleap,
+    build_system_with_tleap,
+)
 from amber_metallo.config import (
     InputSource,
     LigandMode,
     MetalChargeAssignment,
+    ProteinSiteRespClusterConfig,
+    ProteinSiteRespConfig,
+    ProteinSiteRespMode,
     RespApplyMode,
     ResidueMaskNumbering,
     SystemConfig,
     WorkflowConfig,
     charge_method_uses_resp,
     normalize_charge_method,
+    save_config,
 )
 from amber_metallo.des import build_des_system
 from amber_metallo.environment import detect_amber_environment
@@ -26,6 +33,16 @@ from amber_metallo.inspection import load_structure
 from amber_metallo.ligand_param import parameterize_ligand, validate_manual_ligand_bundle
 from amber_metallo.md_protocols import generate_md_inputs
 from amber_metallo.prep import prepare_structure
+from amber_metallo.protein_site_resp import (
+    apply_site_resp_results,
+    build_site_resp_jobs,
+    discover_site_clusters,
+    load_topology_atoms,
+    review_site_resp_result,
+    suggested_low_spin_multiplicity,
+    suggested_spin_multiplicity,
+    validate_retained_direct_environment,
+)
 from amber_metallo.qm.nwchem import find_resp_job_candidates, load_resp_job_candidate, molecule_fingerprint
 from amber_metallo.reporting import activity_status, print_notice, write_json
 from amber_metallo.slurm import write_slurm_script
@@ -145,6 +162,157 @@ def _load_prepare_manifest(prepare_dir: Path) -> dict[str, Any] | None:
 
 def _is_interactive_terminal() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _source_identity_label(config: WorkflowConfig) -> str:
+    if config.input.source == InputSource.PDB_ID:
+        return str(config.input.pdb_id or "PDB").strip().upper()
+    if config.input.path:
+        return Path(config.input.path).expanduser().stem
+    return "protein"
+
+
+def _confirm_protein_site_resp_application(jobs: list[dict[str, object]]) -> bool:
+    reviews = [review_site_resp_result(str(job["job_dir"])) for job in jobs]
+    lines = [
+        "A completed, fingerprint-matching protein-site RESP result was detected.",
+        "Review the site-specific charge changes before applying this experimental hybrid model:",
+    ]
+    for review in reviews:
+        lines.append(f"\n{review.get('description')}")
+        fitted_rmse = float(review.get("esp_rmse") or 0.0)
+        baseline_rmse_raw = review.get("baseline_esp_rmse")
+        baseline_rmse = None if baseline_rmse_raw is None else float(baseline_rmse_raw)
+        improvement = (
+            None
+            if baseline_rmse is None or baseline_rmse <= 1.0e-15
+            else 100.0 * (baseline_rmse - fitted_rmse) / baseline_rmse
+        )
+        lines.append(
+            f"ESP RMSE: {fitted_rmse:.6g} | baseline ff19SB RMSE: "
+            f"{baseline_rmse:.6g}" if baseline_rmse is not None else "ESP RMSE baseline: unavailable"
+        )
+        if improvement is not None:
+            lines.append(f"ESP RMSE improvement over baseline: {improvement:+.2f}%")
+        lines.append(
+            "Normalized ESP residual: "
+            f"{float(review.get('esp_relative_rmse')):.4f} | "
+            if review.get("esp_relative_rmse") is not None
+            else "Normalized ESP residual: unavailable | "
+        )
+        lines[-1] += (
+            "maximum constraint residual: "
+            f"{float(review.get('maximum_constraint_residual') or 0.0):.3e}"
+        )
+        for change in list(review.get("changes") or []):
+            lines.append(
+                f"- {change.get('residue_key')}@{change.get('atom_name')}: "
+                f"{float(change.get('original_charge') or 0.0):+.6f} -> "
+                f"{float(change.get('charge') or 0.0):+.6f} "
+                f"({float(change.get('delta') or 0.0):+.6f})"
+            )
+        for residue_sum in list(review.get("residue_sums") or []):
+            lines.append(
+                f"Residue sum {residue_sum.get('label')}: "
+                f"{float(residue_sum.get('baseline') or 0.0):+.6f} -> "
+                f"{float(residue_sum.get('fitted') or 0.0):+.6f}"
+            )
+        if review.get("symmetry_constraints"):
+            lines.append(
+                f"Verified symmetry constraints: {len(list(review.get('symmetry_constraints') or []))}"
+            )
+        for warning in list(review.get("warnings") or []):
+            lines.append(f"WARNING: {warning}")
+    print_notice("Protein-Site RESP Review", "\n".join(lines), border_style="yellow")
+    return typer.confirm("Apply these protein-site RESP charges to the final topology?", default=False)
+
+
+def _review_protein_site_resp_clusters(
+    *,
+    resp_config: ProteinSiteRespConfig,
+    system_config: SystemConfig,
+    system_pdb: Path,
+    system_prmtop: Path,
+) -> ProteinSiteRespConfig:
+    """Require terminal users to confirm cluster membership and spin after TLeap mapping."""
+    probe_config = resp_config.model_copy(deep=True)
+    if probe_config.default_multiplicity is None:
+        probe_config.default_multiplicity = 1
+    atoms = load_topology_atoms(system_prmtop, system_pdb)
+    clusters = discover_site_clusters(
+        atoms=atoms,
+        system_config=system_config,
+        resp_config=probe_config,
+    )
+    atom_by_index = {atom.topology_index: atom for atom in atoms}
+    charge_by_site = {int(item.site): int(item.charge) for item in system_config.metal_charges}
+    reviewed: list[ProteinSiteRespClusterConfig] = []
+    for number, cluster in enumerate(clusters, start=1):
+        species = [
+            (
+                atom_by_index[topology_index].element,
+                charge_by_site[site],
+            )
+            for site, topology_index in zip(cluster.metal_sites, cluster.metal_atom_indices, strict=True)
+        ]
+        suggested = (
+            suggested_spin_multiplicity(species[0][0], species[0][1])
+            if len(species) == 1
+            else None
+        )
+        low_spin = (
+            suggested_low_spin_multiplicity(species[0][0], species[0][1])
+            if len(species) == 1
+            else None
+        )
+        species_text = ", ".join(f"{element}{charge:+d}" for element, charge in species)
+        print_notice(
+            f"Protein-Site RESP Cluster {number}",
+            "Connected metal site(s): " + ", ".join(str(site) for site in cluster.metal_sites)
+            + f" ({species_text})\nDirect protein donors: "
+            + (", ".join(cluster.donor_residue_keys) or "None")
+            + "\nFixed QM environment: "
+            + (", ".join(cluster.fixed_environment_keys) or "None")
+            + "\nDefault/high-spin multiplicity: "
+            + (str(suggested) if suggested is not None else "no single curated value")
+            + "\nLow-spin alternative: "
+            + (
+                str(low_spin)
+                if low_spin is not None
+                else "not conventionally assigned for this ion; inspect the electronic state"
+            ),
+            border_style="yellow",
+        )
+        donor_text = typer.prompt(
+            "Direct donor residues (comma separated; review/edit)",
+            default=", ".join(cluster.donor_residue_keys),
+        ).strip()
+        fixed_text = typer.prompt(
+            "Fixed QM-environment residues (comma separated; review/edit; blank allowed)",
+            default=", ".join(cluster.fixed_environment_keys),
+            show_default=bool(cluster.fixed_environment_keys),
+        ).strip()
+        multiplicity = typer.prompt(
+            "Confirmed spin multiplicity for this connected cluster",
+            default=int(suggested or resp_config.default_multiplicity or 1),
+            type=int,
+        )
+        if multiplicity < 1:
+            raise ValueError("Protein-site RESP spin multiplicity must be at least 1.")
+        if not typer.confirm(
+            f"Use multiplicity {multiplicity} for cluster {number} ({species_text})?",
+            default=True,
+        ):
+            raise ValueError("Protein-site RESP multiplicity was not confirmed.")
+        reviewed.append(
+            ProteinSiteRespClusterConfig(
+                metal_sites=cluster.metal_sites,
+                donor_residues=[item.strip() for item in donor_text.split(",") if item.strip()],
+                fixed_environment=[item.strip() for item in fixed_text.split(",") if item.strip()],
+                multiplicity=multiplicity,
+            )
+        )
+    return resp_config.model_copy(update={"clusters": reviewed}, deep=True)
 
 
 def _prompt_resp_apply_mode(*, has_completed_result: bool) -> RespApplyMode:
@@ -406,6 +574,107 @@ def _prepare_ligands(
     return artifacts
 
 
+def _load_json_dict(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _resume_existing_protein_site_resp_workflow(
+    *,
+    config: WorkflowConfig,
+    root: Path,
+    stages: dict[str, Path],
+    selected: list[str],
+    dry_run: bool,
+    amber_env: Any,
+) -> dict[str, Any]:
+    job_dirs = [Path(item).expanduser().resolve() for item in config.protein_site_resp.job_dirs]
+    if not job_dirs:
+        raise ValueError("Protein-site RESP continuation requires at least one selected RESP job directory.")
+    system_prmtop = stages["system"] / "system.prmtop"
+    system_inpcrd = stages["system"] / "system.inpcrd"
+    if not system_prmtop.exists() or not system_inpcrd.exists():
+        raise FileNotFoundError(
+            "The selected RESP workflow no longer has 02_system/system.prmtop and system.inpcrd; "
+            "SIMPLE cannot safely continue it in place."
+        )
+
+    jobs = [{"job_dir": str(job_dir)} for job_dir in job_dirs]
+    prepared = _load_prepare_manifest(stages["prepare"])
+    system_payload = _load_json_dict(stages["system"] / "system_manifest.json") or {
+        "output_files": {
+            "prmtop": str(system_prmtop),
+            "inpcrd": str(system_inpcrd),
+        }
+    }
+    protein_site_resp_result: dict[str, object]
+    md_stages = []
+    slurm_path: Path | None = None
+
+    if "system" not in selected and "md" not in selected:
+        protein_site_resp_result = {
+            "status": "review_required",
+            "jobs": [{**job, "review": review_site_resp_result(str(job["job_dir"]))} for job in jobs],
+            "message": "The selected stage range stops before topology application.",
+        }
+    else:
+        should_apply = True
+        if _is_interactive_terminal():
+            should_apply = _confirm_protein_site_resp_application(jobs)
+        if not should_apply:
+            protein_site_resp_result = {
+                "status": "review_required",
+                "jobs": [{**job, "review": review_site_resp_result(str(job["job_dir"]))} for job in jobs],
+                "message": "The matching charges were reviewed but not approved; the topology was not changed.",
+            }
+        else:
+            parmed_status = amber_env.binaries.get("parmed")
+            protein_site_resp_result = apply_site_resp_results(
+                job_dirs=job_dirs,
+                prmtop_path=system_prmtop,
+                inpcrd_path=system_inpcrd,
+                parmed_binary=parmed_status.path if parmed_status is not None else None,
+                output_dir=stages["system"],
+                dry_run=dry_run,
+            )
+
+            if "md" in selected:
+                prepared_pdb_for_mask = None
+                if prepared and prepared.get("cleaned_pdb"):
+                    prepared_pdb_for_mask = Path(str(prepared["cleaned_pdb"]))
+                final_system_pdb = stages["system"] / "system.pdb"
+                _translate_focused_restraint_mask_to_topology(
+                    config,
+                    prepared_pdb_for_mask,
+                    final_system_pdb,
+                )
+                md_input_dir = stages["md"] / "inputs"
+                md_stages = generate_md_inputs(config.md, md_input_dir)
+                slurm_path = write_slurm_script(
+                    stages=md_stages,
+                    slurm_config=config.slurm,
+                    output_dir=stages["md"],
+                )
+
+    result = {
+        "output_dir": str(root),
+        "prepare": str(stages["prepare"] / "prepare_manifest.json") if prepared else None,
+        "system": system_payload,
+        "md_inputs": [str(stages["md"] / "inputs" / stage.filename) for stage in md_stages],
+        "slurm": str(slurm_path) if slurm_path else None,
+        "dry_run": dry_run,
+        "amberhome": str(amber_env.amberhome) if amber_env.amberhome else None,
+        "protein_site_resp": protein_site_resp_result,
+    }
+    write_json(root / "workflow_manifest.json", result)
+    return result
+
+
 def run_workflow(
     *,
     config: WorkflowConfig,
@@ -420,6 +689,7 @@ def run_workflow(
     prepared: dict[str, Any] | None = None
     ligand_artifacts: list[Any] = []
     system_result: Any = None
+    protein_site_resp_result: dict[str, object] | None = None
     md_stages = []
     slurm_path: Path | None = None
 
@@ -427,6 +697,23 @@ def run_workflow(
     start_index = ordered.index(from_stage)
     end_index = ordered.index(to_stage)
     selected = ordered[start_index : end_index + 1]
+
+    snapshot_name = (
+        "workflow_resume_config.toml"
+        if config.protein_site_resp.resume_existing_system
+        else "workflow_config.toml"
+    )
+    save_config(config, root / snapshot_name)
+
+    if config.protein_site_resp.resume_existing_system:
+        return _resume_existing_protein_site_resp_workflow(
+            config=config,
+            root=root,
+            stages=stages,
+            selected=selected,
+            dry_run=dry_run,
+            amber_env=amber_env,
+        )
 
     if "prepare" in selected:
         if config.input.source == InputSource.DES:
@@ -511,6 +798,13 @@ def run_workflow(
             if prepared is None:
                 prepared_pdb = stages["prepare"] / "cleaned_input.pdb"
                 prepared = {"cleaned_pdb": str(prepared_pdb) if prepared_pdb.exists() else None, "ligand_inputs": []}
+        site_resp_enabled = (
+            config.input.source not in {InputSource.SMALL_MOLECULE, InputSource.DES}
+            and config.protein_site_resp.mode == ProteinSiteRespMode.RESP
+        )
+        source_files: list[Path] = []
+        prepared_pdb: Path | None = None
+        site_system_config: SystemConfig | None = None
         if config.input.source == InputSource.DES:
             system_result = build_des_system(
                 des_config=config.des,
@@ -522,12 +816,207 @@ def run_workflow(
         else:
             source_files = [Path(item["path"]) for item in prepared.get("ligand_inputs", [])] if prepared else []
             prepared_pdb = Path(prepared["cleaned_pdb"]) if prepared and prepared.get("cleaned_pdb") else None
+            site_system_config = _system_config_with_inserted_metal_charges(config.system, prepared)
+            if site_resp_enabled:
+                if prepared_pdb is None:
+                    raise ValueError("Protein-site RESP requires a prepared protein PDB reference.")
+                system_result = build_protein_site_resp_reference_with_tleap(
+                    system_config=site_system_config,
+                    amber_env=amber_env,
+                    prepared_pdb=prepared_pdb,
+                    ligand_artifacts=ligand_artifacts,
+                    source_files=source_files,
+                    output_dir=stages["system"],
+                    dry_run=dry_run,
+                )
+            else:
+                system_result = build_system_with_tleap(
+                    system_config=site_system_config,
+                    amber_env=amber_env,
+                    prepared_pdb=prepared_pdb,
+                    ligand_artifacts=ligand_artifacts,
+                    source_files=source_files,
+                    output_dir=stages["system"],
+                    dry_run=dry_run,
+                )
+
+        if site_resp_enabled:
+            assert site_system_config is not None
+            assert prepared_pdb is not None
+            system_pdb = stages["system"] / "system.pdb"
+            system_prmtop = stages["system"] / "system.prmtop"
+            system_inpcrd = stages["system"] / "system.inpcrd"
+            reference_pdb = stages["system"] / "system.unsolvated.pdb"
+            reference_prmtop = stages["system"] / "system.unsolvated.prmtop"
+            if dry_run and not (reference_pdb.exists() and reference_prmtop.exists()):
+                protein_site_resp_result = {
+                    "status": "reference_pending",
+                    "message": (
+                        "Protein-site RESP needs an executed TLeap reference topology to obtain hydrogens, "
+                        "baseline ff19SB charges, and an exact atom mapping. Rerun without --dry-run on the Amber host."
+                    ),
+                }
+                result = {
+                    "output_dir": str(root),
+                    "prepare": str(prepared.get("manifest")) if prepared and prepared.get("manifest") else None,
+                    "system": system_result.to_dict() if system_result else None,
+                    "md_inputs": [],
+                    "slurm": None,
+                    "dry_run": dry_run,
+                    "amberhome": str(amber_env.amberhome) if amber_env.amberhome else None,
+                    "protein_site_resp": protein_site_resp_result,
+                }
+                write_json(root / "workflow_manifest.json", result)
+                return result
+            site_resp_config = config.protein_site_resp
+            raw_source = (prepared or {}).get("raw_input")
+            if raw_source and Path(raw_source).exists():
+                validate_retained_direct_environment(
+                    source_pdb=raw_source,
+                    reference_pdb=reference_pdb,
+                )
+            if site_resp_config.review_clusters and not site_resp_config.clusters:
+                reference_atoms = load_topology_atoms(reference_prmtop, reference_pdb)
+                proposed_clusters = discover_site_clusters(
+                    atoms=reference_atoms,
+                    system_config=site_system_config,
+                    resp_config=site_resp_config,
+                )
+                atom_by_index = {atom.topology_index: atom for atom in reference_atoms}
+                charge_by_site = {int(item.site): int(item.charge) for item in site_system_config.metal_charges}
+                cluster_rows: list[dict[str, object]] = []
+                for cluster in proposed_clusters:
+                    species = [
+                        {
+                            "site": site,
+                            "element": atom_by_index[topology_index].element,
+                            "formal_charge": charge_by_site[site],
+                        }
+                        for site, topology_index in zip(
+                            cluster.metal_sites,
+                            cluster.metal_atom_indices,
+                            strict=True,
+                        )
+                    ]
+                    suggestion = (
+                        suggested_spin_multiplicity(
+                            str(species[0]["element"]),
+                            int(species[0]["formal_charge"]),
+                        )
+                        if len(species) == 1
+                        else None
+                    )
+                    cluster_rows.append(
+                        {
+                            **cluster.to_dict(),
+                            "species": species,
+                            "suggested_multiplicity": suggestion,
+                        }
+                    )
+                protein_site_resp_result = {
+                    "status": "cluster_review_required",
+                    "clusters": cluster_rows,
+                    "message": (
+                        "Review/edit the detected donor residues, fixed QM environment, and spin multiplicity "
+                        "for every connected metal cluster before generating NWChem jobs."
+                    ),
+                }
+                result = {
+                    "output_dir": str(root),
+                    "prepare": str(prepared.get("manifest")) if prepared and prepared.get("manifest") else None,
+                    "system": system_result.to_dict() if system_result else None,
+                    "md_inputs": [],
+                    "slurm": None,
+                    "dry_run": dry_run,
+                    "amberhome": str(amber_env.amberhome) if amber_env.amberhome else None,
+                    "protein_site_resp": protein_site_resp_result,
+                }
+                write_json(root / "workflow_manifest.json", result)
+                return result
+            if _is_interactive_terminal():
+                site_resp_config = _review_protein_site_resp_clusters(
+                    resp_config=site_resp_config,
+                    system_config=site_system_config,
+                    system_pdb=reference_pdb,
+                    system_prmtop=reference_prmtop,
+                )
+            site_jobs = build_site_resp_jobs(
+                system_pdb=reference_pdb,
+                system_prmtop=reference_prmtop,
+                system_config=site_system_config,
+                resp_config=site_resp_config,
+                slurm_config=config.slurm,
+                base_dir=stages["prepare"] / "protein_site_resp_jobs",
+                source_label=_source_identity_label(config),
+                source_pdb=(prepared or {}).get("raw_input"),
+            )
+            pending_jobs = [job for job in site_jobs if job.get("status") == "setup_pending"]
+            if pending_jobs:
+                protein_site_resp_result = {
+                    "status": "setup_pending",
+                    "jobs": site_jobs,
+                    "message": (
+                        "Run each generated Tahoma CPU RESP job, then rerun SIMPLE. "
+                        "The matching results will be reviewed before topology application."
+                    ),
+                }
+                print_notice(
+                    "Protein-Site RESP Setup Complete",
+                    protein_site_resp_result["message"],
+                    border_style="green",
+                )
+                result = {
+                    "output_dir": str(root),
+                    "prepare": str(prepared.get("manifest")) if prepared and prepared.get("manifest") else None,
+                    "system": system_result.to_dict() if system_result else None,
+                    "md_inputs": [],
+                    "slurm": None,
+                    "dry_run": dry_run,
+                    "amberhome": str(amber_env.amberhome) if amber_env.amberhome else None,
+                    "protein_site_resp": protein_site_resp_result,
+                }
+                write_json(root / "workflow_manifest.json", result)
+                return result
+
+            should_apply = site_resp_config.apply_mode == RespApplyMode.APPLY_EXISTING
+            if site_resp_config.apply_mode == RespApplyMode.DETECT and _is_interactive_terminal():
+                should_apply = _confirm_protein_site_resp_application(site_jobs)
+            if not should_apply:
+                protein_site_resp_result = {
+                    "status": "review_required",
+                    "jobs": [
+                        {**job, "review": review_site_resp_result(str(job["job_dir"]))}
+                        for job in site_jobs
+                    ],
+                    "message": "Review and approve the matching site-specific charges before application.",
+                }
+                result = {
+                    "output_dir": str(root),
+                    "prepare": str(prepared.get("manifest")) if prepared and prepared.get("manifest") else None,
+                    "system": system_result.to_dict() if system_result else None,
+                    "md_inputs": [],
+                    "slurm": None,
+                    "dry_run": dry_run,
+                    "amberhome": str(amber_env.amberhome) if amber_env.amberhome else None,
+                    "protein_site_resp": protein_site_resp_result,
+                }
+                write_json(root / "workflow_manifest.json", result)
+                return result
             system_result = build_system_with_tleap(
-                system_config=_system_config_with_inserted_metal_charges(config.system, prepared),
+                system_config=site_system_config,
                 amber_env=amber_env,
                 prepared_pdb=prepared_pdb,
                 ligand_artifacts=ligand_artifacts,
                 source_files=source_files,
+                output_dir=stages["system"],
+                dry_run=dry_run,
+            )
+            parmed_status = amber_env.binaries.get("parmed")
+            protein_site_resp_result = apply_site_resp_results(
+                job_dirs=[str(job["job_dir"]) for job in site_jobs],
+                prmtop_path=system_prmtop,
+                inpcrd_path=system_inpcrd,
+                parmed_binary=parmed_status.path if parmed_status is not None else None,
                 output_dir=stages["system"],
                 dry_run=dry_run,
             )
@@ -565,6 +1054,7 @@ def run_workflow(
         "slurm": str(slurm_path) if slurm_path else None,
         "dry_run": dry_run,
         "amberhome": str(amber_env.amberhome) if amber_env.amberhome else None,
+        "protein_site_resp": protein_site_resp_result,
     }
     write_json(root / "workflow_manifest.json", result)
     return result

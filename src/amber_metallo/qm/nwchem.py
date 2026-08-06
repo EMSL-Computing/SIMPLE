@@ -1368,6 +1368,11 @@ def _aux_basis_for(basis: str) -> str:
 
 
 def _xc_keyword(functional: str) -> str:
+    # PBE is used internally only to precondition difficult open-shell metal
+    # orbitals before the requested r2SCAN single point; it is not exposed as
+    # a selectable final RESP level.
+    if str(functional).strip().lower() == "pbe":
+        return "pbe"
     normalized = _normalize_functional(functional, default=QM_DEFAULT_DFT_FUNCTIONAL)
     if normalized == "hf":
         return "hfexch 1.0"
@@ -1383,7 +1388,18 @@ def _render_dft_theory_block(
     maxiter: int,
     reset_existing: bool = False,
     vectors_input_atomic: bool = False,
+    vectors_input_file: str | None = None,
+    vectors_output_file: str | None = None,
+    convergence_profile: str = "default",
 ) -> str:
+    if convergence_profile == "metal_robust":
+        maxiter = max(int(maxiter), 500)
+        convergence = " convergence energy 1d-7 damp 40 lshift 0.5 rabuck 30 diis 6"
+    elif convergence_profile == "metal_retry":
+        maxiter = max(int(maxiter), 1000)
+        convergence = " convergence energy 1d-7 damp 70 lshift 1.0 rabuck 80 diis 8"
+    else:
+        convergence = " convergence energy 1d-7"
     lines: list[str] = []
     if reset_existing:
         lines.extend(
@@ -1408,12 +1424,20 @@ def _render_dft_theory_block(
             f" mult {int(multiplicity)}",
             f" xc {_xc_keyword(functional)}",
             f" grid {grid} nodisk",
-            f" maxiter {int(maxiter)}",
-            " convergence energy 1d-7",
+            f" iterations {int(maxiter)}",
+            convergence,
         ]
     )
-    if vectors_input_atomic:
-        lines.append(" vectors input atomic")
+    if vectors_input_file:
+        vector_line = f' vectors input "{vectors_input_file}"'
+    elif vectors_input_atomic:
+        vector_line = " vectors input atomic"
+    else:
+        vector_line = ""
+    if vectors_output_file:
+        vector_line += f' output "{vectors_output_file}"'
+    if vector_line:
+        lines.append(vector_line)
     lines.extend(
         [
             ' noprint "final vectors analysis"',
@@ -1475,9 +1499,32 @@ def _resolve_resp_theory(qm_settings: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def _render_resp_reference_block(qm_settings: dict[str, Any]) -> str:
+def _render_resp_reference_block(qm_settings: dict[str, Any], *, convergence_profile: str = "default") -> str:
     resources = dict(qm_settings.get("resources") or {})
     functional, basis = _resolve_resp_theory(qm_settings)
+    if convergence_profile == "metal_retry":
+        preconditioner = _render_dft_theory_block(
+            functional="pbe",
+            basis=basis,
+            multiplicity=int(qm_settings.get("multiplicity") or 1),
+            grid=str(resources.get("grid") or QM_DEFAULT_GRID),
+            maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
+            reset_existing=True,
+            vectors_input_atomic=True,
+            vectors_output_file="site_resp_precondition.movecs",
+            convergence_profile="metal_retry",
+        )
+        final = _render_dft_theory_block(
+            functional=functional,
+            basis=basis,
+            multiplicity=int(qm_settings.get("multiplicity") or 1),
+            grid=str(resources.get("grid") or QM_DEFAULT_GRID),
+            maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
+            reset_existing=True,
+            vectors_input_file="site_resp_precondition.movecs",
+            convergence_profile="metal_retry",
+        )
+        return "\n\n".join([preconditioner, "task dft", final, "task dft"])
     return "\n".join(
         [
             _render_dft_theory_block(
@@ -1488,13 +1535,19 @@ def _render_resp_reference_block(qm_settings: dict[str, Any]) -> str:
                 maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
                 reset_existing=True,
                 vectors_input_atomic=True,
+                convergence_profile=convergence_profile,
             ),
             "task dft",
         ]
     )
 
 
-def render_nwchem_input(molecule: MoleculeData, *, session_state: dict[str, Any]) -> str:
+def render_nwchem_input(
+    molecule: MoleculeData,
+    *,
+    session_state: dict[str, Any],
+    convergence_profile: str = "default",
+) -> str:
     raw_qm = dict(session_state.get("qm_settings") or {})
     qm = normalize_qm_settings(
         raw_qm,
@@ -1510,7 +1563,7 @@ def render_nwchem_input(molecule: MoleculeData, *, session_state: dict[str, Any]
         net_charge=int(qm["net_charge"]),
         multiplicity=int(qm["multiplicity"]),
         optimization_step_block=_render_optimization_step_block(qm),
-        resp_reference_block=_render_resp_reference_block(qm),
+        resp_reference_block=_render_resp_reference_block(qm, convergence_profile=convergence_profile),
     )
 
 

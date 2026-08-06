@@ -233,6 +233,26 @@
                 <button id="disulfide_all">Check All Disulfides</button>
                 <button id="disulfide_none">Uncheck All Disulfides</button>
               </div>
+              <div class="section-title">Protein Metal-Site Charges</div>
+              <div class="infobox small warn-box">
+                Standard ff19SB charges are the GUI default. Creating new site-specific protein RESP calculations is
+                an advanced workflow provided only by <strong>main.py</strong>. After completing that NWChem/RESP
+                workflow, this GUI can scan the generated case folder, review the fitted charges, and apply the
+                compatible result to the rebuilt topology.
+              </div>
+              <input id="protein_site_resp_mode" type="hidden" value="standard_ff">
+              <input id="protein_site_resp_scope" type="hidden" value="sidechain">
+              <input id="protein_site_resp_multiplicity" type="hidden" value="1">
+              <input id="protein_site_resp_multiplicity_confirmed" type="checkbox" hidden>
+              <input id="protein_site_resp_search_root" type="hidden" value=".">
+              <input id="protein_site_resp_job_dir" type="hidden" value="">
+              <div class="actions">
+                <button id="scan_protein_site_resp" type="button">Scan / Browse RESP Results...</button>
+                <button id="apply_protein_site_resp" type="button" hidden>Approve Charges and Resume MD</button>
+              </div>
+              <input id="protein_site_resp_directory_picker" type="file" webkitdirectory directory multiple hidden>
+              <div id="protein_site_resp_candidates" class="tablebox">No site-RESP result scan has been run. Use main.py to create a new site-RESP calculation.</div>
+              <div id="protein_site_resp_review" class="tablebox" hidden></div>
             </div>
 
             <div id="des_panel" class="workflow-panel" hidden>
@@ -280,6 +300,7 @@
                 <select id="system_c4_parameter_set"></select>
               </div>
               <div id="system_c4_note" class="infobox small">OPC + Duvail is the default for metal MD setup.</div>
+              <div id="system_c4_compat_warning" class="infobox small warn-box" role="alert" hidden></div>
               <div id="system_metal_charges" class="tablebox">Detected metal sites appear here after preview loading.</div>
               <div id="metallophore_geometry_actions" class="actions post-table-actions">
                 <button id="quick_min">Quick Minimize Donor Geometry</button>

@@ -847,6 +847,9 @@ def discover_water_library_cases() -> list[AnalysisCaseDiscovery]:
                 library_key=key,
                 library_snapshot=entry,
                 metadata={
+                    "metal": entry.get("metal"),
+                    "formal_charge": entry.get("formal_charge"),
+                    "water_model": entry.get("water_model"),
                     "delta_g_kcal_mol": total.get("delta_g_kcal_mol"),
                     "propagated_sem_kcal_mol": total.get("propagated_sem_kcal_mol"),
                     "bootstrap_ci95": ci95,
@@ -1297,7 +1300,12 @@ def analyze_rbfe(
     return _persist_rbfe_result(result)
 
 
-def print_analysis_summary(result: SingleCaseAnalysisResult | RBFEAnalysisResult | list[SingleCaseAnalysisResult]) -> None:
+def print_analysis_summary(
+    result: SingleCaseAnalysisResult
+    | RBFEAnalysisResult
+    | list[SingleCaseAnalysisResult]
+    | list[RBFEAnalysisResult],
+) -> None:
     if Table is None:
         if isinstance(result, list):
             console.print(json.dumps([item.to_dict() for item in result], indent=2))
@@ -1305,6 +1313,28 @@ def print_analysis_summary(result: SingleCaseAnalysisResult | RBFEAnalysisResult
         console.print(json.dumps(result.to_dict(), indent=2))
         return
     if isinstance(result, list):
+        if result and all(isinstance(item, RBFEAnalysisResult) for item in result):
+            rbfe_results = [item for item in result if isinstance(item, RBFEAnalysisResult)]
+            table = Table(title="Batch RBFE", box=box.SIMPLE_HEAVY)
+            table.add_column("Bound case", style="bold white")
+            table.add_column("Water reference", style="white")
+            table.add_column("ddG", style="cyan", justify="right")
+            table.add_column("SEM", style="green", justify="right")
+            table.add_column("95% CI", style="magenta", justify="right")
+            for item in rbfe_results:
+                table.add_row(
+                    item.bound.case.display_name,
+                    item.water.case.display_name,
+                    f"{item.ddg_kcal_mol:.6f}",
+                    f"{item.propagated_sem_kcal_mol:.6f}",
+                    _format_ci95(item.bootstrap_ci95),
+                )
+            console.print(table)
+            console.print(
+                f"[dim]Analyzed {len(rbfe_results)} RBFE pair(s). Individual outputs were saved under each "
+                "bound case's analysis/rbfe directory.[/dim]"
+            )
+            return
         table = Table(title="Batch Single-Case dG", box=box.SIMPLE_HEAVY)
         table.add_column("Case", style="bold white")
         table.add_column("Type", style="white")

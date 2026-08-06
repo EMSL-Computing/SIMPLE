@@ -248,14 +248,14 @@ def _prompt_snapshot_mode(*, selected_stable: bool) -> SnapshotMode:
 def _prompt_ti_implementation_mode() -> TIImplementationMode:
     choices = [
         WizardChoice(
-            TIImplementationMode.AMBER_12_6_WORKAROUND.value,
-            "Amber TI official 12-6 rebuild",
-            "Supported now. Rebuild TI-specific ion/metal non-bonded terms to the official Amber 12-6 set before charge-off and VDW-off TI.",
-        ),
-        WizardChoice(
             TIImplementationMode.AMBER_12_6_4_GTI.value,
             "Amber TI 12-6-4 (GTI/CUDA)",
-            "Supported for GPU/CUDA Amber builds. Keep the original 12-6-4 C4 terms during TI and generate pmemd.cuda scripts.",
+            "Default. Keep the original 12-6-4 C4 terms and run the GTI path with GPU/pmemd.cuda.",
+        ),
+        WizardChoice(
+            TIImplementationMode.AMBER_12_6_WORKAROUND.value,
+            "Amber TI official 12-6 rebuild",
+            "Legacy alternative. Rebuild TI-specific ion/metal non-bonded terms to the official Amber 12-6 set.",
         ),
         WizardChoice(
             TIImplementationMode.GROMACS_TABULATED_12_6_4.value,
@@ -269,7 +269,7 @@ def _prompt_ti_implementation_mode() -> TIImplementationMode:
         _prompt_choice(
             "Choose the TI implementation mode",
             choices,
-            default_key=TIImplementationMode.AMBER_12_6_WORKAROUND.value,
+            default_key=TIImplementationMode.AMBER_12_6_4_GTI.value,
         )
     )
     if selection == TIImplementationMode.AMBER_12_6_4_GTI:
@@ -299,13 +299,14 @@ def _prompt_ti_decoupling_mode(implementation_mode: TIImplementationMode) -> TID
     choices = [
         WizardChoice(
             TIDecouplingMode.SPLIT_Q_VDW.value,
-            "Split Q then VDW",
-            "Recommended. Run charge-off first, relax the decharged endpoint, then run softcore VDW-off.",
+            "Split Q then VDW (coming soon)",
+            "Temporarily unavailable while the split-path error is being resolved.",
+            enabled=False,
         ),
         WizardChoice(
             TIDecouplingMode.COMBINED_Q_VDW.value,
             "Combined softcore",
-            "Advanced. Decouple charge and VDW together in one CUDA/GTI softcore path.",
+            "Default and currently supported. Decouple charge and VDW together in one CUDA/GTI softcore path.",
         ),
     ]
     _display_choice_table("TI decoupling path", choices)
@@ -313,7 +314,7 @@ def _prompt_ti_decoupling_mode(implementation_mode: TIImplementationMode) -> TID
         _prompt_choice(
             "Choose the TI decoupling path",
             choices,
-            default_key=TIDecouplingMode.SPLIT_Q_VDW.value,
+            default_key=TIDecouplingMode.COMBINED_Q_VDW.value,
         )
     )
     if selection == TIDecouplingMode.SPLIT_Q_VDW:
@@ -329,6 +330,38 @@ def _prompt_ti_decoupling_mode(implementation_mode: TIImplementationMode) -> TID
         )
     print_notice("Selected TI Decoupling", notice, border_style="cyan")
     return selection
+
+
+def _prompt_ti_execution_profile(implementation_mode: TIImplementationMode) -> SlurmProfile:
+    if implementation_mode != TIImplementationMode.AMBER_12_6_4_GTI:
+        return _prompt_execution_profile()
+    choices = [
+        WizardChoice(
+            SlurmProfile.GPU.value,
+            "GPU / pmemd.cuda (required)",
+            "GTI/CUDA requires pmemd.cuda; generated master and Tahoma scripts will target GPU execution.",
+        ),
+        WizardChoice(
+            SlurmProfile.CPU.value,
+            "CPU / pmemd.MPI (unavailable for GTI)",
+            "GTI/CUDA cannot run with the CPU pmemd.MPI path.",
+            enabled=False,
+        ),
+    ]
+    print_notice(
+        "GTI GPU Requirement",
+        "Amber 12-6-4 GTI must run with [bold]GPU/pmemd.cuda[/bold]. GPU is selected by default; "
+        "the CPU profile is unavailable for this mode.",
+        border_style="yellow",
+    )
+    _display_choice_table("GTI execution target", choices)
+    return SlurmProfile(
+        _prompt_choice(
+            "Choose the GTI execution target",
+            choices,
+            default_key=SlurmProfile.GPU.value,
+        )
+    )
 
 
 def _prompt_formal_charge(element: str) -> int:
@@ -1456,6 +1489,60 @@ def _prompt_discovered_workflow(discoveries: list[WorkflowDiscovery]) -> Workflo
         return selected
 
 
+def _parse_discovered_workflow_selection(
+    raw: str,
+    discoveries: list[WorkflowDiscovery],
+) -> list[WorkflowDiscovery] | None:
+    token = raw.strip().lower()
+    if token == "0":
+        return None
+    if token in {"a", "all", "*"}:
+        selected = [item for item in discoveries if item.selectable]
+        if not selected:
+            raise ValueError("No detected workflow folder is ready for TI.")
+        return selected
+    if not token:
+        raise ValueError("Choose A, 0, one workflow number, or comma-separated workflow numbers.")
+
+    selected: list[WorkflowDiscovery] = []
+    seen: set[int] = set()
+    for item in re.split(r"[\s,]+", token):
+        if not item:
+            continue
+        if not item.isdigit():
+            raise ValueError("Choose A, 0, one workflow number, or comma-separated workflow numbers.")
+        index = int(item)
+        if index == 0:
+            raise ValueError("0 (manual input) cannot be combined with detected workflow numbers.")
+        if index < 1 or index > len(discoveries):
+            raise ValueError(f"Workflow number {index} is not present in the table.")
+        discovery = discoveries[index - 1]
+        if not discovery.selectable:
+            raise ValueError(f"Workflow {index} is not ready: {discovery.readiness_note}")
+        if index not in seen:
+            seen.add(index)
+            selected.append(discovery)
+    if not selected:
+        raise ValueError("Choose at least one ready workflow folder.")
+    return selected
+
+
+def _prompt_discovered_workflows(
+    discoveries: list[WorkflowDiscovery],
+) -> list[WorkflowDiscovery] | None:
+    selectable_indices = [index for index, item in enumerate(discoveries, start=1) if item.selectable]
+    default_choice = "A" if len(selectable_indices) > 1 else (str(selectable_indices[0]) if selectable_indices else "0")
+    while True:
+        raw = typer.prompt(
+            "Choose A for all ready workflows, one number, comma-separated numbers, or 0 for manual input",
+            default=default_choice,
+        )
+        try:
+            return _parse_discovered_workflow_selection(raw, discoveries)
+        except ValueError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+
+
 def _complex_input_from_discovery(discovery: WorkflowDiscovery) -> TIInputSelection:
     if (
         discovery.prmtop_path is None
@@ -1839,6 +1926,37 @@ def _prompt_complex_input_selection() -> TIInputSelection:
     return _prompt_manual_workflow_or_raw_files()
 
 
+def _prompt_complex_input_selections() -> list[TIInputSelection]:
+    """FreeE TI input picker with multi-workflow selection support."""
+    search_dir = Path.cwd()
+    discoveries = _discover_main_workflow_directories(search_dir)
+    if discoveries:
+        _display_discovered_workflows(search_dir, discoveries)
+        selected = _prompt_discovered_workflows(discoveries)
+        if selected is not None:
+            selections: list[TIInputSelection] = []
+            for discovery in selected:
+                _display_selected_workflow_inputs(discovery)
+                _warn_for_selected_workflow(discovery)
+                selections.append(_complex_input_from_discovery(discovery))
+            return selections
+    else:
+        raw_discoveries = _discover_raw_ti_inputs(search_dir)
+        if raw_discoveries:
+            console.print("[dim]No main.py workflow folders were detected, but raw AMBER inputs were found.[/dim]")
+            selected_raw = _prompt_raw_ti_input_selection(search_dir, raw_discoveries)
+            if selected_raw is not None:
+                selected_raw = _prompt_raw_ti_trajectory_selection(selected_raw, search_root=search_dir)
+                _display_selected_raw_ti_inputs(selected_raw)
+                return [_complex_input_from_raw_discovery(selected_raw)]
+        else:
+            console.print(
+                "[dim]No main.py workflow folders or raw AMBER topology/trajectory bundles were detected here, "
+                "so the wizard will switch to manual input.[/dim]"
+            )
+    return [_prompt_manual_workflow_or_raw_files()]
+
+
 def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWorkflowConfig:
     amber_env = detect_amber_environment()
     _print_step_header(
@@ -1977,12 +2095,13 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
     _print_step_header(
         3,
         "Choose the Execution Script and Output Location",
-        "Select whether to generate CPU or GPU master sbatch files. A separate Tahoma script will also be written automatically.",
+        (
+            "GTI/CUDA requires GPU/pmemd.cuda. GPU master and Tahoma sbatch files will be generated."
+            if ti_implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI
+            else "Select whether to generate CPU or GPU master sbatch files. A separate Tahoma script will also be written automatically."
+        ),
     )
-    profile = _prompt_execution_profile()
-    if ti_implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI and profile != SlurmProfile.GPU:
-        console.print("[bold yellow]GTI/CUDA mode requires pmemd.cuda, so the execution profile was set to GPU.[/bold yellow]")
-        profile = SlurmProfile.GPU
+    profile = _prompt_ti_execution_profile(ti_implementation_mode)
     output_dir_path = _default_output_directory(
         reference_structure_path,
         workflow_root=input_selection.workflow_root,

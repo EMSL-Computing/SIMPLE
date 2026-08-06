@@ -421,6 +421,18 @@ textarea:disabled {
   color: var(--error);
 }
 
+.resp-quit-action {
+  border-color: #fb923c;
+  background: #fff7ed;
+  color: #9a3412;
+  font-weight: 700;
+}
+
+.resp-quit-action:hover {
+  border-color: #c2410c;
+  background: #ffedd5;
+}
+
 .tab-panel {
   display: none;
   overflow: auto;

@@ -15,7 +15,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from amber_metallo.amber.leap import allowed_metal_charges, calculate_salt_ions, ion_parameter_requirements
+from amber_metallo.amber.leap import (
+    allowed_metal_charges,
+    c4_parameter_set_supports_metal_charge,
+    calculate_salt_ions,
+    ion_parameter_requirements,
+)
 from amber_metallo.config import (
     BoxShape,
     ChargeMethod,
@@ -39,6 +44,10 @@ from amber_metallo.config import (
     MetalReplacement,
     NeutralizationIon,
     PrepareConfig,
+    ProteinSiteRespClusterConfig,
+    ProteinSiteRespConfig,
+    ProteinSiteRespMode,
+    ProteinSiteRespScope,
     ProtonationChange,
     ProtonationConfig,
     ProtonationEngine,
@@ -100,6 +109,12 @@ from amber_metallo.protonation import (
     ProtonationDisplayCandidate,
     predict_protonation_prediction,
     residue_locator,
+)
+from amber_metallo.protein_site_resp import (
+    ProteinSiteRespResumeCandidate,
+    find_protein_site_resp_resume_candidates,
+    suggested_low_spin_multiplicity,
+    suggested_spin_multiplicity,
 )
 from amber_metallo.reporting import console, emit_key_value_table, print_workflow_summary
 from amber_metallo.qm.editor import launch_resp_editor
@@ -325,6 +340,11 @@ class WizardBuildResult:
 
 
 @dataclass(slots=True)
+class _ProteinSiteRespResumeSelection:
+    candidates: list[ProteinSiteRespResumeCandidate]
+
+
+@dataclass(slots=True)
 class _ProtonationVariant:
     protonation_config: ProtonationConfig
     ph: float | None = None
@@ -502,6 +522,99 @@ def _workspace_detectable_resp_candidates() -> list[object]:
     return candidates
 
 
+def _workspace_detectable_protein_site_resp_candidates() -> list[ProteinSiteRespResumeCandidate]:
+    return find_protein_site_resp_resume_candidates(Path.cwd())
+
+
+def _display_protein_site_resp_resume_candidates(
+    candidates: list[ProteinSiteRespResumeCandidate],
+) -> None:
+    table = Table(title="Existing completed protein-site RESP jobs", box=box.SIMPLE_HEAVY)
+    table.add_column("No.", style="bold cyan", justify="right", no_wrap=True)
+    table.add_column("Protein / site", style="bold white", overflow="fold")
+    table.add_column("Result", style="green", overflow="fold")
+    table.add_column("Workflow output", style="cyan", overflow="fold")
+    table.add_column("RESP job", style="dim", overflow="fold")
+    for index, candidate in enumerate(candidates, start=1):
+        payload = candidate.payload
+        metal_states = list(payload.get("formal_metal_states") or [])
+        metals = ", ".join(
+            f"{item.get('element', '?')}{int(item.get('formal_charge') or 0):+d}"
+            for item in metal_states
+            if isinstance(item, dict)
+        )
+        donors = ", ".join(str(item) for item in payload.get("donor_residues") or [])
+        site_text = candidate.source_label
+        if metals:
+            site_text += f" | {metals}"
+        if donors:
+            site_text += f" | {donors}"
+        table.add_row(
+            str(index),
+            site_text,
+            candidate.result_kind,
+            str(candidate.workflow_root),
+            str(candidate.job_dir),
+        )
+    console.print(table)
+
+
+def _parse_protein_site_resp_resume_numbers(
+    raw: str,
+    candidates: list[ProteinSiteRespResumeCandidate],
+) -> list[ProteinSiteRespResumeCandidate] | None:
+    token = raw.strip().lower()
+    if token in {"n", "no", "new", "fresh"}:
+        return None
+    if token in {"a", "all", "*"}:
+        return list(candidates)
+    selected_indices: list[int] = []
+    for item in re.split(r"[\s,]+", token):
+        if not item:
+            continue
+        if not item.isdigit() or not (1 <= int(item) <= len(candidates)):
+            raise ValueError(
+                f"Choose A for all, N for a new protein, or job number(s) from 1 to {len(candidates)}."
+            )
+        index = int(item)
+        if index not in selected_indices:
+            selected_indices.append(index)
+    if not selected_indices:
+        raise ValueError("Choose at least one RESP job, A for all, or N for a new protein.")
+    return [candidates[index - 1] for index in selected_indices]
+
+
+def _prompt_protein_site_resp_resume_selection(
+    candidates: list[ProteinSiteRespResumeCandidate],
+) -> _ProteinSiteRespResumeSelection | None:
+    if not candidates:
+        return None
+    _display_protein_site_resp_resume_candidates(candidates)
+    if not typer.confirm(
+        "Completed protein-site RESP job(s) were found. Continue from existing RESP results?",
+        default=True,
+    ):
+        console.print("[dim]Starting the normal new-protein workflow.[/dim]")
+        return None
+    if len(candidates) == 1:
+        return _ProteinSiteRespResumeSelection(candidates=[candidates[0]])
+
+    while True:
+        raw = typer.prompt(
+            "Select A for all jobs, one job number, comma-separated job numbers, or N for a new protein",
+            default="A",
+        )
+        try:
+            selected = _parse_protein_site_resp_resume_numbers(raw, candidates)
+        except ValueError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            continue
+        if selected is None:
+            console.print("[dim]Starting the normal new-protein workflow.[/dim]")
+            return None
+        return _ProteinSiteRespResumeSelection(candidates=selected)
+
+
 def _materialize_resp_resume_input_file(candidate: object) -> str:
     payload = getattr(candidate, "payload", {}) or {}
     source_file = str(payload.get("source_file") or "").strip()
@@ -662,7 +775,7 @@ def _display_choice_table(title: str, choices: list[WizardChoice]) -> None:
     for index, choice in enumerate(choices, start=1):
         row = [str(index), choice.label, choice.description]
         if any(not item.enabled for item in choices):
-            row.append("Available" if choice.enabled else "Coming soon")
+            row.append("Available" if choice.enabled else "Unavailable")
         table.add_row(*row)
     console.print(table)
 
@@ -694,7 +807,7 @@ def _prompt_yes_no(message: str, *, default: bool = True) -> bool:
 def _default_choice_index(choices: list[WizardChoice], default_key: str | None) -> int:
     if default_key is not None:
         for index, choice in enumerate(choices, start=1):
-            if choice.key == default_key:
+            if choice.key == default_key and choice.enabled:
                 return index
     for index, choice in enumerate(choices, start=1):
         if choice.enabled:
@@ -2100,7 +2213,10 @@ def _prompt_add_des_component_library() -> None:
                 return
 
 
-def _prompt_input_config() -> tuple[InputConfig, object | None, object | None, DESConfig | None]:
+def _prompt_input_config() -> (
+    tuple[InputConfig, object | None, object | None, DESConfig | None]
+    | _ProteinSiteRespResumeSelection
+):
     while True:
         try:
             while True:
@@ -2159,6 +2275,12 @@ def _prompt_input_config() -> tuple[InputConfig, object | None, object | None, D
                         detected_resp_candidate,
                         None,
                     )
+
+            protein_resume = _prompt_protein_site_resp_resume_selection(
+                _workspace_detectable_protein_site_resp_candidates()
+            )
+            if protein_resume is not None:
+                return protein_resume
 
             console.print(
                 "Enter a local PDB path or a 4-character PDB ID. "
@@ -3426,16 +3548,36 @@ def _metal_model_choices() -> list[WizardChoice]:
     ]
 
 
-def _metal_c4_parameter_set_choices() -> list[WizardChoice]:
+def _metal_c4_parameter_set_choices(
+    metal_species: list[tuple[str, int]] | None = None,
+) -> list[WizardChoice]:
+    unsupported_duvail = sorted(
+        {
+            (element.title(), int(charge))
+            for element, charge in (metal_species or [])
+            if not c4_parameter_set_supports_metal_charge(
+                DESC4ParameterSet.OPC_DUVAIL,
+                element,
+                charge,
+            )
+        }
+    )
+    duvail_description = (
+        "Use the bundled Duvail Ln3+ ion parameters, polarizability data, and C4 values with OPC water."
+    )
+    if unsupported_duvail:
+        unsupported_text = ", ".join(f"{element}{charge}+" for element, charge in unsupported_duvail)
+        duvail_description += f" Unavailable because the bundled files do not contain {unsupported_text}."
     return [
         WizardChoice(
             DESC4ParameterSet.OPC_DUVAIL.value,
             "OPC + Duvail",
-            "Default. Use the bundled Duvail ion frcmod, polarizability data, and C4 values with OPC water.",
+            duvail_description,
+            enabled=not unsupported_duvail,
         ),
         WizardChoice(
             DESC4ParameterSet.SPCE_LIMERZ.value,
-            "Li/Merz",
+            "SPC/E + Li/Merz",
             "Use compatible Amber Li/Merz 12-6-4 ion files for the selected water model (SPC/E is the default).",
         ),
     ]
@@ -4486,6 +4628,7 @@ def execute_wizard_configs(
 ) -> int:
     failures: list[tuple[WorkflowConfig, Exception]] = []
     succeeded_names: set[str] = set()
+    pending_names: set[str] = set()
     attempted_names: set[str] = set()
     total = len(configs)
 
@@ -4495,7 +4638,7 @@ def execute_wizard_configs(
         if total > 1:
             console.print(
                 Panel(
-                    f"Starting output {index} of {total}: {output_name}",
+                    Text(f"Starting output {index} of {total}: {output_name}"),
                     border_style="bright_cyan",
                     box=box.ROUNDED,
                 )
@@ -4509,15 +4652,20 @@ def execute_wizard_configs(
             )
         except Exception as exc:
             failures.append((config, exc))
-            console.print(
-                f"[bold red]Workflow failed for {output_name}:[/bold red] {exc}"
-            )
+            failure_message = Text()
+            failure_message.append(f"Workflow failed for {output_name}:", style="bold red")
+            failure_message.append(f" {exc}")
+            console.print(failure_message)
             if failure_hint:
-                console.print(f"[bold yellow]{failure_hint}[/bold yellow]")
+                console.print(Text(failure_hint, style="bold yellow"))
             if index < total and typer.confirm("Continue with the remaining outputs?", default=True):
                 continue
             break
-        succeeded_names.add(output_name)
+        site_resp_status = str(((result.get("protein_site_resp") or {}).get("status") or ""))
+        if site_resp_status in {"reference_pending", "cluster_review_required", "setup_pending", "review_required"}:
+            pending_names.add(output_name)
+        else:
+            succeeded_names.add(output_name)
         print_workflow_summary(result)
 
     if total > 1 or failures:
@@ -4528,16 +4676,143 @@ def execute_wizard_configs(
         for config in configs:
             name = _workflow_output_label(config.output_dir)
             if name in failed_names:
-                table.add_row(name, f"[bold red]Failed[/bold red] ({failed_names[name]})")
+                status = Text("Failed", style="bold red")
+                status.append(f" ({failed_names[name]})")
+            elif name in pending_names:
+                status = Text("RESP pending", style="bold yellow")
             elif name in succeeded_names:
-                table.add_row(name, "[bold green]Succeeded[/bold green]")
+                status = Text("Succeeded", style="bold green")
             elif name in attempted_names:
-                table.add_row(name, "[bold yellow]Stopped[/bold yellow]")
+                status = Text("Stopped", style="bold yellow")
             else:
-                table.add_row(name, "[dim]Not started[/dim]")
+                status = Text("Not started", style="dim")
+            table.add_row(Text(name), status)
         console.print(table)
 
     return 0 if not failures else 1
+
+
+def _resume_input_config(candidate: ProteinSiteRespResumeCandidate) -> InputConfig:
+    payload = candidate.payload
+    source_pdb = str(payload.get("source_pdb") or "").strip()
+    if source_pdb and Path(source_pdb).expanduser().exists():
+        return InputConfig(source=InputSource.PDB_FILE, path=str(Path(source_pdb).expanduser().resolve()))
+    prepared_pdb = str(payload.get("prepared_system_pdb") or "").strip()
+    if prepared_pdb and Path(prepared_pdb).expanduser().exists():
+        return InputConfig(source=InputSource.PDB_FILE, path=str(Path(prepared_pdb).expanduser().resolve()))
+    fallback = candidate.workflow_root / "02_system" / "system.pdb"
+    if fallback.exists():
+        return InputConfig(source=InputSource.PDB_FILE, path=str(fallback.resolve()))
+    raise ValueError(f"The original structure for RESP job {candidate.job_dir} is no longer available.")
+
+
+def _resume_cluster_config(candidate: ProteinSiteRespResumeCandidate) -> ProteinSiteRespClusterConfig:
+    cluster = candidate.payload.get("cluster") or {}
+    if not isinstance(cluster, dict):
+        cluster = {}
+    return ProteinSiteRespClusterConfig(
+        metal_sites=[int(item) for item in cluster.get("metal_sites") or []],
+        donor_residues=[str(item) for item in cluster.get("donor_residue_keys") or []],
+        fixed_environment=[str(item) for item in cluster.get("fixed_environment_keys") or []],
+        multiplicity=int(cluster.get("multiplicity") or candidate.payload.get("multiplicity") or 1),
+        job_dir=str(candidate.job_dir),
+    )
+
+
+def _prompt_legacy_resume_md_settings() -> tuple[MDConfig, SlurmConfig]:
+    console.print(
+        Panel(
+            "This RESP job was created before SIMPLE stored an automatic workflow-config snapshot. "
+            "The prepared topology and RESP atom mapping are intact, but the previous MD/Slurm choices "
+            "cannot be recovered. Confirm those continuation settings below; the protein will not be rebuilt.",
+            title="[bold yellow]MD settings needed for this older RESP job[/bold yellow]",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+    )
+    protocol = _prompt_md_protocol()
+    temperature = typer.prompt("Target temperature (K)", default=300.0, type=float)
+    pressure = typer.prompt("Target pressure (bar)", default=1.0, type=float)
+    production_time = _prompt_positive_float("Production time (ns)", default=100.0)
+    profile = _prompt_execution_profile()
+    return (
+        MDConfig(
+            protocol=protocol,
+            temperature_k=temperature,
+            pressure_bar=pressure,
+            production_time_ns=production_time,
+        ),
+        SlurmConfig(profile=profile),
+    )
+
+
+def _build_protein_site_resp_resume_result(
+    selection: _ProteinSiteRespResumeSelection,
+    write_config: str | None,
+) -> WizardBuildResult:
+    grouped: dict[Path, list[ProteinSiteRespResumeCandidate]] = {}
+    for candidate in selection.candidates:
+        grouped.setdefault(candidate.workflow_root, []).append(candidate)
+
+    legacy_settings: tuple[MDConfig, SlurmConfig] | None = None
+    configs: list[WorkflowConfig] = []
+    suffixes: list[tuple[str, ...]] = []
+    summary_table = Table(title="Protein-site RESP continuation plan", box=box.SIMPLE_HEAVY)
+    summary_table.add_column("Workflow output", style="bold cyan", overflow="fold")
+    summary_table.add_column("Selected RESP job(s)", style="white", justify="right")
+    summary_table.add_column("Continuation settings", style="green")
+
+    for workflow_root, candidates in grouped.items():
+        snapshot_path = workflow_root / "workflow_config.toml"
+        if snapshot_path.exists():
+            config = load_config(snapshot_path)
+            settings_label = "saved workflow settings"
+        else:
+            if legacy_settings is None:
+                legacy_settings = _prompt_legacy_resume_md_settings()
+            md_config, slurm_config = legacy_settings
+            config = WorkflowConfig(
+                input=_resume_input_config(candidates[0]),
+                md=md_config.model_copy(deep=True),
+                slurm=slurm_config.model_copy(
+                    deep=True,
+                    update={"job_name": workflow_root.name},
+                ),
+                output_dir=str(workflow_root),
+            )
+            settings_label = "newly confirmed MD/Slurm settings"
+
+        scopes = {
+            ProteinSiteRespScope(str(candidate.payload.get("scope") or ProteinSiteRespScope.SIDECHAIN.value))
+            for candidate in candidates
+        }
+        if len(scopes) != 1:
+            raise ValueError(
+                f"Selected RESP jobs under {workflow_root} use different fitting scopes and cannot be applied together."
+            )
+        config.output_dir = str(workflow_root)
+        config.protein_site_resp = ProteinSiteRespConfig(
+            mode=ProteinSiteRespMode.RESP,
+            scope=next(iter(scopes)),
+            apply_mode=RespApplyMode.APPLY_EXISTING,
+            search_roots=[str(workflow_root)],
+            job_dirs=[str(candidate.job_dir) for candidate in candidates],
+            resume_existing_system=True,
+            clusters=[_resume_cluster_config(candidate) for candidate in candidates],
+        )
+        config.slurm.job_name = config.slurm.job_name or workflow_root.name
+        configs.append(config)
+        suffixes.append((workflow_root.name,))
+        summary_table.add_row(str(workflow_root), str(len(candidates)), settings_label)
+
+    console.print(summary_table)
+    console.print(
+        "[blink bold cyan]Processing...[/] SIMPLE will refit any grid-only result, show the charge review, "
+        "patch the selected existing topology, and then generate the MD/Slurm files."
+    )
+    result = WizardBuildResult(configs=configs, variant_suffixes=suffixes)
+    result.saved_config_paths.extend(_save_wizard_configs(result, write_config))
+    return result
 
 
 def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
@@ -4549,6 +4824,8 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
         "and decide how to handle waters, hetero residues, and metal sites.",
     )
     prompted_input = _prompt_input_config()
+    if isinstance(prompted_input, _ProteinSiteRespResumeSelection):
+        return _build_protein_site_resp_resume_result(prompted_input, write_config)
     if len(prompted_input) == 3:
         input_config, inspection_summary, detected_resp_candidate = prompted_input
         des_config = None
@@ -4779,6 +5056,7 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
         console.print("[dim]No metal sites remain after Step 1, so metal-model selection is skipped.[/dim]")
 
     variant_metal_charge_assignments = [[] for _ in variant_prepare_configs]
+    batch_charge_map: dict[tuple[int, str], int] = {}
     c4_parameter_set = DESC4ParameterSet.OPC_DUVAIL
     if remaining_metal_site_count > 0 and metal_model == MetalModel.MODEL_1264:
         batch_charge_map = _prompt_batch_metal_charge_assignments(inspection_summary, variant_prepare_configs)
@@ -4786,7 +5064,11 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
             _variant_metal_charge_assignments(inspection_summary, prepare_config, batch_charge_map)
             for prepare_config in variant_prepare_configs
         ]
-        parameter_choices = _metal_c4_parameter_set_choices()
+        selected_metal_species = [
+            (element, charge)
+            for (_site, element), charge in batch_charge_map.items()
+        ]
+        parameter_choices = _metal_c4_parameter_set_choices(selected_metal_species)
         _display_choice_table("Metal 12-6-4 parameter set", parameter_choices)
         c4_parameter_set = DESC4ParameterSet(
             _prompt_choice(
@@ -4811,8 +5093,85 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
     protonation_preview_config = protonation_configs[0]
     ph_batch_active = len(protonation_variants) > 1
 
+    protein_site_resp_config = ProteinSiteRespConfig()
+    if remaining_metal_site_count > 0 and metal_model == MetalModel.MODEL_1264:
+        _print_step_header(
+            4,
+            "Choose Metal-Site Protein Charges",
+            "Keep standard ff19SB charges or prepare an expert, site-specific RESP redistribution "
+            "for directly coordinating protein residues.",
+        )
+        console.print(
+            Panel(
+                "[bold]Standard FF[/bold] is the validated default for the 12-6-4 model.\n"
+                "[bold yellow]Site-specific RESP[/bold yellow] can be useful when metal coordination is expected to "
+                "strongly polarize HIS/CYS/ASP/GLU/MET side chains, but it is a hybrid model outside the original "
+                "12-6-4 parameter combination. The metal point charge remains fixed at its integer oxidation-state "
+                "charge, and every target residue keeps its original total charge.",
+                title="[bold]Protein Metal-Site Charge Model[/bold]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+        if _prompt_yes_no("Prepare site-specific RESP charges for the directly coordinating residues?", default=False):
+            scope_choices = [
+                WizardChoice(
+                    ProteinSiteRespScope.SIDECHAIN.value,
+                    "Side chain (recommended)",
+                    "Fit CB-and-beyond atoms while fixing backbone, caps, metal, water, and other QM environment charges.",
+                ),
+                WizardChoice(
+                    ProteinSiteRespScope.WHOLE_RESIDUE.value,
+                    "Whole residue",
+                    "Fit all atoms of each coordinating residue while preserving each residue's total charge.",
+                ),
+            ]
+            _display_choice_table("Protein-site RESP scope", scope_choices)
+            scope = ProteinSiteRespScope(
+                _prompt_choice(
+                    "Choose the protein-site RESP scope",
+                    scope_choices,
+                    default_key=ProteinSiteRespScope.SIDECHAIN.value,
+                )
+            )
+            suggestion_rows = []
+            for (_site, element), charge in sorted(batch_charge_map.items()):
+                suggestion = suggested_spin_multiplicity(element, charge)
+                low_spin = suggested_low_spin_multiplicity(element, charge)
+                suggestion_rows.append(
+                    f"{element}{charge:+d}: default/high-spin "
+                    f"{suggestion if suggestion is not None else 'no curated suggestion'}; low-spin "
+                    f"{low_spin if low_spin is not None else 'no conventional alternative'}"
+                )
+            console.print(
+                "[bold cyan]Spin guidance:[/bold cyan] "
+                + (", ".join(suggestion_rows) if suggestion_rows else "No curated suggestion is available.")
+                + "\n[dim]After TLeap establishes the exact atom mapping, SIMPLE will show every connected metal "
+                "cluster and require explicit confirmation of its multiplicity and donor/environment lists.[/dim]"
+            )
+            search_root = typer.prompt(
+                _back_prompt_suffix("Folder to search automatically for prior site-RESP jobs"),
+                default=str(Path.cwd()),
+            ).strip()
+            if _is_back_token(search_root):
+                raise WizardBack()
+            explicit_job = typer.prompt(
+                _back_prompt_suffix("Specific completed site-RESP job folder (blank for automatic detection)"),
+                default="",
+                show_default=False,
+            ).strip()
+            if _is_back_token(explicit_job):
+                raise WizardBack()
+            protein_site_resp_config = ProteinSiteRespConfig(
+                mode=ProteinSiteRespMode.RESP,
+                scope=scope,
+                apply_mode=RespApplyMode.DETECT,
+                search_roots=[search_root] if search_root else [],
+                job_dirs=[explicit_job] if explicit_job else [],
+            )
+
     _print_step_header(
-        4,
+        5,
         "Choose Solvation and Ion Settings",
         "Select the solvent model, box geometry, and ion conditions for the prepared system.",
     )
@@ -4879,7 +5238,7 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
         )
 
     _print_step_header(
-        5,
+        6,
         "Choose the MD Protocol",
         "Pick the equilibration strategy and production settings for the molecular dynamics run.",
     )
@@ -4897,7 +5256,7 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
     )
 
     _print_step_header(
-        6,
+        7,
         "Choose the Execution Script and Output Location",
         "Select whether to generate a CPU or GPU Slurm script. "
         "Cluster-specific resource lines can be edited directly in the generated sbatch file.",
@@ -5016,6 +5375,7 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
                 input=input_config,
                 prepare=prepare_config,
                 protonation=protonation_variant.protonation_config.model_copy(deep=True),
+                protein_site_resp=protein_site_resp_config.model_copy(deep=True),
                 ligands=ligands_config.model_copy(deep=True),
                 system=SystemConfig(
                     protein_ff=protein_ff,

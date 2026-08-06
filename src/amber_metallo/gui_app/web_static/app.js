@@ -50,6 +50,8 @@ const state = {
   selectedLibraryFileEditable: false,
   structureComponent: null,
   selectedRespJobDir: "",
+  proteinSiteRespApproved: false,
+  proteinSiteRespClusters: [],
   proteinLoaded: false,
   proteinLoadSerial: 0,
   lastProteinMissingLoopAction: "",
@@ -1789,6 +1791,7 @@ function renderSystemMetalCharges(sites) {
   if (!sites || !sites.length) {
     $("system_metal_charges").textContent = "No current metal sites.";
     refreshRespChargeHint();
+    syncSystemC4ParameterSet(false, false);
     return;
   }
   const showCoordination = $("workflow_type")?.value === "metallophore";
@@ -1829,6 +1832,7 @@ function renderSystemMetalCharges(sites) {
   for (const row of document.querySelectorAll(".metal-charge-row")) {
     row.querySelector(".metal-charge-select")?.addEventListener("change", () => {
       updateCoordinationSelect(row);
+      syncSystemC4ParameterSet(true, true);
       if (showCoordination) {
         state.metCoordination = null;
         refreshMetalCoordinationStatus();
@@ -1842,12 +1846,18 @@ function renderSystemMetalCharges(sites) {
     });
   }
   refreshMetalCoordinationStatus();
+  syncSystemC4ParameterSet(true, true);
 }
 
 function resetProteinTables() {
   state.proteinMetals = [];
   state.proteinSourceMetals = [];
   state.proteinMetalActions = new Map();
+  state.proteinSiteRespApproved = false;
+  state.proteinSiteRespClusters = [];
+  if ($("protein_site_resp_mode")) $("protein_site_resp_mode").value = "standard_ff";
+  if ($("protein_site_resp_job_dir")) $("protein_site_resp_job_dir").value = "";
+  if ($("protein_site_resp_multiplicity_confirmed")) $("protein_site_resp_multiplicity_confirmed").checked = false;
   state.proteinInsertions = [];
   state.proteinInsertionDonors = [];
   state.proteinResidues = [];
@@ -1870,6 +1880,8 @@ function resetProteinTables() {
   if ($("propka_box")) $("propka_box").textContent = "Run PropKa to review selectable residue-state changes.";
   if ($("disulfide_state")) $("disulfide_state").textContent = "Load a protein preview to detect CYS-CYS candidate pairs.";
   if ($("disulfide_box")) $("disulfide_box").textContent = "No CYS-CYS candidates loaded.";
+  if ($("apply_protein_site_resp")) $("apply_protein_site_resp").hidden = true;
+  if ($("protein_site_resp_review")) $("protein_site_resp_review").hidden = true;
 }
 
 function proteinSelectionFromKey(key) {
@@ -2811,11 +2823,14 @@ function currentQmSettings() {
 
 function collectMetalCharges() {
   if ($("workflow_type")?.value === "deep_eutectic") return [];
-  if (!$("apply_1264_metals").checked) return [];
   const out = [];
   for (const row of document.querySelectorAll(".metal-charge-row")) {
     const select = row.querySelector(".metal-charge-select");
-    out.push({site: Number(row.dataset.site), charge: Number(select.value)});
+    out.push({
+      site: Number(row.dataset.site),
+      charge: Number(select.value),
+      element: String(row.dataset.element || "").trim(),
+    });
   }
   return out;
 }
@@ -2901,6 +2916,7 @@ function collectDesConfig() {
 }
 
 function collectPayload() {
+  syncSystemC4ParameterSet(false, false);
   const workflow = $("workflow_type").value;
   const payload = {
     workflow_type: workflow,
@@ -2909,6 +2925,7 @@ function collectPayload() {
     system: {
       protein_ff: $("protein_ff").value || "ff19SB",
       ligand_ff: $("ligand_ff").value || "gaff2",
+      apply_1264: $("apply_1264_metals").checked,
       c4_parameter_set: $("system_c4_parameter_set").value || "opc_duvail",
       water_model: $("water_model").value || "opc",
       box_shape: $("box_shape").value || "oct",
@@ -2957,6 +2974,7 @@ function collectPayload() {
     };
   } else if (workflow === "metalloprotein") {
     syncProteinInputFields();
+    const siteRespJobDir = $("protein_site_resp_job_dir")?.value.trim() || "";
     payload.protein = {
       input_mode: $("protein_input_mode").value,
       input_value: $("protein_input").value.trim(),
@@ -2970,6 +2988,16 @@ function collectPayload() {
           .filter((node) => node.checked && !node.disabled)
           .map((node) => state.propkaChanges[Number(node.dataset.idx)]?.change)
           .filter(Boolean),
+      },
+      site_resp: {
+        mode: siteRespJobDir ? "resp" : "standard_ff",
+        scope: $("protein_site_resp_scope")?.value || "sidechain",
+        apply_mode: state.proteinSiteRespApproved ? "apply_existing" : "detect",
+        default_multiplicity: Number.parseInt($("protein_site_resp_multiplicity")?.value || "1", 10),
+        multiplicity_confirmed: Boolean(siteRespJobDir),
+        search_root: $("protein_site_resp_search_root")?.value.trim() || ".",
+        job_dir: siteRespJobDir,
+        clusters: state.proteinSiteRespClusters || [],
       },
       ligands: {mode: "manual"},
     };
@@ -3029,15 +3057,60 @@ function syncMetal1264Ui() {
   syncSystem1264EnabledState(false);
 }
 
-function syncSystemC4ParameterSet(updateWater = true) {
-  const value = $("system_c4_parameter_set").value || "opc_duvail";
+function selectedSystemMetalSpecies() {
+  const species = [];
+  const seen = new Set();
+  for (const row of document.querySelectorAll(".metal-charge-row")) {
+    const element = String(row.dataset.element || "").trim();
+    const charge = Number.parseInt(row.querySelector(".metal-charge-select")?.value || "0", 10);
+    if (!element || !Number.isInteger(charge) || charge < 1) continue;
+    const key = `${element}:${charge}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    species.push({element, charge});
+  }
+  return species;
+}
+
+function unsupportedDuvailSpecies() {
+  return selectedSystemMetalSpecies().filter(({element, charge}) => {
+    const record = (state.bootstrap?.supported_metals || []).find((item) => item.element === element);
+    return !record || !(record.duvail_charges || []).map(Number).includes(Number(charge));
+  });
+}
+
+function syncSystemC4ParameterSet(updateWater = true, announce = false) {
+  const select = $("system_c4_parameter_set");
+  const unsupported = unsupportedDuvailSpecies();
+  const duvailOption = Array.from(select.options).find((item) => item.value === "opc_duvail");
+  if (duvailOption) duvailOption.disabled = unsupported.length > 0;
+
+  let forcedToLimerz = false;
+  if (unsupported.length && select.value === "opc_duvail") {
+    select.value = "spce_limerz";
+    forcedToLimerz = true;
+  }
+  const value = select.value || "opc_duvail";
   const record = (state.bootstrap?.c4_parameter_sets || []).find((item) => item.key === value);
   const recommendedWater = record?.water_model || (value === "spce_limerz" ? "spce" : "opc");
-  if (updateWater && Array.from($("water_model").options).some((item) => item.value === recommendedWater)) {
+  if ((updateWater || forcedToLimerz) && Array.from($("water_model").options).some((item) => item.value === recommendedWater)) {
     $("water_model").value = recommendedWater;
   }
   $("system_c4_note").textContent = record?.description || "Select the 12-6-4 parameter family used during MD system setup.";
+
+  const compatibilityWarning = $("system_c4_compat_warning");
+  if (unsupported.length) {
+    const unsupportedText = unsupported.map(({element, charge}) => `${element}${charge}+`).join(", ");
+    const message = `OPC + Duvail does not support the selected ion(s): ${unsupportedText}. Duvail is disabled; SPC/E + Li/Merz and SPC/E solvation are selected instead.`;
+    compatibilityWarning.textContent = message;
+    compatibilityWarning.hidden = false;
+    if (announce && forcedToLimerz) setStatus(message, "warn");
+  } else {
+    compatibilityWarning.textContent = "";
+    compatibilityWarning.hidden = true;
+  }
   syncSystemC4WaterWarning(false);
+  return unsupported;
 }
 
 function waterModelLabel(value) {
@@ -3864,15 +3937,164 @@ async function previewSolvation() {
   setStatus("Solvation preview loaded.", "ok");
 }
 
+async function shutdownGui() {
+  setStatus("Shutting down SIMPLE Web GUI...", "warn");
+  await api("/api/quit", {});
+  window.open("", "_self");
+  window.close();
+  setTimeout(() => {
+    document.body.innerHTML = "<div class=\"closed-message\">SIMPLE Web GUI closed. You can return to the command prompt.</div>";
+  }, 250);
+}
+
 async function finishWorkflow() {
   setStatus("Building final AMBER inputs. This may take a moment...", "warn");
   const data = await api("/api/finish", collectPayload());
+  const siteResp = data.protein_site_resp || data.result?.protein_site_resp || null;
+  if (siteResp?.status === "cluster_review_required") {
+    $("finish_note").textContent = "This result is missing the reviewed cluster metadata required for GUI import. Reopen it through main.py.";
+    setStatus("Use main.py to review this protein-site RESP cluster before importing it in the GUI.", "error");
+    return data;
+  }
+  if (siteResp?.status === "setup_pending") {
+    renderProteinSiteRespReview(siteResp);
+    $("finish_note").textContent = "The selected site-RESP job is not complete. Finish it through main.py/NWChem, then scan the case folder again.";
+    setStatus("Only completed main.py site-RESP results can be imported by the GUI.", "warn");
+    return data;
+  }
+  if (siteResp?.status === "reference_pending") {
+    $("finish_note").textContent = siteResp.message || "An executed TLeap reference topology is required.";
+    setStatus("Protein-site RESP reference topology is pending.", "warn");
+    return data;
+  }
+  if (siteResp?.status === "review_required") {
+    state.proteinSiteRespApproved = false;
+    renderProteinSiteRespReview(siteResp);
+    $("finish_note").textContent = "A fingerprint-matching RESP result was found. Review the charge table and approve it to resume MD generation.";
+    setStatus("Protein-site RESP charge review is required before application.", "warn");
+    return data;
+  }
+  if (siteResp?.status === "applied") {
+    renderProteinSiteRespReview(siteResp);
+  }
   const outputs = data.result?.system?.output_files || {};
   const outputText = [outputs.prmtop, outputs.inpcrd].filter(Boolean).join(" | ");
   $("finish_note").textContent = outputText
     ? `Build complete. ${outputText}`
     : `Build complete. Config: ${data.config_path}`;
   setStatus(`Build complete. Config: ${data.config_path}`, "ok");
+  return data;
+}
+
+function renderProteinSiteRespCandidates(candidates) {
+  const box = $("protein_site_resp_candidates");
+  if (!box) return;
+  if (!candidates?.length) {
+    box.textContent = "No protein-site RESP manifests were found below this search root.";
+    return;
+  }
+  box.innerHTML = `<table><thead><tr><th>Source / site</th><th>Scope</th><th>Spin</th><th>Status</th><th>Folder</th></tr></thead><tbody>${candidates.map((item, index) => `
+    <tr>
+      <td>${escapeHtml(item.description || `${item.source_label || "protein"}; sites ${(item.metal_sites || []).join(",")}`)}</td>
+      <td>${escapeHtml(item.scope || "")}</td>
+      <td>${escapeHtml(item.multiplicity ?? "")}</td>
+      <td>${item.completed ? "Completed" : "Pending"}</td>
+      <td><button type="button" class="select-protein-site-resp" data-index="${index}" ${item.completed ? "" : "disabled"}>${item.completed ? "Select" : "Not ready"}</button><br>${escapeHtml(item.job_dir || "")}</td>
+    </tr>`).join("")}</tbody></table>`;
+  for (const button of document.querySelectorAll(".select-protein-site-resp")) {
+    button.addEventListener("click", () => {
+      const selected = candidates[Number(button.dataset.index)];
+      $("protein_site_resp_job_dir").value = selected.job_dir || "";
+      $("protein_site_resp_mode").value = "resp";
+      $("protein_site_resp_scope").value = selected.scope || "sidechain";
+      $("protein_site_resp_multiplicity").value = String(selected.multiplicity || 1);
+      $("protein_site_resp_multiplicity_confirmed").checked = true;
+      const cluster = selected.cluster || {};
+      state.proteinSiteRespClusters = cluster.metal_sites?.length ? [{
+        metal_sites: cluster.metal_sites,
+        donor_residues: cluster.donor_residue_keys || [],
+        fixed_environment: cluster.fixed_environment_keys || [],
+        multiplicity: selected.multiplicity || cluster.multiplicity || 1,
+        job_dir: selected.job_dir || null,
+      }] : [];
+      state.proteinSiteRespApproved = false;
+      setStatus("Completed main.py site-RESP result selected. SIMPLE will still require an exact prepared-system fingerprint match.", "ok");
+    });
+  }
+}
+
+function renderProteinSiteRespReview(siteResp) {
+  const box = $("protein_site_resp_review");
+  if (!box) return;
+  const jobs = siteResp.jobs || [];
+  const reviews = jobs.map((job) => job.review).filter(Boolean);
+  if (!reviews.length) {
+    box.hidden = false;
+    box.innerHTML = `<strong>${escapeHtml(siteResp.message || siteResp.status || "Protein-site RESP")}</strong>${jobs.length ? `<br>${jobs.map((job) => escapeHtml(job.job_dir || "")).join("<br>")}` : ""}`;
+    if ($("apply_protein_site_resp")) $("apply_protein_site_resp").hidden = true;
+    return;
+  }
+  const rows = reviews.flatMap((review) => (review.changes || []).map((change) => `
+    <tr><td>${escapeHtml(`${change.residue_key || ""}@${change.atom_name || ""}`)}</td>
+    <td>${Number(change.original_charge).toFixed(6)}</td><td>${Number(change.charge).toFixed(6)}</td>
+    <td>${Number(change.delta).toFixed(6)}</td></tr>`));
+  const metrics = reviews.map((review) => escapeHtml(`${review.description || "site"}: ESP RMSE ${review.esp_rmse ?? "N/A"}; constraint residual ${review.maximum_constraint_residual ?? "N/A"}`)).join("<br>");
+  const residueSums = reviews.flatMap((review) => review.residue_sums || []);
+  const sumText = residueSums.map((item) => escapeHtml(`${item.label}: ${Number(item.baseline).toFixed(6)} -> ${Number(item.fitted).toFixed(6)}`)).join("<br>");
+  const symmetryCount = reviews.reduce((count, review) => count + (review.symmetry_constraints || []).length, 0);
+  const warnings = reviews.flatMap((review) => review.warnings || []);
+  box.hidden = false;
+  box.innerHTML = `${metrics}${sumText ? `<br><strong>Residue totals</strong><br>${sumText}` : ""}<br>Verified symmetry constraints: ${symmetryCount}${warnings.length ? `<div class="warn-box">${warnings.map(escapeHtml).join("<br>")}</div>` : ""}
+    <table><thead><tr><th>Atom</th><th>Baseline</th><th>RESP</th><th>Delta</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  if ($("apply_protein_site_resp")) $("apply_protein_site_resp").hidden = false;
+}
+
+async function scanProteinSiteRespFolders() {
+  const data = await api("/api/protein-site-resp/candidates", {
+    search_root: $("protein_site_resp_search_root")?.value.trim() || ".",
+  });
+  renderProteinSiteRespCandidates(data.candidates || []);
+  setStatus(`Protein-site RESP scan found ${(data.candidates || []).length} candidate(s). Exact compatibility is checked after TLeap.`, "ok");
+}
+
+async function uploadProteinSiteRespCase(fileList) {
+  const allowed = /\.(?:json|grid|xyz|nw|sbatch|py|txt|log|out|pdb|prmtop|inpcrd|toml)$/i;
+  const selected = Array.from(fileList || []).filter((file) => allowed.test(file.name));
+  if (!selected.length) {
+    throw new Error("The selected case folder contains no recognizable protein-site RESP files.");
+  }
+  if (!selected.some((file) => file.name === "site_resp_manifest.json")) {
+    throw new Error("Choose the generated case folder that contains a site_resp_manifest.json in one of its subdirectories.");
+  }
+  const form = new FormData();
+  for (const file of selected) {
+    form.append("files", file, file.name);
+    form.append("relative_paths", file.webkitRelativePath || file.name);
+  }
+  const response = await fetch("/api/protein-site-resp/upload", {method: "POST", body: form});
+  const data = await response.json();
+  if (!response.ok || data.ok === false) throw new Error(data.error || "Could not open the selected RESP case folder.");
+  $("protein_site_resp_search_root").value = data.search_root || ".";
+  $("protein_site_resp_job_dir").value = "";
+  $("protein_site_resp_mode").value = "standard_ff";
+  $("protein_site_resp_multiplicity_confirmed").checked = false;
+  state.proteinSiteRespApproved = false;
+  state.proteinSiteRespClusters = [];
+  renderProteinSiteRespCandidates(data.candidates || []);
+  const completed = (data.candidates || []).filter((item) => item.completed).length;
+  setStatus(
+    `Selected case folder scanned recursively: ${(data.candidates || []).length} RESP job(s), ${completed} completed.`,
+    completed ? "ok" : "warn"
+  );
+}
+
+function openProteinSiteRespDirectoryPicker() {
+  $("protein_site_resp_directory_picker").click();
+}
+
+async function approveProteinSiteResp() {
+  state.proteinSiteRespApproved = true;
+  await finishWorkflow();
 }
 
 async function buildRespAssets() {
@@ -3972,6 +4194,17 @@ function setupEvents() {
   $("build_resp_assets").addEventListener("click", () => runBusy("Building RESP input assets...", buildRespAssets).catch((err) => setStatus(err.message, "error")));
   $("export_met_pdb").addEventListener("click", () => runBusy("Writing metallophore PDB...", exportMetallophorePdb).catch((err) => setStatus(err.message, "error")));
   $("scan_resp").addEventListener("click", () => runBusy("Scanning RESP folders...", scanRespFolders).catch((err) => setStatus(err.message, "error")));
+  $("scan_protein_site_resp").addEventListener("click", openProteinSiteRespDirectoryPicker);
+  $("protein_site_resp_directory_picker").addEventListener("change", (ev) => {
+    const input = ev.currentTarget;
+    runBusy("Uploading and recursively scanning the selected RESP case folder...", () => uploadProteinSiteRespCase(input.files))
+      .catch((err) => setStatus(err.message, "error"))
+      .finally(() => { input.value = ""; });
+  });
+  $("apply_protein_site_resp").addEventListener("click", () => runBusy("Applying reviewed protein-site RESP charges...", approveProteinSiteResp).catch((err) => {
+    state.proteinSiteRespApproved = false;
+    setStatus(err.message, "error");
+  }));
   $("load_protein").addEventListener("click", () => runBusy("Loading protein preview...", loadProtein).catch((err) => setStatus(err.message, "error")));
   $("protein_use_selected_residues").addEventListener("click", () => runBusy("Loading insertion donor candidates...", loadProteinInsertionDonors).catch((err) => setStatus(err.message, "error")));
   $("protein_preview_insert_metal").addEventListener("click", () => runBusy("Previewing inserted protein metal...", previewProteinInsertedMetal).catch((err) => setStatus(err.message, "error")));
@@ -3984,18 +4217,11 @@ function setupEvents() {
     setStatus(err.message, "error");
   }));
   $("quit_app").addEventListener("click", async () => {
-    setStatus("Shutting down SIMPLE Web GUI...", "warn");
     try {
-      await api("/api/quit", {});
+      await shutdownGui();
     } catch (err) {
       setStatus(err.message, "error");
-      return;
     }
-    window.open("", "_self");
-    window.close();
-    setTimeout(() => {
-      document.body.innerHTML = "<div class=\"closed-message\">SIMPLE Web GUI closed. You can return to the command prompt.</div>";
-    }, 250);
   });
   $("met_file").addEventListener("change", () => uploadFile("met_file").then((file) => {
     $("met_input_path").value = file.path;

@@ -76,6 +76,16 @@ Metal handling options include:
 
 PROPKA-assisted protonation review can suggest residue-state changes based on pKa estimates. Disulfide candidates can also be detected and selected before system building.
 
+### Optional protein metal-site RESP charges
+
+New protein metal-site RESP calculations are an advanced `main.py` option; the web GUI does not generate them. Keep standard ff19SB charges for the default 12-6-4 model, and choose the site-specific RESP path in the interactive `main.py` workflow only when a reviewed, site-polarization-aware hybrid model is scientifically justified.
+
+SIMPLE then uses an unsolvated TLeap reference topology to establish hydrogens, protonation variants, atom indices, and baseline Amber charges. It detects directly coordinating HIS/CYS/ASP/GLU/MET residues and treats directly coordinating water or parameterized heteroligands as fixed QM environment. The default fit scope is the side chain; the metal formal charge, backbone, caps, fixed environment, target-residue total charges, and whole cluster charge remain constrained.
+
+During the `main.py` prompts, SIMPLE shows the existing default/high-spin multiplicity and, where conventional ligand-field alternatives exist, a low-spin multiplicity as well. The default remains the original heuristic; the user must select and confirm the electronic state appropriate to the coordination environment. SIMPLE writes one NWChem/RESP job per independent metal cluster, or one joint job when multiple metals share a donor, together with generic and Tahoma CPU sbatch scripts. Each sbatch file starts directly with `#!/bin/bash`, followed by its `#SBATCH` directives. Submit the Tahoma script, or edit and submit the generic script; the MD workflow pauses at this point.
+
+After the NWChem job completes, either continue through `main.py` or open the GUI and press **Scan / Browse RESP Results**. Choose the completed case folder rather than individual files; SIMPLE preserves the selected folder tree and searches all subdirectories for the required manifests and outputs. Select a completed candidate, then press **Finish + Build Inputs** to run the exact fingerprint check and display baseline, fitted, and delta charges together with residue sums, symmetry checks, fit metrics, and warnings. MD generation resumes only after **Approve Charges and Resume MD** is pressed. The standard-charge topology is retained as `02_system/system.standard_ff.prmtop`, while the validated patched topology becomes `02_system/system.prmtop`.
+
 <img src="tutorial_slide_08.png" alt="Metalloprotein repair, protonation, and disulfides" width="80%">
 
 If SIMPLE detects missing internal loops, the GUI asks whether to repair the missing regions before preview. After the protein is loaded, residues suggested by PropKa are highlighted in red, and possible disulfide-bond-forming residue pairs are highlighted in yellow.
@@ -91,6 +101,8 @@ The solvation tab controls:
 - box shape and buffer size;
 - salt pair, neutralization mode, and bulk concentration;
 - preview of the approximate solvent box and ion placement.
+
+For Protein and Small Molecule metal setups, the GUI checks the selected element and oxidation state against the bundled Duvail tables. If a species such as a divalent transition-metal ion is absent, **OPC + Duvail** is disabled, an explicit warning is shown, and the setup switches to **SPC/E + Li/Merz** with SPC/E as the solvation default.
 
 The MD / Slurm tab controls the MD protocol, temperature, pressure, production length, stage-level MD input overrides, and CPU/GPU Slurm script generation. Press **Finish + Build Inputs** to write the final TOML, run the workflow, and produce `system.prmtop`, `system.inpcrd`, MD inputs, and scheduler scripts.
 
@@ -313,7 +325,7 @@ python analyses.py
 The general launcher asks for the analysis family:
 
 1. **ABFE calculation**: analyze one or more completed TI cases and report standalone `dG` values. In the current SIMPLE interface, ABFE means single-case `dG` postprocessing of a completed TI case.
-2. **RBFE calculation**: choose one completed bound TI case and one completed water-reference TI case. SIMPLE computes `ddG = (dG_bound_ti + restraint_correction) - dG_water`.
+2. **RBFE calculation**: choose one or more completed bound TI cases. For each bound case, SIMPLE separately asks for its water-reference TI case and defaults to a reference with the same REE identity (and matching oxidation state when that metadata is available). SIMPLE computes `ddG = (dG_bound_ti + restraint_correction) - dG_water` for every pair.
 3. **Additional trajectory analysis**: switch to the trajectory analysis wizard for structural observables.
 
 For TI postprocessing, SIMPLE currently uses the trapezoidal TI estimator from existing Amber `DV/DL` output. BAR and MBAR are listed as future analysis options, but the current TI runs do not yet generate the additional overlap information needed for those estimators.

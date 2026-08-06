@@ -26,6 +26,16 @@ SIMPLE provides:
 - explicit handling of metal identity, oxidation state, coordination, solvent, and 12-6-4 parameter choices;
 - consistent output layouts and manifests that preserve workflow decisions.
 
+### Key developers
+
+- Hoshin Kim (hoshin.kim@pnnl.gov) — Main Developer
+- Daniel Mejia-Rogriguez (daniel.mejia@pnnl.gov)
+- Edo Apra (Edoardo.Apra@pnnl.gov)
+- Amity Andersen
+- Mark Maupin (mark.maupin@pnnl.gov) — Principal Investigator
+
+For questions about the code or implementation, contact Hoshin Kim at hoshin.kim@pnnl.gov.
+
 ## Interfaces
 
 SIMPLE supports both visual, system-by-system preparation and automated campaign generation.
@@ -69,6 +79,12 @@ Load common molecular structure formats, inspect or edit the metal coordination 
 
 Load a local PDB file or retrieve a structure by PDB ID, inspect protein and hetero components, review metal sites and protonation, handle retained ligands, and prepare complete simulation inputs.
 
+For directly coordinating HIS, CYS, ASP, GLU, or MET residues, SIMPLE also offers an optional expert protein-site RESP workflow through `main.py`. Standard force-field charges remain the default. The advanced interactive workflow prepares a fixed-geometry r2SCAN/def2-TZVP NWChem calculation, pauses while the external CPU job runs, then discovers and validates the result on a later run. The metal remains at its integer formal charge, each target residue retains its original total charge, and only the reviewed residue partial-charge redistribution is applied after the 12-6-4 C4 terms have been generated.
+
+The web GUI does not create new protein-site RESP calculations. It retains **Scan / Browse RESP Results** so a completed `main.py` case folder can be imported recursively, fingerprint-checked, reviewed, and applied to a compatible rebuilt topology.
+
+This is a hybrid model outside the original 12-6-4 parameter combination and should be treated as a scientific modeling choice, not an automatic improvement. SIMPLE records that status in the generated manifest, preserves `system.standard_ff.prmtop`, and requires charge review before replacing the canonical `system.prmtop`. See the [12-6-4 model paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC4306492/) and [MCPB.py paper](https://pubs.acs.org/doi/10.1021/acs.jcim.5b00674) for scientific context.
+
 ### Deep eutectic solvents
 
 Build DES compositions from reusable components, define mixture ratios and placement, add metal sites when needed, and generate DES-specific equilibration and production protocols.
@@ -84,6 +100,7 @@ Inspect and register compatible Amber library and parameter-file pairs for reuse
 - PROPKA-assisted protonation review and optional missing-loop handling
 - GAFF/GAFF2 ligand parameterization and manual Amber parameter bundles
 - RESP and NWChem input preparation
+- Optional advanced `main.py` constrained protein metal-site RESP redistribution with pause/resume validation and GUI result import
 - Amber/tleap system construction
 - Configurable force fields, water models, box shapes, salt conditions, and metal models
 - OPC + Duvail and SPC/E + Li/Merz 12-6-4 parameter pathways
@@ -96,9 +113,18 @@ Inspect and register compatible Amber library and parameter-file pairs for reuse
 
 SIMPLE requires Python 3.11. The molecular-simulation programs needed at runtime depend on the selected workflow.
 
+### Get SIMPLE
+
+Clone the SIMPLE repository and move into the downloaded project directory before creating the Python environment:
+
+```bash
+git clone https://github.com/EMSL-Computing/SIMPLE.git
+cd SIMPLE
+```
+
 ### Conda
 
-The supplied environment file is the recommended installation route. From the repository root:
+The supplied environment file is the recommended installation route:
 
 ```bash
 conda env create -f environment.yml
@@ -212,7 +238,7 @@ These launchers cover TI and MM-PBSA preparation, saved-result summaries, and co
 
 ## Documentation
 
-- [Tutorial](docs/tutorial.md) — guided usage documentation (coming soon)
+- [Tutorial](docs/tutorial.md) — guided usage documentation
 - [Manual ligand parameters](docs/manual_ligands.md) — accepted Amber-ready parameter bundles
 
 ## Support

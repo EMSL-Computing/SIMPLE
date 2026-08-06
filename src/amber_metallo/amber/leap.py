@@ -10,6 +10,7 @@ from amber_metallo.c4_assets import (
     opc_duvail_c4_file,
     opc_duvail_ion_frcmod,
     opc_duvail_polarizability_file,
+    opc_duvail_supports_metal_charge,
 )
 from amber_metallo.config import (
     BoxShape,
@@ -641,12 +642,49 @@ def allowed_metal_charges(element: str) -> tuple[int, ...]:
     return SUPPORTED_1264_METAL_CHARGES.get(element.title(), ())
 
 
+def c4_parameter_set_supports_metal_charge(
+    parameter_set: DESC4ParameterSet,
+    element: str,
+    charge: int,
+) -> bool:
+    if parameter_set == DESC4ParameterSet.OPC_DUVAIL:
+        return opc_duvail_supports_metal_charge(element, charge)
+    return True
+
+
+def _validate_c4_parameter_set_metal_species(
+    system_config: SystemConfig,
+    species: list[tuple[str, int]],
+) -> None:
+    unsupported = sorted(
+        {
+            (element.title(), int(charge))
+            for element, charge in species
+            if not c4_parameter_set_supports_metal_charge(
+                system_config.c4_parameter_set,
+                element,
+                charge,
+            )
+        }
+    )
+    if not unsupported:
+        return
+    unsupported_text = ", ".join(f"{element}{charge}+" for element, charge in unsupported)
+    raise ValueError(
+        "The bundled OPC + Duvail 12-6-4 assets do not contain a complete C4/LJ parameter set for "
+        f"{unsupported_text}. The Duvail force field is parameterized for Ln3+ ions. "
+        "Choose the SPC/E + Li/Merz parameter set for this metal, with compatible Amber 12-6-4 frcmod files, "
+        "or provide a separately validated parameter set."
+    )
+
+
 def _validate_supported_metal_charges(system_config: SystemConfig, prepared_pdb: Path | None) -> None:
-    if prepared_pdb is None or not prepared_pdb.exists() or not system_config.metal_charges:
+    if prepared_pdb is None or not prepared_pdb.exists():
         return
 
     summary = inspect_structure(prepared_pdb, detect_missing_loops=False)
     metal_by_site = {int(site.site): site.element.title() for site in summary.metals}
+    charge_by_site = {int(item.site): int(item.charge) for item in system_config.metal_charges}
     for assignment in system_config.metal_charges:
         element = metal_by_site.get(int(assignment.site))
         if element is None:
@@ -658,6 +696,15 @@ def _validate_supported_metal_charges(system_config: SystemConfig, prepared_pdb:
                 f"Metal site {assignment.site} ({element}) does not support the requested oxidation state "
                 f"+{assignment.charge} in the current 12-6-4 workflow. Allowed values: {allowed_text}."
             )
+    if system_config.apply_1264:
+        _validate_c4_parameter_set_metal_species(
+            system_config,
+            [
+                (element, charge_by_site.get(site, DEFAULT_TLEAP_METAL_CHARGES[element]))
+                for site, element in metal_by_site.items()
+                if element in DEFAULT_TLEAP_METAL_CHARGES
+            ],
+        )
 
 
 def _validate_small_molecule_supported_metal_charges(
@@ -665,8 +712,6 @@ def _validate_small_molecule_supported_metal_charges(
     ligand_artifacts: list[LigandArtifacts],
     source_files: list[Path],
 ) -> None:
-    if not system_config.metal_charges:
-        return
     probe_paths: list[Path] = []
     for artifact in ligand_artifacts:
         probe_paths.extend(_loadable_ligand_molecule_paths(artifact))
@@ -694,6 +739,7 @@ def _validate_small_molecule_supported_metal_charges(
             metal_by_site[site_index] = element
         if not metal_by_site:
             continue
+        charge_by_site = {int(item.site): int(item.charge) for item in system_config.metal_charges}
         for assignment in system_config.metal_charges:
             element = metal_by_site.get(int(assignment.site))
             if element is None:
@@ -706,6 +752,15 @@ def _validate_small_molecule_supported_metal_charges(
                     f"oxidation state +{assignment.charge} in the current 12-6-4 workflow. "
                     f"Allowed values: {allowed_text}."
                 )
+        if system_config.apply_1264:
+            _validate_c4_parameter_set_metal_species(
+                system_config,
+                [
+                    (element, charge_by_site.get(site, DEFAULT_TLEAP_METAL_CHARGES[element]))
+                    for site, element in metal_by_site.items()
+                    if element in DEFAULT_TLEAP_METAL_CHARGES
+                ],
+            )
         return
 
 
@@ -736,6 +791,18 @@ def _ion_parameter_files(
 ) -> list[Path]:
     if system_config.custom_ion_frcmods:
         return [Path(path).expanduser().resolve() for path in system_config.custom_ion_frcmods]
+
+    if not system_config.apply_1264:
+        selected: list[Path] = []
+        if include_monovalent:
+            for monovalent in amber_env.matching_monovalent_126_files(water_model):
+                if monovalent not in selected:
+                    selected.append(monovalent)
+        if include_multivalent:
+            for multivalent in amber_env.matching_multivalent_126_files(water_model):
+                if multivalent not in selected:
+                    selected.append(multivalent)
+        return selected
 
     if system_config.c4_parameter_set == DESC4ParameterSet.OPC_DUVAIL:
         bundled = opc_duvail_ion_frcmod()
@@ -1413,6 +1480,8 @@ def render_tleap_script(
     save_prefix: str,
     ion_parameter_files: list[Path] | None = None,
     placeholder_salt_comment: bool = False,
+    save_unsolvated_reference: bool = False,
+    solvate: bool = True,
 ) -> str:
     if system_config.metal_model != MetalModel.MODEL_1264:
         raise NotImplementedError(
@@ -1443,25 +1512,137 @@ def render_tleap_script(
     lines.extend(_coordinate_unit_lines(system_config, prepared_pdb, ligand_artifacts, source_files, output_dir))
     lines.append("check system")
     lines.append("charge system")
-    if system_config.box_shape == BoxShape.OCT:
-        lines.append(f"solvateOct system {water_box} {system_config.buffer_angstrom:.2f}")
-    else:
-        lines.append(f"solvateBox system {water_box} {system_config.buffer_angstrom:.2f}")
-    for ion_map in (neutralizing_ions or {}, extra_ions or {}):
-        for ion_name, count in ion_map.items():
-            if count > 0:
-                lines.append(f"addionsrand system {_tleap_additive_ion_unit_name(ion_name)} {count}")
-    if placeholder_salt_comment:
-        lines.append("# Neutralizing and/or bulk-salt ion counts are computed at execution time.")
-    lines.append("charge system")
-    lines.extend(
-        [
-            f"savePDB system {(output_dir / f'{save_prefix}.pdb').as_posix()}",
-            f"saveAmberParm system {(output_dir / f'{save_prefix}.prmtop').as_posix()} {(output_dir / f'{save_prefix}.inpcrd').as_posix()}",
-            "quit",
-        ]
-    )
+    if save_unsolvated_reference:
+        lines.extend(
+            [
+                f"savePDB system {(output_dir / 'system.unsolvated.pdb').as_posix()}",
+                f"saveAmberParm system {(output_dir / 'system.unsolvated.prmtop').as_posix()} "
+                f"{(output_dir / 'system.unsolvated.inpcrd').as_posix()}",
+            ]
+        )
+    if solvate:
+        if system_config.box_shape == BoxShape.OCT:
+            lines.append(f"solvateOct system {water_box} {system_config.buffer_angstrom:.2f}")
+        else:
+            lines.append(f"solvateBox system {water_box} {system_config.buffer_angstrom:.2f}")
+        for ion_map in (neutralizing_ions or {}, extra_ions or {}):
+            for ion_name, count in ion_map.items():
+                if count > 0:
+                    lines.append(f"addionsrand system {_tleap_additive_ion_unit_name(ion_name)} {count}")
+        if placeholder_salt_comment:
+            lines.append("# Neutralizing and/or bulk-salt ion counts are computed at execution time.")
+        lines.append("charge system")
+        lines.extend(
+            [
+                f"savePDB system {(output_dir / f'{save_prefix}.pdb').as_posix()}",
+                f"saveAmberParm system {(output_dir / f'{save_prefix}.prmtop').as_posix()} {(output_dir / f'{save_prefix}.inpcrd').as_posix()}",
+            ]
+        )
+    lines.append("quit")
     return "\n".join(lines) + "\n"
+
+
+def build_protein_site_resp_reference_with_tleap(
+    *,
+    system_config: SystemConfig,
+    amber_env: AmberEnvironment,
+    prepared_pdb: Path,
+    ligand_artifacts: list[LigandArtifacts],
+    source_files: list[Path],
+    output_dir: Path,
+    dry_run: bool,
+) -> LeapBuildResult:
+    """Build only the unsolvated topology needed to prepare protein-site RESP jobs.
+
+    The final 12-6-4 LJ/C4 model is intentionally deferred until RESP results
+    have been reviewed and approved.  This reference build uses ordinary 12-6
+    ion parameters, does not solvate, and never runs ParmEd ``add12_6_4``.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    warnings: list[str] = []
+    commands: list[list[str]] = []
+    reference_config = system_config.model_copy(
+        update={
+            "apply_1264": False,
+            "custom_ion_frcmods": [],
+            "salt": SaltConfig(mode=SaltMode.NONE),
+        }
+    )
+    _validate_supported_metal_charges(reference_config, prepared_pdb)
+    include_monovalent, include_multivalent = ion_parameter_requirements(
+        reference_config.salt,
+        metal_charges=_configured_metal_charge_values(reference_config),
+        prepared_pdb=prepared_pdb,
+    )
+    ion_parameter_files = _ion_parameter_files(
+        system_config=reference_config,
+        amber_env=amber_env,
+        water_model=reference_config.water_model,
+        include_monovalent=include_monovalent,
+        include_multivalent=include_multivalent,
+    )
+    if (include_monovalent or include_multivalent) and not ion_parameter_files:
+        missing_sets: list[str] = []
+        if include_monovalent:
+            missing_sets.append("monovalent/anion")
+        if include_multivalent:
+            missing_sets.append("multivalent")
+        if dry_run and amber_env.amberhome is None:
+            warnings.append(
+                "Could not verify standard 12-6 ion parameters for the unsolvated site-RESP reference "
+                f"topology because AMBERHOME was not detected. Required set(s): {', '.join(missing_sets)}."
+            )
+        else:
+            raise ValueError(
+                "The unsolvated protein-site RESP reference topology needs ordinary 12-6 ion parameters, "
+                f"but none were found for water model '{reference_config.water_model}' and required set(s): "
+                f"{', '.join(missing_sets)}. This check is independent of the deferred 12-6-4/Li-Merz model."
+            )
+
+    script_text = render_tleap_script(
+        system_config=reference_config,
+        amber_env=amber_env,
+        prepared_pdb=prepared_pdb,
+        ligand_artifacts=ligand_artifacts,
+        source_files=source_files,
+        output_dir=output_dir,
+        extra_ions=None,
+        neutralizing_ions=None,
+        save_prefix="system.unsolvated",
+        ion_parameter_files=ion_parameter_files,
+        save_unsolvated_reference=True,
+        solvate=False,
+    )
+    script_path = output_dir / "tleap_site_resp_reference.in"
+    script_path.write_text(script_text, encoding="utf-8")
+    if not dry_run:
+        ensure_execution_host(dry_run=False)
+        command = ["tleap", "-f", str(script_path)]
+        commands.append(command)
+        run_command(command, cwd=output_dir, log_path=output_dir / "tleap_site_resp_reference.log")
+
+    result = LeapBuildResult(
+        script_path=str(script_path),
+        output_files={
+            "unsolvated_pdb": str(output_dir / "system.unsolvated.pdb"),
+            "unsolvated_prmtop": str(output_dir / "system.unsolvated.prmtop"),
+            "unsolvated_inpcrd": str(output_dir / "system.unsolvated.inpcrd"),
+        },
+        warnings=warnings,
+        commands=commands,
+        water_count=None,
+        extra_ions={},
+        system_metadata={
+            "reference_only": True,
+            "ion_model": "12-6",
+            "ion_parameter_files": [str(path) for path in ion_parameter_files],
+            "deferred_apply_1264": system_config.apply_1264,
+            "deferred_c4_parameter_set": system_config.c4_parameter_set.value,
+        },
+    )
+    write_json(output_dir / "site_resp_reference_manifest.json", result.to_dict())
+    return result
 
 
 def build_system_with_tleap(
@@ -1504,6 +1685,7 @@ def build_system_with_tleap(
     )
     if (
         (include_monovalent or include_multivalent)
+        and system_config.apply_1264
         and system_config.c4_parameter_set == DESC4ParameterSet.OPC_DUVAIL
         and system_config.water_model.lower() != "opc"
     ):
@@ -1518,7 +1700,9 @@ def build_system_with_tleap(
         include_monovalent=include_monovalent,
         include_multivalent=include_multivalent,
     )
-    uses_1264_files = any("1264" in path.name.lower() for path in ion_parameter_files)
+    uses_1264_files = system_config.apply_1264 and any(
+        "1264" in path.name.lower() for path in ion_parameter_files
+    )
     uses_monovalent_1264 = any(_is_monovalent_1264_file(path) for path in ion_parameter_files)
     uses_multivalent_1264 = any(_is_multivalent_1264_file(path) for path in ion_parameter_files)
     if (include_monovalent or include_multivalent) and not ion_parameter_files:
@@ -1527,15 +1711,18 @@ def build_system_with_tleap(
             missing_sets.append("monovalent/anion")
         if include_multivalent:
             missing_sets.append("multivalent")
+        parameter_label = "12-6-4" if system_config.apply_1264 else "standard 12-6"
         if dry_run and amber_env.amberhome is None:
             warnings.append(
-                f"Could not verify 12-6-4 ion parameter availability for water model '{system_config.water_model}' "
+                f"Could not verify {parameter_label} ion parameter availability for water model "
+                f"'{system_config.water_model}' "
                 f"in dry-run mode because AMBERHOME was not detected. Required set(s): {', '.join(missing_sets)}."
             )
         else:
             raise ValueError(
-                f"Water model '{system_config.water_model}' cannot be used for the selected 12-6-4 workflow because "
-                f"no compatible 12-6-4 ion parameter file was found for the required set(s): {', '.join(missing_sets)}."
+                f"Water model '{system_config.water_model}' cannot be used for the selected {parameter_label} "
+                f"workflow because no compatible {parameter_label} ion parameter file was found for the required "
+                f"set(s): {', '.join(missing_sets)}."
             )
 
     if not dry_run and system_config.salt.mode != SaltMode.NONE:
@@ -1596,6 +1783,7 @@ def build_system_with_tleap(
         save_prefix="system",
         ion_parameter_files=ion_parameter_files,
         placeholder_salt_comment=system_config.salt.mode != SaltMode.NONE and dry_run,
+        save_unsolvated_reference=prepared_pdb is not None,
     )
 
     script_path = output_dir / "tleap.in"
@@ -1736,6 +1924,15 @@ def build_system_with_tleap(
             "pdb": str(output_dir / "system.pdb"),
             "prmtop": str(output_dir / "system.prmtop"),
             "inpcrd": str(output_dir / "system.inpcrd"),
+            **(
+                {
+                    "unsolvated_pdb": str(output_dir / "system.unsolvated.pdb"),
+                    "unsolvated_prmtop": str(output_dir / "system.unsolvated.prmtop"),
+                    "unsolvated_inpcrd": str(output_dir / "system.unsolvated.inpcrd"),
+                }
+                if prepared_pdb is not None
+                else {}
+            ),
         },
         warnings=warnings,
         commands=commands,
@@ -1751,7 +1948,10 @@ def build_system_with_tleap(
         c4_script_path=c4_script_path,
         c4_mask=c4_mask,
         c4_applied=c4_applied,
-        system_metadata={"c4_parameter_set": system_config.c4_parameter_set.value},
+        system_metadata={
+            "apply_1264": system_config.apply_1264,
+            "c4_parameter_set": system_config.c4_parameter_set.value,
+        },
     )
     write_json(output_dir / "system_manifest.json", result.to_dict())
     return result

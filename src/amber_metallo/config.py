@@ -102,6 +102,16 @@ class RespApplyMode(StrEnum):
     NEW_DIRECTORY = "new_directory"
 
 
+class ProteinSiteRespMode(StrEnum):
+    STANDARD_FF = "standard_ff"
+    RESP = "resp"
+
+
+class ProteinSiteRespScope(StrEnum):
+    SIDECHAIN = "sidechain"
+    WHOLE_RESIDUE = "whole_residue"
+
+
 class MetalModel(StrEnum):
     MODEL_1264 = "1264"
     MCPB = "mcpb"
@@ -473,6 +483,7 @@ class SystemConfig(BaseModel):
     protein_ff: str = "ff19SB"
     ligand_ff: str = "gaff2"
     metal_model: MetalModel = MetalModel.MODEL_1264
+    apply_1264: bool = True
     c4_parameter_set: DESC4ParameterSet = DESC4ParameterSet.OPC_DUVAIL
     metal_charges: list[MetalChargeAssignment] = Field(default_factory=list)
     water_model: str = "opc"
@@ -550,11 +561,55 @@ class SlurmConfig(BaseModel):
     job_name: str = "simple"
 
 
+class ProteinSiteRespClusterConfig(BaseModel):
+    metal_sites: list[int] = Field(default_factory=list)
+    donor_residues: list[str] = Field(default_factory=list)
+    fixed_environment: list[str] = Field(default_factory=list)
+    multiplicity: int | None = Field(default=None, ge=1)
+    job_dir: str | None = None
+
+    @model_validator(mode="after")
+    def normalize(self) -> "ProteinSiteRespClusterConfig":
+        self.metal_sites = sorted({int(site) for site in self.metal_sites if int(site) > 0})
+        self.donor_residues = sorted({item.strip() for item in self.donor_residues if item.strip()})
+        self.fixed_environment = sorted({item.strip() for item in self.fixed_environment if item.strip()})
+        self.job_dir = (self.job_dir or "").strip() or None
+        return self
+
+
+class ProteinSiteRespConfig(BaseModel):
+    mode: ProteinSiteRespMode = ProteinSiteRespMode.STANDARD_FF
+    scope: ProteinSiteRespScope = ProteinSiteRespScope.SIDECHAIN
+    apply_mode: RespApplyMode = RespApplyMode.DETECT
+    default_multiplicity: int | None = Field(default=None, ge=1)
+    search_roots: list[str] = Field(default_factory=list)
+    job_dirs: list[str] = Field(default_factory=list)
+    review_clusters: bool = False
+    # Internal continuation flag used when an existing RESP result is selected
+    # from the interactive Protein start screen.  In this mode SIMPLE patches
+    # the already-built 02_system topology instead of preparing the protein and
+    # rebuilding the solvated system.
+    resume_existing_system: bool = False
+    clusters: list[ProteinSiteRespClusterConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def normalize(self) -> "ProteinSiteRespConfig":
+        if self.apply_mode == RespApplyMode.REBUILD:
+            raise ValueError(
+                "protein_site_resp.apply_mode must be detect, new_directory, or apply_existing"
+            )
+        self.search_roots = sorted({item.strip() for item in self.search_roots if item.strip()})
+        self.job_dirs = sorted({item.strip() for item in self.job_dirs if item.strip()})
+        self.clusters = [ProteinSiteRespClusterConfig.model_validate(item) for item in self.clusters]
+        return self
+
+
 class WorkflowConfig(BaseModel):
     input: InputConfig
     des: DESConfig = Field(default_factory=DESConfig)
     prepare: PrepareConfig = Field(default_factory=PrepareConfig)
     protonation: ProtonationConfig = Field(default_factory=ProtonationConfig)
+    protein_site_resp: ProteinSiteRespConfig = Field(default_factory=ProteinSiteRespConfig)
     ligands: LigandsConfig = Field(default_factory=LigandsConfig)
     system: SystemConfig = Field(default_factory=SystemConfig)
     md: MDConfig = Field(default_factory=MDConfig)
@@ -565,6 +620,8 @@ class WorkflowConfig(BaseModel):
     def validate_protonation_scope(self) -> "WorkflowConfig":
         if self.input.source in {InputSource.SMALL_MOLECULE, InputSource.DES} and self.protonation.enabled:
             raise ValueError("protonation is only supported for protein workflows")
+        if self.input.source in {InputSource.SMALL_MOLECULE, InputSource.DES} and self.protein_site_resp.mode == ProteinSiteRespMode.RESP:
+            raise ValueError("protein_site_resp is only supported for protein workflows")
         if self.input.source == InputSource.DES and not self.des.components:
             raise ValueError("des.components is required when input.source='deep_eutectic_solvent'")
         return self
@@ -610,6 +667,8 @@ def dump_config(config: WorkflowConfig) -> str:
     doc.add("prepare", _section_from_model(config.prepare.model_dump(mode="json")))
     doc.add(nl())
     doc.add("protonation", _section_from_model(config.protonation.model_dump(mode="json")))
+    doc.add(nl())
+    doc.add("protein_site_resp", _section_from_model(config.protein_site_resp.model_dump(mode="json")))
     doc.add(nl())
     doc.add("ligands", _section_from_model(config.ligands.model_dump(mode="json")))
     doc.add(nl())

@@ -20,7 +20,13 @@ def _generic_header(*, job_name: str) -> list[str]:
     ]
 
 
-def render_resp_slurm_script(*, job_root: Path, slurm_config: SlurmConfig, job_name: str) -> str:
+def render_resp_slurm_script(
+    *,
+    job_root: Path,
+    slurm_config: SlurmConfig,
+    job_name: str,
+    retry_input: str | None = None,
+) -> str:
     input_dir = job_root / "inputs"
     output_dir = job_root / "output"
     runner = f"srun -n $SLURM_NTASKS {slurm_config.binary_override or 'nwchem'}"
@@ -49,10 +55,22 @@ def render_resp_slurm_script(*, job_root: Path, slurm_config: SlurmConfig, job_n
             "",
         ]
     )
+    if retry_input:
+        lines.insert(lines.index('cp "$INPUT_DIR/resp_fit.py" "$OUTPUT_DIR/"'), f'cp "$INPUT_DIR/{retry_input}" "$OUTPUT_DIR/"')
+        run_index = lines.index('echo "Running NWChem RESP job"')
+        lines[run_index : run_index + 2] = [
+            'rm -f ./*.grid ./site_resp_precondition.movecs ./site_resp_charges.json ./site_resp_charges.txt',
+            'echo "Running NWChem RESP job (SCF-stabilized primary input)"',
+            'if ! $RUNNER resp_job.nw > resp_job.log; then',
+            '  echo "Primary SCF did not converge; retrying with PBE orbital preconditioning"',
+            '  rm -f ./*.grid ./site_resp_precondition.movecs',
+            f'  $RUNNER {retry_input} > resp_job_retry.log',
+            'fi',
+        ]
     return "\n".join(lines) + "\n"
 
 
-def render_tahoma_resp_script(*, job_root: Path, job_name: str) -> str:
+def render_tahoma_resp_script(*, job_root: Path, job_name: str, retry_input: str | None = None) -> str:
     input_dir = job_root / "inputs"
     output_dir = job_root / "output"
     run_dir = "/big_scratch/${USER}/simple_resp_${SLURM_JOB_ID}"
@@ -111,4 +129,16 @@ def render_tahoma_resp_script(*, job_root: Path, job_name: str) -> str:
         '"$PYTHON_BIN" resp_fit.py',
         "",
     ]
+    if retry_input:
+        lines.insert(lines.index('cp "$INPUT_DIR/resp_fit.py" "$RUN_DIR/"'), f'cp "$INPUT_DIR/{retry_input}" "$RUN_DIR/"')
+        run_index = lines.index('echo "Running Tahoma RESP job"')
+        lines[run_index : run_index + 2] = [
+            'rm -f ./*.grid ./site_resp_precondition.movecs ./site_resp_charges.json ./site_resp_charges.txt',
+            'echo "Running Tahoma RESP job (SCF-stabilized primary input)"',
+            'if ! srun --mpi=pmi2 -N "$SLURM_NNODES" -n "$SLURM_NPROCS" apptainer exec --bind /big_scratch "$NWBIN" nwchem resp_job.nw > resp_job.log; then',
+            '  echo "Primary SCF did not converge; retrying with PBE orbital preconditioning"',
+            '  rm -f ./*.grid ./site_resp_precondition.movecs',
+            f'  srun --mpi=pmi2 -N "$SLURM_NNODES" -n "$SLURM_NPROCS" apptainer exec --bind /big_scratch "$NWBIN" nwchem {retry_input} > resp_job_retry.log',
+            'fi',
+        ]
     return "\n".join(lines) + "\n"

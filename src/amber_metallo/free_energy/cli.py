@@ -13,7 +13,7 @@ from rich import box
 from rich.panel import Panel
 from rich.table import Table
 
-from amber_metallo.cli import WizardChoice, _display_choice_table, _prompt_choice, _prompt_execution_profile, _print_step_header
+from amber_metallo.cli import WizardChoice, _display_choice_table, _prompt_choice, _print_step_header
 from amber_metallo.config import SlurmProfile
 from amber_metallo.environment import detect_amber_environment
 from amber_metallo.free_energy.config import (
@@ -43,6 +43,7 @@ from amber_metallo.ti.analysis import (
     select_site,
 )
 from amber_metallo.ti.cli import (
+    TIInputSelection,
     _default_output_directory,
     _display_site_table,
     _infer_charge_from_selected_site,
@@ -52,8 +53,10 @@ from amber_metallo.ti.cli import (
     _production_status_text,
     _prompt_existing_path,
     _prompt_complex_input_selection,
+    _prompt_complex_input_selections,
     _prompt_snapshot_mode,
     _prompt_ti_decoupling_mode,
+    _prompt_ti_execution_profile,
     _prompt_ti_implementation_mode,
     _resolve_water_reference_settings,
     _resolve_water_reference_source_choice,
@@ -353,7 +356,7 @@ def _free_energy_method_choices() -> list[WizardChoice]:
         WizardChoice(
             FreeEnergyMethod.TI.value,
             "TI",
-            "Use the existing TI workflow with charge-off and VDW-off windows.",
+            "Generate TI assets; Amber 12-6-4 GTI/CUDA with combined Q+VDW softcore is the default path.",
         ),
         WizardChoice(
             FreeEnergyMethod.MMPBSA.value,
@@ -1487,14 +1490,17 @@ def _build_single_free_energy_wizard_config(
     *,
     dry_run: bool,
     forced_method: FreeEnergyMethod | None,
+    input_selection: TIInputSelection | None = None,
+    shared_ti_settings: FreeEnergyWorkflowConfig | None = None,
 ) -> FreeEnergyWorkflowConfig:
     amber_env = detect_amber_environment()
-    _print_step_header(
-        1,
-        "Load the Complex Trajectory Inputs",
-        "Select a main.py workflow folder from the current directory, enter a workflow path manually, or fall back to the raw topology/trajectory files.",
-    )
-    input_selection = _prompt_complex_input_selection()
+    if input_selection is None:
+        _print_step_header(
+            1,
+            "Load the Complex Trajectory Inputs",
+            "Select a main.py workflow folder from the current directory, enter a workflow path manually, or fall back to the raw topology/trajectory files.",
+        )
+        input_selection = _prompt_complex_input_selection()
     prmtop_path = input_selection.complex_input.prmtop_path
     trajectory_path = input_selection.complex_input.trajectory_path
     reference_structure_path = input_selection.complex_input.reference_structure_path
@@ -1590,7 +1596,11 @@ def _build_single_free_energy_wizard_config(
         )
         if in_place_ti:
             ti_implementation_mode = TIImplementationMode.AMBER_12_6_4_GTI
-            ti_decoupling_mode = _prompt_ti_decoupling_mode(ti_implementation_mode)
+            ti_decoupling_mode = (
+                TIDecouplingMode.COMBINED_Q_VDW
+                if shared_ti_settings is not None
+                else _prompt_ti_decoupling_mode(ti_implementation_mode)
+            )
             print_notice(
                 "In-Place TI",
                 "DES/raw AMBER input was detected, so FreeE will keep the existing prmtop nonbonded model, "
@@ -1599,9 +1609,23 @@ def _build_single_free_energy_wizard_config(
                 border_style="cyan",
             )
         else:
-            ti_implementation_mode = _prompt_ti_implementation_mode()
-            ti_decoupling_mode = _prompt_ti_decoupling_mode(ti_implementation_mode)
-        snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
+            if shared_ti_settings is None:
+                ti_implementation_mode = _prompt_ti_implementation_mode()
+                ti_decoupling_mode = _prompt_ti_decoupling_mode(ti_implementation_mode)
+            else:
+                ti_implementation_mode = shared_ti_settings.ti.implementation_mode
+                ti_decoupling_mode = shared_ti_settings.ti.decoupling_mode
+                console.print(
+                    f"[dim]Batch setting reused: {ti_implementation_mode.value}, {ti_decoupling_mode.value}.[/dim]"
+                )
+        if shared_ti_settings is None:
+            snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
+        else:
+            snapshot_mode = shared_ti_settings.snapshot.mode
+            if snapshot_mode.value == "cluster" and not all(item.stable for item in selected_assessments):
+                snapshot_mode = _prompt_snapshot_mode(selected_stable=False)
+            else:
+                console.print(f"[dim]Batch snapshot setting reused: {snapshot_mode.value}.[/dim]")
         if in_place_ti:
             formal_charge = _infer_charge_from_selected_site(selected) or default_formal_charge(selected.element)
             water_reference_enabled = typer.confirm(
@@ -1651,12 +1675,19 @@ def _build_single_free_energy_wizard_config(
         _print_step_header(
             4 if forced_method is None else 3,
             "Choose the Execution Script and Output Location",
-            "Select whether to generate CPU or GPU master sbatch files. A separate Tahoma script will also be written automatically.",
+            (
+                "GTI/CUDA requires GPU/pmemd.cuda. GPU master and Tahoma sbatch files will be generated."
+                if ti_implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI
+                else "Select whether to generate CPU or GPU master sbatch files. A separate Tahoma script will also be written automatically."
+            ),
         )
-        profile = _prompt_execution_profile()
-        if ti_implementation_mode.value == "amber_12_6_4_gti" and profile != SlurmProfile.GPU:
-            console.print("[bold yellow]GTI/CUDA mode requires pmemd.cuda, so the execution profile was set to GPU.[/bold yellow]")
-            profile = SlurmProfile.GPU
+        if shared_ti_settings is None:
+            profile = _prompt_ti_execution_profile(ti_implementation_mode)
+        else:
+            profile = shared_ti_settings.slurm.profile
+            if ti_implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI:
+                profile = SlurmProfile.GPU
+            console.print(f"[dim]Batch execution setting reused: {profile.value}.[/dim]")
         output_dir_path = _default_output_directory(
             reference_structure_path,
             workflow_root=input_selection.workflow_root,
@@ -1847,6 +1878,79 @@ def _build_general_mmpbsa_wizard_result(
     return result
 
 
+def _ti_case_plan_from_config(config: FreeEnergyWorkflowConfig) -> TIBatchCasePlan:
+    candidates = detect_bound_metal_sites(
+        config.complex_input.reference_structure_path,
+        config.complex_input.prmtop_path,
+        donor_cutoff_angstrom=config.snapshot.donor_cutoff_angstrom,
+        include_unbound_metals=bool(config.water_reference.bound_in_place or not config.water_reference.enabled),
+    )
+    selected_site = config.metal.selected_site or (config.metal.selected_sites[0] if config.metal.selected_sites else None)
+    candidate = next((item for item in candidates if item.site == selected_site), None)
+    if candidate is None:
+        raise ValueError(f"Could not recover selected TI metal site {selected_site} for {config.output_dir}.")
+    return TIBatchCasePlan(
+        site=candidate.site,
+        element=candidate.element,
+        atom_index=candidate.atom_index,
+        output_dir=Path(config.output_dir).expanduser().resolve(),
+    )
+
+
+def _build_ti_multi_workflow_result(
+    *,
+    selections: list[TIInputSelection],
+    dry_run: bool,
+) -> FreeEnergyWizardBuildResult:
+    configs: list[FreeEnergyWorkflowConfig] = []
+    suffixes: list[tuple[str, ...]] = []
+    case_plans: list[TIBatchCasePlan] = []
+    shared_ti_settings: FreeEnergyWorkflowConfig | None = None
+
+    for index, input_selection in enumerate(selections, start=1):
+        case_label = (
+            input_selection.workflow_root.name
+            if input_selection.workflow_root is not None
+            else Path(input_selection.complex_input.reference_structure_path).stem
+        )
+        if len(selections) > 1:
+            console.print(
+                Panel(
+                    f"Configuring selected TI workflow {index} of {len(selections)}: {case_label}",
+                    border_style="bright_cyan",
+                    box=box.ROUNDED,
+                )
+            )
+        base_config = _build_single_free_energy_wizard_config(
+            dry_run=dry_run,
+            forced_method=FreeEnergyMethod.TI,
+            input_selection=input_selection,
+            shared_ti_settings=shared_ti_settings,
+        )
+        if shared_ti_settings is None:
+            shared_ti_settings = base_config
+        expanded = _expand_ti_one_by_one_config(base_config)
+        configs.extend(expanded.configs)
+        suffixes.extend((case_label, *suffix) for suffix in expanded.config_suffixes)
+        if expanded.ti_batch_plan is not None:
+            case_plans.extend(expanded.ti_batch_plan.cases)
+        else:
+            case_plans.extend(_ti_case_plan_from_config(config) for config in expanded.configs)
+
+    ti_batch_plan: TIBatchPlan | None = None
+    if len(configs) > 1:
+        ti_batch_plan = TIBatchPlan(
+            batch_root=(Path.cwd() / "TI_BATCH").resolve(),
+            selection_mode="multi_workflow" if len(selections) > 1 else TIMetalSelectionMode.ONE_BY_ONE.value,
+            cases=case_plans,
+        )
+    return FreeEnergyWizardBuildResult(
+        configs=configs,
+        config_suffixes=suffixes,
+        ti_batch_plan=ti_batch_plan,
+    )
+
+
 def build_free_energy_wizard_configs(write_config: str | None, *, dry_run: bool) -> FreeEnergyWizardBuildResult:
     _print_step_header(
         1,
@@ -1855,8 +1959,13 @@ def build_free_energy_wizard_configs(write_config: str | None, *, dry_run: bool)
     )
     method = _prompt_free_energy_method()
     if method == FreeEnergyMethod.TI:
-        config = _build_single_free_energy_wizard_config(dry_run=dry_run, forced_method=FreeEnergyMethod.TI)
-        result = _expand_ti_one_by_one_config(config)
+        _print_step_header(
+            2,
+            "Load One or More Complex Trajectory Inputs",
+            "Choose A for all ready main.py workflows, one folder, comma-separated folders, or manual/raw input.",
+        )
+        input_selections = _prompt_complex_input_selections()
+        result = _build_ti_multi_workflow_result(selections=input_selections, dry_run=dry_run)
         result.saved_config_paths.extend(_save_free_energy_wizard_configs(result, write_config))
         if result.saved_config_paths:
             console.print("[bold cyan]Saved TI config(s):[/bold cyan]")
@@ -2273,6 +2382,8 @@ def execute_free_energy_configs(
             console.print(f"[bold red]Free-energy workflow failed for {output_name}:[/bold red] {exc}")
             if failure_hint:
                 console.print(f"[bold yellow]{failure_hint}[/bold yellow]")
+            if index < total and typer.confirm("Continue with the remaining selected workflows?", default=True):
+                continue
             break
         successful_results.append(execution_result)
         succeeded_names.add(output_name)

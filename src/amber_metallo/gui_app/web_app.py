@@ -15,7 +15,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from amber_metallo.amber.leap import DEFAULT_TLEAP_METAL_CHARGES, allowed_metal_charges
+from amber_metallo.amber.leap import (
+    DEFAULT_TLEAP_METAL_CHARGES,
+    allowed_metal_charges,
+    c4_parameter_set_supports_metal_charge,
+)
 from amber_metallo.config import (
     BoxShape,
     ChargeMethod,
@@ -36,6 +40,9 @@ from amber_metallo.config import (
     MetalReplacement,
     NeutralizationIon,
     PrepareConfig,
+    ProteinSiteRespConfig,
+    ProteinSiteRespMode,
+    ProteinSiteRespScope,
     ProtonationChange,
     ProtonationConfig,
     ProtocolKind,
@@ -67,6 +74,7 @@ from amber_metallo.inspection import SUPPORTED_METALS, fetch_pdb_structure, insp
 from amber_metallo.ligand_param import prepare_canonical_small_molecule_mol2
 from amber_metallo.prep import prepare_structure
 from amber_metallo.protonation import predict_protonation_prediction
+from amber_metallo.protein_site_resp import site_resp_result_path
 from amber_metallo.qm.nwchem import (
     AUTO_GROUP_GRAPH_METHOD_AUTOMORPHISM,
     AUTO_GROUP_GRAPH_METHOD_CONNECTIVITY,
@@ -153,6 +161,21 @@ DEFAULT_WATER_MODELS = ["opc", "spce", "tip3p", "opc3", "tip4pew", "tip5p"]
 DEFAULT_PROTEIN_FFS = ["ff19SB", "ff14SB", "ff99SB", "ff99SBildn"]
 DEFAULT_LIGAND_FFS = ["gaff2", "gaff"]
 SMALL_MOLECULE_SUFFIXES = {".pdb", ".mol2", ".sdf", ".sd", ".smi", ".smiles", ".txt"}
+SITE_RESP_BROWSER_SUFFIXES = {
+    ".json",
+    ".grid",
+    ".xyz",
+    ".nw",
+    ".sbatch",
+    ".py",
+    ".txt",
+    ".log",
+    ".out",
+    ".pdb",
+    ".prmtop",
+    ".inpcrd",
+    ".toml",
+}
 AUTO_GROUP_MODE_OPTIONS = [
     (AUTO_GROUP_MODE_HYDROGEN_AND_SYMMETRY, "H + Symmetry"),
     (AUTO_GROUP_MODE_HYDROGEN_ONLY, "H Only"),
@@ -540,6 +563,7 @@ def _system_config(data: dict[str, Any] | None, *, include_protein: bool) -> Sys
     return SystemConfig(
         protein_ff=protein_ff if include_protein else "ff19SB",
         ligand_ff=ligand_ff,
+        apply_1264=bool(payload.get("apply_1264", True)),
         c4_parameter_set=parameter_set,
         metal_charges=_metal_charges(payload.get("metal_charges") or []),
         water_model=water_model,
@@ -726,6 +750,96 @@ def _protonation_config(data: dict[str, Any] | None) -> ProtonationConfig:
     )
 
 
+def _protein_site_resp_config(data: dict[str, Any] | None, state: WebGuiState) -> ProteinSiteRespConfig:
+    payload = dict(data or {})
+    mode = ProteinSiteRespMode(str(payload.get("mode") or ProteinSiteRespMode.STANDARD_FF.value))
+    if mode == ProteinSiteRespMode.STANDARD_FF:
+        return ProteinSiteRespConfig()
+
+    job_text = str(payload.get("job_dir") or "").strip()
+    job_path: Path | None = None
+    imported_manifest: dict[str, Any] = {}
+    if job_text:
+        job_path = Path(job_text).expanduser()
+        if not job_path.is_absolute():
+            job_path = state.launch_cwd / job_path
+        job_path = job_path.resolve()
+        manifest_path = job_path / "manifests" / "site_resp_manifest.json"
+        if manifest_path.exists():
+            try:
+                loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Could not read the selected site-RESP manifest: {manifest_path}") from exc
+            if isinstance(loaded_manifest, dict):
+                imported_manifest = loaded_manifest
+
+    if job_path is None or not imported_manifest:
+        raise ValueError(
+            "The GUI imports completed protein-site RESP results only. Create and review the site-RESP job "
+            "through main.py, then select its completed case folder with Scan / Browse RESP Results."
+        )
+    if site_resp_result_path(job_path) is None:
+        raise ValueError(
+            "The selected main.py site-RESP job is not complete yet. Finish the NWChem/RESP calculation, then "
+            "scan the case folder again."
+        )
+
+    multiplicity_confirmed = bool(payload.get("multiplicity_confirmed")) or bool(imported_manifest)
+    if not multiplicity_confirmed:
+        raise ValueError(
+            "Confirm the spin multiplicity through main.py first. The selected protein-site RESP result has no "
+            "readable main.py manifest with a confirmed multiplicity for GUI import."
+        )
+    multiplicity = int(
+        imported_manifest.get("multiplicity")
+        or payload.get("default_multiplicity")
+        or 0
+    )
+    if multiplicity < 1:
+        raise ValueError("Protein-site RESP spin multiplicity must be at least 1.")
+
+    search_roots: list[str] = []
+    search_text = str(payload.get("search_root") or "").strip()
+    if search_text:
+        search_path = Path(search_text).expanduser()
+        if not search_path.is_absolute():
+            search_path = state.launch_cwd / search_path
+        search_roots.append(str(search_path.resolve()))
+    job_dirs: list[str] = []
+    if job_path is not None:
+        job_dirs.append(str(job_path.resolve()))
+    raw_clusters: list[dict[str, Any]] = []
+    cluster = dict(imported_manifest.get("cluster") or {})
+    if cluster.get("metal_sites"):
+        raw_clusters = [
+            {
+                "metal_sites": cluster.get("metal_sites") or [],
+                "donor_residues": cluster.get("donor_residue_keys") or [],
+                "fixed_environment": cluster.get("fixed_environment_keys") or [],
+                "multiplicity": imported_manifest.get("multiplicity") or cluster.get("multiplicity"),
+                "job_dir": str(job_path) if job_path is not None else None,
+            }
+        ]
+    return ProteinSiteRespConfig(
+        mode=mode,
+        scope=ProteinSiteRespScope(
+            str(
+                imported_manifest.get("scope")
+                or payload.get("scope")
+                or ProteinSiteRespScope.SIDECHAIN.value
+            )
+        ),
+        apply_mode=RespApplyMode(
+            str(payload.get("apply_mode") or RespApplyMode.DETECT.value)
+        ),
+        default_multiplicity=multiplicity,
+        search_roots=search_roots,
+        job_dirs=job_dirs,
+        review_clusters=True,
+        clusters=raw_clusters,
+    )
+
+
 def _resolve_resp_resume_source(candidate: Any, state: WebGuiState) -> str:
     payload = getattr(candidate, "payload", {}) or {}
     for key in ("resume_source_file", "source_file", "canonical_source_file"):
@@ -744,6 +858,48 @@ def _resolve_resp_resume_source(candidate: Any, state: WebGuiState) -> str:
     raise ValueError("The selected RESP job does not contain a reusable source file or saved MOL2 preview.")
 
 
+def _validate_gui_c4_selection(payload: dict[str, Any], *, workflow_type: str) -> None:
+    """Reject a stale or hand-edited GUI payload that bypasses disabled Duvail choices."""
+    if workflow_type == "deep_eutectic":
+        # DES has a separate parameter-set selector and validation path.  This
+        # guard mirrors the Protein/Small Molecule metal table controlled by
+        # system.c4_parameter_set in the browser GUI.
+        return
+    species: list[tuple[str, int]] = []
+    system = dict(payload.get("system") or {})
+    if not bool(system.get("apply_1264", True)):
+        return
+    parameter_set = DESC4ParameterSet(
+        str(system.get("c4_parameter_set") or DESC4ParameterSet.OPC_DUVAIL.value)
+    )
+    species.extend(
+        (
+            str(item.get("element") or "").strip().title(),
+            int(item.get("charge") or 0),
+        )
+        for item in system.get("metal_charges") or []
+        if isinstance(item, dict) and str(item.get("element") or "").strip()
+    )
+    if parameter_set != DESC4ParameterSet.OPC_DUVAIL:
+        return
+    unsupported = sorted(
+        {
+            (element, charge)
+            for element, charge in species
+            if element
+            and charge > 0
+            and not c4_parameter_set_supports_metal_charge(parameter_set, element, charge)
+        }
+    )
+    if not unsupported:
+        return
+    unsupported_text = ", ".join(f"{element}{charge}+" for element, charge in unsupported)
+    raise ValueError(
+        f"OPC + Duvail does not support the selected ion(s): {unsupported_text}. "
+        "Choose SPC/E + Li/Merz; SPC/E will be used as the compatible solvation default."
+    )
+
+
 def build_workflow_config(
     payload: dict[str, Any],
     state: WebGuiState,
@@ -753,6 +909,7 @@ def build_workflow_config(
     workflow_type = str(payload.get("workflow_type") or "metalloprotein")
     job_name = _safe_name(str(payload.get("job_name") or "simple_gui"))
     output_dir = _output_dir_from_payload(payload, state)
+    _validate_gui_c4_selection(payload, workflow_type=workflow_type)
     system = _system_config(payload.get("system") or {}, include_protein=workflow_type == "metalloprotein")
     slurm = _slurm_config(payload.get("slurm") or {}, job_name=job_name)
 
@@ -881,6 +1038,7 @@ def build_workflow_config(
         input=input_config,
         prepare=_prepare_config(protein.get("prepare") or {}),
         protonation=_protonation_config(protein.get("protonation") or {}),
+        protein_site_resp=_protein_site_resp_config(protein.get("site_resp") or {}, state),
         ligands=_ligands_config(protein.get("ligands") or {"mode": LigandMode.MANUAL.value}, residue_name="CUSTOM"),
         system=system,
         md=_md_config(payload.get("md") or {}),
@@ -1015,6 +1173,70 @@ def _des_library_upload_target(
     if target.suffix.lower() not in {".lib", ".off", ".frcmod"}:
         raise ValueError("Only Amber .lib/.off and .frcmod files can be selected here.")
     return target
+
+
+def _site_resp_upload_target(
+    upload_root: Path,
+    relative_path: object,
+    fallback_name: object,
+) -> Path:
+    """Return a safe session-local destination for a browser-selected RESP case file."""
+    raw = str(relative_path or fallback_name or "upload.dat").strip().replace("\\", "/")
+    browser_path = PurePosixPath(raw)
+    if (
+        not raw
+        or browser_path.is_absolute()
+        or re.match(r"^[A-Za-z]:/", raw)
+        or any(part == ".." for part in browser_path.parts)
+    ):
+        raise ValueError(f"Unsafe browser upload path: {raw or '<empty>'}")
+    safe_parts = [_safe_name(part, "upload") for part in browser_path.parts if part not in {"", "."}]
+    if not safe_parts:
+        raise ValueError("The selected protein-site RESP file has no usable name.")
+    target = (upload_root.resolve() / Path(*safe_parts)).resolve()
+    try:
+        target.relative_to(upload_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Unsafe browser upload path: {raw}") from exc
+    if target.suffix.lower() not in SITE_RESP_BROWSER_SUFFIXES:
+        raise ValueError(
+            "This file type is not needed for protein-site RESP result import: "
+            f"{target.suffix or '<no suffix>'}"
+        )
+    return target
+
+
+def scan_protein_site_resp_directory(state: WebGuiState, raw_path: object) -> dict[str, Any]:
+    raw = str(raw_path or ".").strip() or "."
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        root = state.launch_cwd / root
+    root = root.resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Protein-site RESP search folder was not found: {root}")
+    candidates: list[dict[str, Any]] = []
+    for manifest_path in root.rglob("site_resp_manifest.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        job_dir = manifest_path.parent.parent
+        result_path = site_resp_result_path(job_dir)
+        candidates.append(
+            {
+                "job_dir": str(job_dir.resolve()),
+                "description": manifest.get("description"),
+                "source_label": manifest.get("source_label"),
+                "metal_sites": (manifest.get("cluster") or {}).get("metal_sites"),
+                "cluster": manifest.get("cluster") or {},
+                "scope": manifest.get("scope"),
+                "multiplicity": manifest.get("multiplicity"),
+                "created_at": manifest.get("created_at"),
+                "completed": result_path is not None,
+            }
+        )
+    candidates.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return {"ok": True, "search_root": str(root), "candidates": candidates}
 
 
 def scan_des_library_directory(state: WebGuiState, raw_path: object) -> dict[str, Any]:
@@ -1160,6 +1382,15 @@ def _bootstrap_payload(state: WebGuiState) -> dict[str, Any]:
             {
                 "element": element,
                 "charges": list(allowed_metal_charges(element)),
+                "duvail_charges": [
+                    charge
+                    for charge in allowed_metal_charges(element)
+                    if c4_parameter_set_supports_metal_charge(
+                        DESC4ParameterSet.OPC_DUVAIL,
+                        element,
+                        charge,
+                    )
+                ],
                 "default_charge": DEFAULT_TLEAP_METAL_CHARGES.get(element),
                 "coordination": COORDINATION_NUMBER_HINTS.get(element, ""),
                 "coordination_by_charge": _coordination_metadata_for_element(element),
@@ -1774,7 +2005,43 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 "result": result,
                 "command": command,
                 "resp_pending": result.get("resp") if isinstance(result, dict) else None,
+                "protein_site_resp": result.get("protein_site_resp") if isinstance(result, dict) else None,
             }
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+
+    @app.post("/api/protein-site-resp/candidates")
+    def protein_site_resp_candidates(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
+        try:
+            return scan_protein_site_resp_directory(state, payload.get("search_root"))
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+
+    @app.post("/api/protein-site-resp/upload")
+    async def protein_site_resp_upload(
+        files: list[UploadFile] = File(...),
+        relative_paths: list[str] = Form(...),
+    ):  # type: ignore[misc]
+        try:
+            if len(files) != len(relative_paths):
+                raise ValueError("The browser did not provide a path for every selected RESP file.")
+            upload_root = state.session_root / "protein_site_resp_uploads" / str(time.time_ns())
+            staged: list[Path] = []
+            for file, relative_path in zip(files, relative_paths, strict=True):
+                target = _site_resp_upload_target(upload_root, relative_path, file.filename)
+                if target in staged:
+                    raise ValueError(f"Two selected files resolve to the same upload path: {target.name}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as stream:
+                    while chunk := await file.read(1024 * 1024):
+                        stream.write(chunk)
+                staged.append(target)
+            if not staged:
+                raise ValueError("Select a case folder containing protein-site RESP results.")
+            state.uploads.extend(staged)
+            result = scan_protein_site_resp_directory(state, upload_root)
+            result["uploaded_files"] = [str(path) for path in staged]
+            return result
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
 
