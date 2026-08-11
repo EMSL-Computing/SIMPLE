@@ -87,13 +87,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.interactive:
             from amber_metallo.free_energy.cli import build_free_energy_wizard_configs, execute_free_energy_configs
-
-            wizard_result = build_free_energy_wizard_configs(args.write_config, dry_run=args.dry_run)
-            return execute_free_energy_configs(
-                wizard_result,
-                dry_run=args.dry_run,
-                failure_hint=SUPPORT_HINT,
+            from amber_metallo.subdirectory_search import (
+                prompt_for_subdirectory_search,
+                subdirectory_search_scope,
             )
+
+            search_subdirectories = prompt_for_subdirectory_search(Path.cwd())
+            with subdirectory_search_scope(search_subdirectories):
+                wizard_result = build_free_energy_wizard_configs(args.write_config, dry_run=args.dry_run)
+                return execute_free_energy_configs(
+                    wizard_result,
+                    dry_run=args.dry_run,
+                    failure_hint=SUPPORT_HINT,
+                )
         elif args.refresh_summaries:
             from amber_metallo.free_energy.mmpbsa import refresh_mmpbsa_summaries
 

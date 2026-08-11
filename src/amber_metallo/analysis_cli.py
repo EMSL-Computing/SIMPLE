@@ -9,18 +9,23 @@ from rich.table import Table
 
 from amber_metallo.cli import WizardChoice, _display_choice_table, _prompt_choice, _print_step_header
 from amber_metallo.reporting import console, print_notice
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti.abfe import (
     CASE_TYPE_BOUND,
     CASE_TYPE_WATER,
+    SAMPLING_SELECTION_FORWARD_ONLY,
+    SAMPLING_SELECTION_FORWARD_REVERSE,
     AnalysisCaseDiscovery,
     RBFEAnalysisResult,
     SingleCaseAnalysisResult,
     analyze_rbfe,
     analyze_single_case,
+    case_has_bidirectional_sampling,
     decoupling_scheme_for_case,
     discover_analysis_cases,
     discover_water_library_cases,
     inspect_analysis_case,
+    rbfe_pair_compatibility,
 )
 
 
@@ -72,6 +77,44 @@ def _analysis_method_choices() -> list[WizardChoice]:
     ]
 
 
+def _sampling_selection_choices() -> list[WizardChoice]:
+    return [
+        WizardChoice(
+            SAMPLING_SELECTION_FORWARD_ONLY,
+            "Forward only",
+            "Default. Use the conventional forward TI estimate and ignore reverse windows when they exist.",
+        ),
+        WizardChoice(
+            SAMPLING_SELECTION_FORWARD_REVERSE,
+            "Forward + Reverse",
+            "Optional convergence diagnostic. Average both sweeps only when their hysteresis is acceptably small; a large difference signals inadequate equilibration or path dependence.",
+        ),
+    ]
+
+
+def _prompt_sampling_selection(cases: list[AnalysisCaseDiscovery]) -> str:
+    if not any(case_has_bidirectional_sampling(case) for case in cases):
+        return SAMPLING_SELECTION_FORWARD_ONLY
+    choices = _sampling_selection_choices()
+    _display_choice_table("Bidirectional TI data to include", choices)
+    return _prompt_choice(
+        "Choose which TI directions to analyze",
+        choices,
+        default_key=SAMPLING_SELECTION_FORWARD_ONLY,
+    )
+
+
+def _case_sampling_label(case: AnalysisCaseDiscovery) -> str:
+    library_selection = str(case.metadata.get("library_sampling_selection") or "")
+    if library_selection == "legacy_unspecified":
+        return "Legacy (Forward-compatible)"
+    if library_selection == SAMPLING_SELECTION_FORWARD_ONLY:
+        return "Forward"
+    if library_selection == SAMPLING_SELECTION_FORWARD_REVERSE:
+        return "Forward + Reverse"
+    return "Forward + Reverse" if case_has_bidirectional_sampling(case) else "Forward"
+
+
 def _display_cases(
     search_dir: Path,
     discoveries: list[AnalysisCaseDiscovery],
@@ -84,6 +127,8 @@ def _display_cases(
     table.add_column("Case", style="bold white")
     table.add_column("Type", style="white")
     table.add_column("Scheme", style="magenta")
+    table.add_column("Sampling", style="green")
+    table.add_column("Charge mode", style="yellow")
     table.add_column("Description", style="cyan")
     table.add_column("Outputs", style="white")
     table.add_column("Status", style="white")
@@ -91,6 +136,8 @@ def _display_cases(
         table.add_row(
             "0",
             "All ready cases",
+            "-",
+            "-",
             "-",
             "-",
             "Analyze every selectable case in this list.",
@@ -102,6 +149,8 @@ def _display_cases(
             "Enter a path manually",
             "-",
             "-",
+            "-",
+            "-",
             "Use a case outside this list.",
             "-",
             "Always available",
@@ -110,6 +159,8 @@ def _display_cases(
         table.add_row(
             "0",
             "Enter a path manually",
+            "-",
+            "-",
             "-",
             "-",
             "Use a case outside this list.",
@@ -125,13 +176,16 @@ def _display_cases(
             f"{discovery.display_name}\n{discovery.root}",
             type_label,
             decoupling_scheme_for_case(discovery),
+            _case_sampling_label(discovery),
+            str(discovery.metadata.get("charge_compensation_mode") or "unknown"),
             discovery.description,
             discovery.completion_summary,
             discovery.readiness_note,
         )
     console.print(table)
+    scope = "and its immediate subdirectories" if search_subdirectories_enabled() else "only"
     console.print(
-        f"[dim]Scanned {search_dir.resolve()} and its immediate subdirectories for completed water_ref and bound TI cases.[/dim]"
+        f"[dim]Scanned {search_dir.resolve()} {scope} for completed water_ref and bound TI cases.[/dim]"
     )
 
 
@@ -249,9 +303,14 @@ def _prompt_case_selection(
     prompt_text: str,
     include_library_water: bool = False,
     preferred_for_bound: AnalysisCaseDiscovery | None = None,
+    candidate_cases: list[AnalysisCaseDiscovery] | None = None,
 ) -> AnalysisCaseDiscovery:
-    discoveries = discover_analysis_cases(Path.cwd(), case_types=case_types)
-    if include_library_water and CASE_TYPE_WATER in case_types:
+    discoveries = (
+        list(candidate_cases)
+        if candidate_cases is not None
+        else discover_analysis_cases(Path.cwd(), case_types=case_types)
+    )
+    if candidate_cases is None and include_library_water and CASE_TYPE_WATER in case_types:
         discoveries.extend(discover_water_library_cases())
     if discoveries:
         _display_cases(Path.cwd(), discoveries, title=title)
@@ -349,7 +408,7 @@ def _preferred_water_case(
     if not selectable:
         return None
 
-    def score(water_case: AnalysisCaseDiscovery) -> tuple[int, int]:
+    def score(water_case: AnalysisCaseDiscovery) -> tuple[int, int, int, int, int]:
         water_signatures = _case_metal_signatures(water_case)
         exact = bool(bound_signatures & water_signatures)
         same_element = any(
@@ -357,10 +416,19 @@ def _preferred_water_case(
             for bound_element, _bound_charge in bound_signatures
             for water_element, _water_charge in water_signatures
         )
-        return (2 if exact else 1 if same_element else 0, -selectable.index(water_case))
+        bound_charge_mode = str(bound_case.metadata.get("charge_compensation_mode") or "unknown")
+        water_charge_mode = str(water_case.metadata.get("charge_compensation_mode") or "unknown")
+        charge_match = 2 if bound_charge_mode == water_charge_mode else 1 if "unknown" in {bound_charge_mode, water_charge_mode} else 0
+        bound_scheme = decoupling_scheme_for_case(bound_case)
+        water_scheme = decoupling_scheme_for_case(water_case)
+        scheme_match = 2 if bound_scheme == water_scheme else 1 if "Unknown" in {bound_scheme, water_scheme} else 0
+        metal_match = 2 if exact else 1 if same_element else 0
+        sampling_metadata = str(water_case.metadata.get("library_sampling_selection") or "")
+        sampling_specificity = 0 if sampling_metadata == "legacy_unspecified" else 1
+        return (charge_match, scheme_match, metal_match, sampling_specificity, -selectable.index(water_case))
 
     preferred = max(selectable, key=score)
-    return preferred if score(preferred)[0] > 0 else None
+    return preferred if score(preferred)[2] > 0 else None
 
 
 def run_analysis_wizard() -> (
@@ -410,7 +478,11 @@ def run_analysis_wizard() -> (
             title="Detected TI Cases for ABFE",
             prompt_text="Choose case number(s) (0 = analyze all ready, M = enter a path manually)",
         )
-        results = [analyze_single_case(case_selection) for case_selection in case_selections]
+        sampling_selection = _prompt_sampling_selection(case_selections)
+        results = [
+            analyze_single_case(case_selection, sampling_selection=sampling_selection)
+            for case_selection in case_selections
+        ]
         return results[0] if len(results) == 1 else results
 
     if mode == "rbfe":
@@ -424,7 +496,12 @@ def run_analysis_wizard() -> (
             title="Detected Bound TI Cases",
             prompt_text="Choose bound case number(s) (0 = analyze all ready, M = enter a path manually)",
         )
-        results: list[RBFEAnalysisResult] = []
+        sampling_selection = _prompt_sampling_selection(bound_cases)
+        water_candidates = discover_analysis_cases(Path.cwd(), case_types={CASE_TYPE_WATER})
+        water_candidates.extend(
+            discover_water_library_cases(sampling_selection=sampling_selection)
+        )
+        pairings: list[tuple[AnalysisCaseDiscovery, AnalysisCaseDiscovery]] = []
         for index, bound_case in enumerate(bound_cases, start=1):
             _print_step_header(
                 3 + index,
@@ -432,14 +509,34 @@ def run_analysis_wizard() -> (
                 "Choose the completed water-reference case for this bound case. A matching REE identity is "
                 "selected as the default when available.",
             )
-            water_case = _prompt_case_selection(
-                case_types={CASE_TYPE_WATER},
-                title=f"Water References for {bound_case.display_name}",
-                prompt_text="Choose a water-reference case number (0 = enter a path manually)",
-                include_library_water=True,
-                preferred_for_bound=bound_case,
-            )
-            results.append(analyze_rbfe(bound_case, water_case))
+            while True:
+                water_case = _prompt_case_selection(
+                    case_types={CASE_TYPE_WATER},
+                    title=f"Water References for {bound_case.display_name}",
+                    prompt_text="Choose a water-reference case number (0 = enter a path manually)",
+                    preferred_for_bound=bound_case,
+                    candidate_cases=water_candidates,
+                )
+                compatibility_errors, compatibility_warnings = rbfe_pair_compatibility(bound_case, water_case)
+                if compatibility_errors:
+                    console.print(
+                        "[bold red]That bound/water pair is incompatible:[/bold red] "
+                        + " ".join(compatibility_errors)
+                    )
+                    continue
+                for warning in compatibility_warnings:
+                    console.print(f"[bold yellow]Pairing warning:[/bold yellow] {warning}")
+                pairings.append((bound_case, water_case))
+                break
+        print_notice(
+            "RBFE Pairings Confirmed",
+            "All bound/water selections are complete. SIMPLE will now run the calculations without pausing for more case choices.",
+            border_style="cyan",
+        )
+        results = [
+            analyze_rbfe(bound_case, water_case, sampling_selection=sampling_selection)
+            for bound_case, water_case in pairings
+        ]
         return results[0] if len(results) == 1 else results
 
     raise typer.Abort()

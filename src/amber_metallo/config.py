@@ -586,9 +586,9 @@ class ProteinSiteRespConfig(BaseModel):
     job_dirs: list[str] = Field(default_factory=list)
     review_clusters: bool = False
     # Internal continuation flag used when an existing RESP result is selected
-    # from the interactive Protein start screen.  In this mode SIMPLE patches
-    # the already-built 02_system topology instead of preparing the protein and
-    # rebuilding the solvated system.
+    # from the interactive Protein start screen.  In this mode SIMPLE preserves
+    # the prepared protein/reference topology, builds the deferred final solvated
+    # system when needed, and then applies the reviewed RESP charges in place.
     resume_existing_system: bool = False
     clusters: list[ProteinSiteRespClusterConfig] = Field(default_factory=list)
 

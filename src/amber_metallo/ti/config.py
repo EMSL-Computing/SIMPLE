@@ -55,6 +55,16 @@ class TIDecouplingMode(StrEnum):
     COMBINED_Q_VDW = "combined_q_vdw"
 
 
+class TISamplingMode(StrEnum):
+    SINGLE_PASS = "single_pass"
+    BIDIRECTIONAL = "bidirectional"
+
+
+class TIChargeCompensationMode(StrEnum):
+    CO_ALCHEMICAL_COUNTERIONS = "co_alchemical_counterions"
+    NONE = "none"
+
+
 class TIMetalSelectionMode(StrEnum):
     SINGLE = "single"
     ONE_BY_ONE = "one_by_one"
@@ -117,6 +127,14 @@ class TIProtocolConfig(BaseModel):
     implementation_mode: TIImplementationMode = TIImplementationMode.AMBER_12_6_WORKAROUND
     decoupling_mode: TIDecouplingMode = TIDecouplingMode.SPLIT_Q_VDW
     production_time_ns: float = Field(default=1.0, gt=0.0)
+    sampling_mode: TISamplingMode = TISamplingMode.SINGLE_PASS
+    window_equilibration_ns: float = Field(default=0.2, ge=0.0)
+    charge_compensation_mode: TIChargeCompensationMode = TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS
+    counterion_min_solute_distance_angstrom: float = Field(default=12.0, gt=0.0)
+    counterion_min_separation_angstrom: float = Field(default=6.0, gt=0.0)
+    counterion_restraint_force_constant: float = Field(default=5.0, gt=0.0)
+    counterion_prep_min_cycles: int = Field(default=5000, ge=100)
+    counterion_prep_eq_ns: float = Field(default=0.2, gt=0.0)
     charge_lambdas: list[float] = Field(default_factory=_default_charge_lambdas)
     vdw_lambdas: list[float] = Field(default_factory=_default_vdw_lambdas)
     qoff_dt_ps: float = Field(default=0.001, gt=0.0)
@@ -133,10 +151,30 @@ class TIProtocolConfig(BaseModel):
     scbeta: float = Field(default=12.0, gt=0.0)
     logdvdl: bool = True
 
+    @model_validator(mode="before")
+    @classmethod
+    def upgrade_legacy_sampling_mode(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        upgraded = dict(value)
+        if upgraded.get("sampling_mode") == "replicated_bidirectional":
+            upgraded["sampling_mode"] = TISamplingMode.BIDIRECTIONAL.value
+        # sampling_replicas belonged to the short-lived replicated protocol.
+        # Accept old config files, but intentionally run one forward/reverse pair.
+        upgraded.pop("sampling_replicas", None)
+        return upgraded
+
     @model_validator(mode="after")
     def validate_lambdas(self) -> "TIProtocolConfig":
         self.charge_lambdas = _validate_lambda_schedule(self.charge_lambdas, label="charge_lambdas")
         self.vdw_lambdas = _validate_lambda_schedule(self.vdw_lambdas, label="vdw_lambdas")
+        if self.sampling_mode == TISamplingMode.BIDIRECTIONAL and not (
+            self.implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI
+            and self.decoupling_mode == TIDecouplingMode.COMBINED_Q_VDW
+        ):
+            raise ValueError(
+                "bidirectional sampling currently requires amber_12_6_4_gti with combined_q_vdw"
+            )
         return self
 
 

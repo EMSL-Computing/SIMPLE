@@ -513,6 +513,7 @@ def discover_des_library_candidates(
     search_dir: str | Path = ".",
     *,
     ref_data_dir: str | Path = "REF_DATA",
+    recursive: bool = True,
 ) -> list[DESLibraryCandidate]:
     root = Path(search_dir).expanduser().resolve()
     excluded = {
@@ -529,7 +530,8 @@ def discover_des_library_candidates(
     }
     library_files: list[Path] = []
     frcmod_files: list[Path] = []
-    for path in root.rglob("*"):
+    paths = root.rglob("*") if recursive else root.iterdir()
+    for path in paths:
         if any(part in excluded for part in path.relative_to(root).parts[:-1]):
             continue
         if path.suffix.lower() in {".lib", ".off"}:

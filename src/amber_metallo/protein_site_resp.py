@@ -33,11 +33,14 @@ from amber_metallo.qm.resp_fit import (
 )
 from amber_metallo.qm.slurm import render_resp_slurm_script, render_tahoma_resp_script
 from amber_metallo.reporting import write_json
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.execution import run_command
 
 
 AMBER_CHARGE_SCALE = 18.2223
 DIRECT_COORDINATION_CUTOFF_ANGSTROM = 3.0
+LINK_CAP_MIN_NONBONDED_DISTANCE_ANGSTROM = 1.50
+_LINK_CAP_DIRECTION_SAMPLES = 512
 SUPPORTED_TARGET_RESIDUES = {
     "HIS",
     "HID",
@@ -637,20 +640,93 @@ def discover_site_clusters(
     return clusters
 
 
-def _unit_vector(first: TopologyAtom, second: TopologyAtom) -> tuple[float, float, float]:
-    dx, dy, dz = first.x - second.x, first.y - second.y, first.z - second.z
+def _unit_vector_toward(first: TopologyAtom, second: TopologyAtom) -> tuple[float, float, float]:
+    """Return the direction from ``first`` toward ``second``."""
+
+    dx, dy, dz = second.x - first.x, second.y - first.y, second.z - first.z
     length = math.sqrt(dx * dx + dy * dy + dz * dz)
     if length <= 1.0e-12:
         return (1.0, 0.0, 0.0)
     return (dx / length, dy / length, dz / length)
 
 
+def _link_cap_direction_candidates(
+    preferred: tuple[float, float, float],
+) -> Iterable[tuple[float, float, float]]:
+    """Yield the cut-bond direction first, followed by deterministic alternatives."""
+
+    yield preferred
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    for index in range(_LINK_CAP_DIRECTION_SAMPLES):
+        z = 1.0 - 2.0 * (index + 0.5) / _LINK_CAP_DIRECTION_SAMPLES
+        radial = math.sqrt(max(0.0, 1.0 - z * z))
+        azimuth = golden_angle * index
+        yield (radial * math.cos(azimuth), radial * math.sin(azimuth), z)
+
+
+def _place_link_cap(
+    *,
+    name: str,
+    anchor: TopologyAtom,
+    removed_neighbor: TopologyAtom,
+    bond_length: float,
+    obstacles: list[tuple[str, str, float, float, float]],
+) -> tuple[float, float, float]:
+    """Place a hydrogen cap toward the removed atom without a nonbonded clash."""
+
+    preferred = _unit_vector_toward(anchor, removed_neighbor)
+    anchor_position = (anchor.x, anchor.y, anchor.z)
+    nonbonded: list[tuple[str, str, float, float, float]] = []
+    skipped_anchor = False
+    for obstacle in obstacles:
+        distance_to_anchor = math.dist(anchor_position, obstacle[2:5])
+        if not skipped_anchor and distance_to_anchor <= 1.0e-6:
+            skipped_anchor = True
+            continue
+        nonbonded.append(obstacle)
+
+    valid: list[tuple[float, float, tuple[float, float, float]]] = []
+    best_clearance = 0.0
+    for direction in _link_cap_direction_candidates(preferred):
+        candidate = tuple(
+            coordinate + bond_length * component
+            for coordinate, component in zip(anchor_position, direction, strict=True)
+        )
+        clearance = min(
+            (math.dist(candidate, obstacle[2:5]) for obstacle in nonbonded),
+            default=math.inf,
+        )
+        best_clearance = max(best_clearance, clearance)
+        if clearance + 1.0e-9 < LINK_CAP_MIN_NONBONDED_DISTANCE_ANGSTROM:
+            continue
+        alignment = sum(
+            component * preferred_component
+            for component, preferred_component in zip(direction, preferred, strict=True)
+        )
+        # Preserve the severed-bond direction whenever possible.  Clearance
+        # breaks ties and keeps a displaced cap away from the acceptance edge.
+        valid.append((alignment, clearance, candidate))
+    if not valid:
+        raise ValueError(
+            f"Could not place protein-site RESP link cap {name} without a nonbonded contact shorter than "
+            f"{LINK_CAP_MIN_NONBONDED_DISTANCE_ANGSTROM:.2f} A (best available clearance "
+            f"{best_clearance:.2f} A). Check the prepared structure for atomic overlaps."
+        )
+    return max(valid, key=lambda item: (item[0], item[1]))[2]
+
+
 def _link_caps(
     *,
     selected_residue_indices: set[int],
+    retained_residue_indices: set[int],
     residues: dict[int, list[TopologyAtom]],
+    retained_atoms: Iterable[TopologyAtom | MoleculeAtom],
 ) -> list[dict[str, object]]:
     caps: list[dict[str, object]] = []
+    obstacles = [
+        (atom.name, atom.element, float(atom.x), float(atom.y), float(atom.z))
+        for atom in retained_atoms
+    ]
     ordered_indices = sorted(residues)
     position = {residue_index: index for index, residue_index in enumerate(ordered_indices)}
     for residue_index in sorted(selected_residue_indices):
@@ -660,42 +736,56 @@ def _link_caps(
         list_position = position[residue_index]
         previous_index = ordered_indices[list_position - 1] if list_position > 0 else None
         next_index = ordered_indices[list_position + 1] if list_position + 1 < len(ordered_indices) else None
-        if previous_index not in selected_residue_indices and previous_index is not None:
+        if previous_index not in retained_residue_indices and previous_index is not None:
             previous_atoms = residues[previous_index]
             if previous_atoms[0].chain == chain and "N" in atom_by_name:
                 previous_c = next((atom for atom in previous_atoms if atom.name.upper() == "C"), None)
                 if previous_c is not None:
                     anchor = atom_by_name["N"]
-                    ux, uy, uz = _unit_vector(anchor, previous_c)
-                    caps.append(
-                        {
-                            "name": f"HN{residue_index}",
-                            "element": "H",
-                            "x": anchor.x + 1.01 * ux,
-                            "y": anchor.y + 1.01 * uy,
-                            "z": anchor.z + 1.01 * uz,
-                            "residue_key": residue_atoms[0].residue_key,
-                            "role": "link_cap",
-                        }
+                    name = f"HN{residue_index}"
+                    x, y, z = _place_link_cap(
+                        name=name,
+                        anchor=anchor,
+                        removed_neighbor=previous_c,
+                        bond_length=1.01,
+                        obstacles=obstacles,
                     )
-        if next_index not in selected_residue_indices and next_index is not None:
+                    cap = {
+                        "name": name,
+                        "element": "H",
+                        "x": x,
+                        "y": y,
+                        "z": z,
+                        "residue_key": residue_atoms[0].residue_key,
+                        "role": "link_cap",
+                    }
+                    caps.append(cap)
+                    obstacles.append((name, "H", x, y, z))
+        if next_index not in retained_residue_indices and next_index is not None:
             next_atoms = residues[next_index]
             if next_atoms[0].chain == chain and "C" in atom_by_name:
                 next_n = next((atom for atom in next_atoms if atom.name.upper() == "N"), None)
                 if next_n is not None:
                     anchor = atom_by_name["C"]
-                    ux, uy, uz = _unit_vector(anchor, next_n)
-                    caps.append(
-                        {
-                            "name": f"HC{residue_index}",
-                            "element": "H",
-                            "x": anchor.x + 1.09 * ux,
-                            "y": anchor.y + 1.09 * uy,
-                            "z": anchor.z + 1.09 * uz,
-                            "residue_key": residue_atoms[0].residue_key,
-                            "role": "link_cap",
-                        }
+                    name = f"HC{residue_index}"
+                    x, y, z = _place_link_cap(
+                        name=name,
+                        anchor=anchor,
+                        removed_neighbor=next_n,
+                        bond_length=1.09,
+                        obstacles=obstacles,
                     )
+                    cap = {
+                        "name": name,
+                        "element": "H",
+                        "x": x,
+                        "y": y,
+                        "z": z,
+                        "residue_key": residue_atoms[0].residue_key,
+                        "role": "link_cap",
+                    }
+                    caps.append(cap)
+                    obstacles.append((name, "H", x, y, z))
     return caps
 
 
@@ -829,7 +919,12 @@ def _cluster_payload(
         if not apply_charge:
             fixed_charges[cluster_index] = original_charge
 
-    for cap in _link_caps(selected_residue_indices=selected_residues, residues=residues):
+    for cap in _link_caps(
+        selected_residue_indices=selected_residues,
+        retained_residue_indices=included_residues,
+        residues=residues,
+        retained_atoms=molecule_atoms,
+    ):
         cluster_index = len(molecule_atoms)
         molecule_atoms.append(
             MoleculeAtom(
@@ -940,7 +1035,19 @@ def _site_job_candidates(search_roots: Iterable[Path], fingerprint: str) -> list
         resolved = root.expanduser().resolve()
         if not resolved.exists():
             continue
-        for manifest_path in resolved.rglob("site_resp_manifest.json"):
+        manifest_paths = (
+            resolved.rglob("site_resp_manifest.json")
+            if search_subdirectories_enabled()
+            else (
+                path
+                for path in (
+                    resolved / "site_resp_manifest.json",
+                    resolved / "manifests" / "site_resp_manifest.json",
+                )
+                if path.is_file()
+            )
+        )
+        for manifest_path in manifest_paths:
             job_dir = manifest_path.parent.parent
             if job_dir in checked:
                 continue
@@ -985,21 +1092,48 @@ def _site_resp_grid_available(job_dir: str | Path) -> bool:
     return has_grid and has_xyz
 
 
+def _site_resp_workflow_system_available(workflow_root: Path) -> bool:
+    """Return whether a workflow has the files needed for a safe RESP resume.
+
+    Older workflows may already have their final solvated topology, while the
+    current deferred-solvation workflow intentionally stops with only an
+    unsolvated site-RESP reference topology.
+    """
+
+    system_dir = workflow_root / "02_system"
+    final_system = (system_dir / "system.prmtop").exists() and (
+        system_dir / "system.inpcrd"
+    ).exists()
+    reference_system = all(
+        path.exists()
+        for path in (
+            system_dir / "site_resp_reference_manifest.json",
+            system_dir / "system.unsolvated.pdb",
+            system_dir / "system.unsolvated.prmtop",
+            system_dir / "system.unsolvated.inpcrd",
+        )
+    )
+    return final_system or reference_system
+
+
+def _site_resp_final_system_available(workflow_root: Path) -> bool:
+    system_dir = workflow_root / "02_system"
+    return (system_dir / "system.prmtop").exists() and (
+        system_dir / "system.inpcrd"
+    ).exists()
+
+
 def _site_resp_workflow_root(job_dir: Path, payload: dict[str, object]) -> Path | None:
     prepared_system = str(payload.get("prepared_system_pdb") or "").strip()
     if prepared_system:
         prepared_path = Path(prepared_system).expanduser()
         if prepared_path.parent.name == "02_system":
             candidate = prepared_path.parent.parent.resolve()
-            if (candidate / "02_system" / "system.prmtop").exists() and (
-                candidate / "02_system" / "system.inpcrd"
-            ).exists():
+            if _site_resp_workflow_system_available(candidate):
                 return candidate
 
     for candidate in (job_dir, *job_dir.parents):
-        if (candidate / "02_system" / "system.prmtop").exists() and (
-            candidate / "02_system" / "system.inpcrd"
-        ).exists():
+        if _site_resp_workflow_system_available(candidate):
             return candidate.resolve()
     return None
 
@@ -1025,12 +1159,15 @@ def _already_applied_site_resp_jobs(workflow_root: Path) -> set[Path]:
 
 def find_protein_site_resp_resume_candidates(
     search_root: str | Path,
+    *,
+    recursive: bool = True,
 ) -> list[ProteinSiteRespResumeCandidate]:
     """Find completed site-RESP jobs that can resume their original workflow.
 
     A result is offered only when its manifest, ESP fit (or refittable grid), and
-    original canonical topology/coordinates are all available.  This keeps the
-    Protein start screen from offering orphaned or already-applied jobs.
+    original final or unsolvated reference topology/coordinates are all
+    available.  This keeps the Protein start screen from offering orphaned or
+    already-applied jobs.
     """
 
     root = Path(search_root).expanduser().resolve()
@@ -1039,7 +1176,18 @@ def find_protein_site_resp_resume_candidates(
     candidates: list[ProteinSiteRespResumeCandidate] = []
     seen: set[Path] = set()
     try:
-        manifests = root.rglob("site_resp_manifest.json")
+        manifests = (
+            root.rglob("site_resp_manifest.json")
+            if recursive
+            else (
+                path
+                for path in (
+                    root / "site_resp_manifest.json",
+                    root / "manifests" / "site_resp_manifest.json",
+                )
+                if path.is_file()
+            )
+        )
         for manifest_path in manifests:
             job_dir = manifest_path.parent.parent.resolve()
             if job_dir in seen:
@@ -1053,6 +1201,12 @@ def find_protein_site_resp_resume_candidates(
                 continue
             workflow_root = _site_resp_workflow_root(job_dir, payload)
             if workflow_root is None:
+                continue
+            # A final solvated topology means this workflow has already moved
+            # beyond the deferred site-RESP stage.  Do not offer it again on
+            # the Protein start screen, even if an older run lacks an explicit
+            # application marker.
+            if _site_resp_final_system_available(workflow_root):
                 continue
             if job_dir in _already_applied_site_resp_jobs(workflow_root):
                 continue
@@ -1255,7 +1409,7 @@ def build_site_resp_jobs(
         (inputs_dir / "resp_job.nw").write_text(header + "\n" + nwchem_text, encoding="utf-8")
         (inputs_dir / "resp_job_retry.nw").write_text(
             header
-            + "\n# Automatic fallback: PBE orbital preconditioning followed by the requested r2SCAN ESP level.\n"
+            + "\n# Automatic fallback: small-basis PBE orbital preconditioning, basis projection, then the requested r2SCAN ESP level.\n"
             + nwchem_retry_text,
             encoding="utf-8",
         )
@@ -1335,7 +1489,7 @@ def build_site_resp_jobs(
             },
             "scf_strategy": {
                 "primary": "r2SCAN/def2-TZVP with damping, level shifting, Rabuck fractional occupation, and DIIS",
-                "retry": "PBE/def2-TZVP orbital preconditioning followed by r2SCAN/def2-TZVP",
+                "retry": "PBE/def2-SVP quadratic-convergence preconditioning projected into r2SCAN/def2-TZVP",
                 "final_esp_level": "r2SCAN/def2-TZVP",
             },
             "expected_result": str((output_dir / "site_resp_charges.json").resolve()),
@@ -1346,7 +1500,8 @@ def build_site_resp_jobs(
             description
             + "\n\nThis is a site-specific hybrid charge model. The metal formal charge and every target residue's "
             "net charge remain fixed. Run slurm/tahoma_resp.sbatch on Tahoma. The script retries a failed primary "
-            "SCF using PBE orbital preconditioning, while the final ESP remains r2SCAN/def2-TZVP. Then rerun SIMPLE "
+            "SCF using small-basis PBE orbital preconditioning and basis projection, while the final ESP remains "
+            "r2SCAN/def2-TZVP. Then rerun SIMPLE "
             "and review the charge-delta table before application.\n",
             encoding="utf-8",
         )

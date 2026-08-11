@@ -11,6 +11,8 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
+
 
 TOPOLOGY_EXTS = {".prmtop", ".parm7", ".top", ".psf", ".pdb"}
 TRAJECTORY_EXTS = {".nc", ".mdcrd", ".crd", ".dcd", ".xtc", ".trr", ".trj"}
@@ -308,7 +310,7 @@ def _iter_scan_files(root: Path, *, max_depth: int = 4) -> Iterable[Path]:
             continue
         for child in children:
             if child.is_dir():
-                if child.name in SCAN_SKIP_NAMES:
+                if child.name in SCAN_SKIP_NAMES or not search_subdirectories_enabled():
                     continue
                 stack.append((child, depth + 1))
             elif child.is_file():

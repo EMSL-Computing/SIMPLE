@@ -26,6 +26,7 @@ from amber_metallo.cli import (
 from amber_metallo.config import SlurmProfile
 from amber_metallo.environment import detect_amber_environment
 from amber_metallo.reporting import console, print_notice
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti import abfe as ti_abfe
 from amber_metallo.ti.analysis import (
     assess_site_stability,
@@ -41,9 +42,11 @@ from amber_metallo.ti.config import (
     MetalSelectionConfig,
     SnapshotConfig,
     SnapshotMode,
+    TIChargeCompensationMode,
     TIDecouplingMode,
     TIImplementationMode,
     TIProtocolConfig,
+    TISamplingMode,
     TIWorkflowConfig,
     WaterReferenceConfig,
     save_config,
@@ -329,6 +332,85 @@ def _prompt_ti_decoupling_mode(implementation_mode: TIImplementationMode) -> TID
             "testing, but it changes the decomposition relative to the default Q-off then VDW-off protocol."
         )
     print_notice("Selected TI Decoupling", notice, border_style="cyan")
+    return selection
+
+
+def _prompt_ti_sampling_mode(decoupling_mode: TIDecouplingMode) -> TISamplingMode:
+    if decoupling_mode != TIDecouplingMode.COMBINED_Q_VDW:
+        console.print("[dim]Split TI currently uses the conventional single forward sweep.[/dim]")
+        return TISamplingMode.SINGLE_PASS
+    choices = [
+        WizardChoice(
+            TISamplingMode.SINGLE_PASS.value,
+            "Forward single pass",
+            "Default and recommended baseline. Run one conventional forward lambda sweep with sequential restart propagation.",
+        ),
+        WizardChoice(
+            TISamplingMode.BIDIRECTIONAL.value,
+            "Optional forward/reverse pair",
+            "Convergence diagnostic: equilibrate every window, decouple forward, then recouple from the endpoint. Use the averaged estimate only when forward/reverse hysteresis is acceptably small.",
+        ),
+    ]
+    _display_choice_table("TI sampling protocol", choices)
+    selection = TISamplingMode(
+        _prompt_choice(
+            "Choose the TI sampling protocol",
+            choices,
+            default_key=TISamplingMode.SINGLE_PASS.value,
+        )
+    )
+    if selection == TISamplingMode.BIDIRECTIONAL:
+        print_notice(
+            "Bidirectional TI Sampling",
+            "Every lambda window receives a separate "
+            "200 ps equilibration whose DV/DL values are not analyzed, followed by the requested production "
+            "length. Reverse recoupling starts from the verified forward endpoint, and the two sweeps are stored "
+            "separately so analyses.py can report hysteresis. This is an optional convergence diagnostic, not a "
+            "guaranteed accuracy improvement: a large forward/reverse difference indicates insufficient equilibration, "
+            "slow relaxation, or path dependence and should not be hidden by averaging. Run the workflow again if "
+            "independent repeats are needed.",
+            border_style="cyan",
+        )
+    return selection
+
+
+def _prompt_ti_charge_compensation_mode() -> TIChargeCompensationMode:
+    choices = [
+        WizardChoice(
+            TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS.value,
+            "Co-alchemical counterions",
+            "Default. Keep the periodic system neutral by decoupling the required distant monovalent counterions with the metal.",
+        ),
+        WizardChoice(
+            TIChargeCompensationMode.NONE.value,
+            "No counterion compensation",
+            "Keep the previous charge-changing PME path. This can be reasonable for equal-charge RBFE where the artifact largely cancels.",
+        ),
+    ]
+    _display_choice_table("TI charge compensation", choices)
+    selection = TIChargeCompensationMode(
+        _prompt_choice(
+            "Choose the TI charge-compensation method",
+            choices,
+            default_key=TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS.value,
+        )
+    )
+    if selection == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS:
+        print_notice(
+            "Charge-Neutral TI",
+            "SIMPLE will reuse suitable distant monovalent counterions when possible. If none are present, it "
+            "will report that counterions are being added, rebuild the affected starting system, and require "
+            "minimization/equilibration before TI. The initial topology and both alchemical endpoints must all "
+            "have zero net charge.",
+            border_style="cyan",
+        )
+    else:
+        print_notice(
+            "Charge-Changing TI",
+            "The previous PME path is retained. For equal-charge RBFE the common finite-size contribution may "
+            "largely cancel, but absolute/charge-changing results should be checked with an electrostatic finite-size correction.",
+            border_style="yellow",
+        )
     return selection
 
 
@@ -747,8 +829,19 @@ def _resolve_water_reference_source_choice(
     custom_ion_frcmods: list[str],
     implementation_mode: TIImplementationMode = TIImplementationMode.AMBER_12_6_WORKAROUND,
     decoupling_mode: TIDecouplingMode = TIDecouplingMode.SPLIT_Q_VDW,
+    sampling_mode: TISamplingMode = TISamplingMode.SINGLE_PASS,
 ) -> tuple[bool, bool, str | None]:
-    library_entry = ti_abfe.lookup_water_library_entry(selected.element, formal_charge, water_model)
+    library_sampling_selection = (
+        ti_abfe.SAMPLING_SELECTION_FORWARD_REVERSE
+        if sampling_mode == TISamplingMode.BIDIRECTIONAL
+        else ti_abfe.SAMPLING_SELECTION_FORWARD_ONLY
+    )
+    library_entry = ti_abfe.lookup_water_library_entry(
+        selected.element,
+        formal_charge,
+        water_model,
+        sampling_selection=library_sampling_selection,
+    )
     if library_entry:
         aggregate = library_entry.get("aggregate") or {}
         total = aggregate.get("total") or {}
@@ -761,6 +854,7 @@ def _resolve_water_reference_source_choice(
             f"{float(total.get('propagated_sem_kcal_mol', 0.0)):.6f} kcal/mol[/bold]\n"
             f"95% CI: [{float(ci95.get('low', 0.0)):.6f}, {float(ci95.get('high', 0.0)):.6f}]\n"
             f"Contributing cases: {int(aggregate.get('n_cases', 0))}\n\n"
+            f"Sampling source: {library_entry.get('sampling_selection', 'legacy_unspecified')}\n\n"
             "If you reuse the library value, SIMPLE will skip generating a fresh water-reference leg and store "
             "the exact library snapshot in the TI manifest for reproducibility.",
             border_style="green",
@@ -942,6 +1036,11 @@ def _is_raw_ti_scan_skipped_dir(path: Path) -> bool:
 
 
 def _iter_raw_ti_scan_files(search_root: Path) -> list[Path]:
+    if not search_subdirectories_enabled():
+        try:
+            return [path for path in search_root.iterdir() if path.is_file()]
+        except OSError:
+            return []
     files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(search_root):
         current = Path(dirpath)
@@ -1364,9 +1463,10 @@ def _inspect_main_workflow_directory(path: str | Path) -> WorkflowDiscovery | No
 def _discover_main_workflow_directories(search_dir: Path) -> list[WorkflowDiscovery]:
     resolved_search_dir = search_dir.expanduser().resolve()
     candidate_roots = [resolved_search_dir]
-    candidate_roots.extend(
-        sorted((path for path in resolved_search_dir.iterdir() if path.is_dir()), key=lambda item: item.name.lower())
-    )
+    if search_subdirectories_enabled():
+        candidate_roots.extend(
+            sorted((path for path in resolved_search_dir.iterdir() if path.is_dir()), key=lambda item: item.name.lower())
+        )
 
     discoveries: list[WorkflowDiscovery] = []
     seen: set[Path] = set()
@@ -1459,9 +1559,8 @@ def _display_discovered_workflows(search_dir: Path, discoveries: list[WorkflowDi
             _workflow_status_label(discovery),
         )
     console.print(table)
-    console.print(
-        f"[dim]Scanned {search_dir.resolve()} and its immediate subdirectories for folders created by main.py.[/dim]"
-    )
+    scope = "and its immediate subdirectories" if search_subdirectories_enabled() else "only"
+    console.print(f"[dim]Scanned {search_dir.resolve()} {scope} for folders created by main.py.[/dim]")
 
 
 def _prompt_discovered_workflow(discoveries: list[WorkflowDiscovery]) -> WorkflowDiscovery | None:
@@ -1657,7 +1756,8 @@ def _display_raw_ti_inputs(search_root: Path, discoveries: list[RawTIInputDiscov
             _format_raw_ti_path(discovery.production_restart_path, search_root=search_root),
         )
     console.print(table)
-    console.print(f"[dim]Scanned {search_root.resolve()} recursively for raw AMBER topology/trajectory inputs.[/dim]")
+    scope = "recursively" if search_subdirectories_enabled() else "without entering subdirectories"
+    console.print(f"[dim]Scanned {search_root.resolve()} {scope} for raw AMBER topology/trajectory inputs.[/dim]")
 
 
 def _prompt_raw_ti_input_selection(
@@ -2046,6 +2146,8 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
         ti_implementation_mode = _prompt_ti_implementation_mode()
         ti_decoupling_mode = _prompt_ti_decoupling_mode(ti_implementation_mode)
     snapshot_mode = _prompt_snapshot_mode(selected_stable=selected_assessment.stable)
+    ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
+    ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
     if in_place_ti:
         formal_charge = _infer_charge_from_selected_site(selected) or default_formal_charge(selected.element)
         water_reference_enabled = typer.confirm(
@@ -2067,6 +2169,7 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
                 custom_ion_frcmods=custom_ion_frcmods,
                 implementation_mode=ti_implementation_mode,
                 decoupling_mode=ti_decoupling_mode,
+                sampling_mode=ti_sampling_mode,
             )
         else:
             water_model = "opc"
@@ -2090,6 +2193,7 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
             custom_ion_frcmods=custom_ion_frcmods,
             implementation_mode=ti_implementation_mode,
             decoupling_mode=ti_decoupling_mode,
+            sampling_mode=ti_sampling_mode,
         )
 
     _print_step_header(
@@ -2127,6 +2231,8 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
         ti=TIProtocolConfig(
             implementation_mode=ti_implementation_mode,
             decoupling_mode=ti_decoupling_mode,
+            sampling_mode=ti_sampling_mode,
+            charge_compensation_mode=ti_charge_compensation_mode,
         ),
         water_reference=WaterReferenceConfig(
             enabled=water_reference_enabled,

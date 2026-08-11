@@ -73,15 +73,21 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.interactive:
             from amber_metallo.cli import build_wizard_configs, execute_wizard_configs
-
-            wizard_result = build_wizard_configs(args.write_config)
-            return execute_wizard_configs(
-                wizard_result.configs,
-                from_stage=args.from_stage,
-                to_stage=args.to_stage,
-                dry_run=args.dry_run,
-                failure_hint=SUPPORT_HINT,
+            from amber_metallo.subdirectory_search import (
+                prompt_for_subdirectory_search,
+                subdirectory_search_scope,
             )
+
+            search_subdirectories = prompt_for_subdirectory_search(Path.cwd())
+            with subdirectory_search_scope(search_subdirectories):
+                wizard_result = build_wizard_configs(args.write_config)
+                return execute_wizard_configs(
+                    wizard_result.configs,
+                    from_stage=args.from_stage,
+                    to_stage=args.to_stage,
+                    dry_run=args.dry_run,
+                    failure_hint=SUPPORT_HINT,
+                )
         else:
             config = load_config(args.config)
     except ModuleNotFoundError as exc:

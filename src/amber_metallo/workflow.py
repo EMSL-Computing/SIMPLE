@@ -30,7 +30,11 @@ from amber_metallo.config import (
 from amber_metallo.des import build_des_system
 from amber_metallo.environment import detect_amber_environment
 from amber_metallo.inspection import load_structure
-from amber_metallo.ligand_param import parameterize_ligand, validate_manual_ligand_bundle
+from amber_metallo.ligand_param import (
+    LigandArtifacts,
+    parameterize_ligand,
+    validate_manual_ligand_bundle,
+)
 from amber_metallo.md_protocols import generate_md_inputs
 from amber_metallo.prep import prepare_structure
 from amber_metallo.protein_site_resp import (
@@ -584,6 +588,56 @@ def _load_json_dict(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _load_existing_ligand_artifacts(prepare_dir: Path) -> list[LigandArtifacts]:
+    """Restore the ligand templates used by a paused site-RESP workflow."""
+
+    ligand_root = prepare_dir / "ligand_params"
+    if not ligand_root.exists():
+        return []
+    artifacts: list[LigandArtifacts] = []
+    for manifest_path in sorted(ligand_root.rglob("ligand_manifest.json")):
+        payload = _load_json_dict(manifest_path)
+        if payload is None:
+            continue
+        raw_files = payload.get("files") or {}
+        if not isinstance(raw_files, dict):
+            continue
+        files: dict[str, str] = {}
+        for label, raw_path in raw_files.items():
+            candidate = Path(str(raw_path)).expanduser()
+            if not candidate.exists():
+                local_candidate = manifest_path.parent / candidate.name
+                if local_candidate.exists():
+                    candidate = local_candidate
+            files[str(label)] = str(candidate.resolve())
+        raw_commands = payload.get("commands") or []
+        commands = [
+            [str(token) for token in command]
+            for command in raw_commands
+            if isinstance(command, list)
+        ]
+        artifacts.append(
+            LigandArtifacts(
+                mode=str(payload.get("mode") or "existing"),
+                residue_name=str(payload.get("residue_name") or "CUSTOM"),
+                source_file=(
+                    None
+                    if payload.get("source_file") is None
+                    else str(payload.get("source_file"))
+                ),
+                coordinate_source=(
+                    None
+                    if payload.get("coordinate_source") is None
+                    else str(payload.get("coordinate_source"))
+                ),
+                files=files,
+                commands=commands,
+                notes=[str(note) for note in payload.get("notes") or []],
+            )
+        )
+    return artifacts
+
+
 def _resume_existing_protein_site_resp_workflow(
     *,
     config: WorkflowConfig,
@@ -596,22 +650,30 @@ def _resume_existing_protein_site_resp_workflow(
     job_dirs = [Path(item).expanduser().resolve() for item in config.protein_site_resp.job_dirs]
     if not job_dirs:
         raise ValueError("Protein-site RESP continuation requires at least one selected RESP job directory.")
+    system_dir = stages["system"]
     system_prmtop = stages["system"] / "system.prmtop"
     system_inpcrd = stages["system"] / "system.inpcrd"
-    if not system_prmtop.exists() or not system_inpcrd.exists():
+    reference_paths = (
+        system_dir / "site_resp_reference_manifest.json",
+        system_dir / "system.unsolvated.pdb",
+        system_dir / "system.unsolvated.prmtop",
+        system_dir / "system.unsolvated.inpcrd",
+    )
+    final_system_available = system_prmtop.exists() and system_inpcrd.exists()
+    if not final_system_available and not all(path.exists() for path in reference_paths):
         raise FileNotFoundError(
-            "The selected RESP workflow no longer has 02_system/system.prmtop and system.inpcrd; "
-            "SIMPLE cannot safely continue it in place."
+            "The selected RESP workflow has neither a final 02_system/system.prmtop + system.inpcrd "
+            "nor the complete site-RESP reference set (site_resp_reference_manifest.json and "
+            "system.unsolvated.pdb/.prmtop/.inpcrd); SIMPLE cannot safely continue it."
         )
 
     jobs = [{"job_dir": str(job_dir)} for job_dir in job_dirs]
     prepared = _load_prepare_manifest(stages["prepare"])
-    system_payload = _load_json_dict(stages["system"] / "system_manifest.json") or {
-        "output_files": {
-            "prmtop": str(system_prmtop),
-            "inpcrd": str(system_inpcrd),
-        }
-    }
+    system_payload = (
+        _load_json_dict(system_dir / "system_manifest.json")
+        or _load_json_dict(system_dir / "site_resp_reference_manifest.json")
+        or {}
+    )
     protein_site_resp_result: dict[str, object]
     md_stages = []
     slurm_path: Path | None = None
@@ -633,6 +695,51 @@ def _resume_existing_protein_site_resp_workflow(
                 "message": "The matching charges were reviewed but not approved; the topology was not changed.",
             }
         else:
+            if not final_system_available:
+                if prepared is None:
+                    raise FileNotFoundError(
+                        "Protein-site RESP continuation requires 01_prepare/prepare_manifest.json "
+                        "to build the deferred final solvated system."
+                    )
+                prepared_pdb_value = prepared.get("cleaned_pdb")
+                prepared_pdb = (
+                    Path(str(prepared_pdb_value)).expanduser().resolve()
+                    if prepared_pdb_value
+                    else stages["prepare"] / "cleaned_input.pdb"
+                )
+                if not prepared_pdb.exists():
+                    raise FileNotFoundError(
+                        "Protein-site RESP continuation could not find the prepared protein PDB needed "
+                        f"to build the final solvated system: {prepared_pdb}"
+                    )
+                source_files = [
+                    Path(str(item["path"])).expanduser().resolve()
+                    for item in prepared.get("ligand_inputs") or []
+                    if isinstance(item, dict) and item.get("path")
+                ]
+                ligand_artifacts = _load_existing_ligand_artifacts(stages["prepare"])
+                if source_files and not ligand_artifacts:
+                    raise FileNotFoundError(
+                        "The paused protein-site RESP workflow contains retained non-standard residues, "
+                        "but their 01_prepare/ligand_params/ligand_manifest.json files are unavailable."
+                    )
+                final_system_config = _system_config_with_inserted_metal_charges(config.system, prepared)
+                final_system_result = build_system_with_tleap(
+                    system_config=final_system_config,
+                    amber_env=amber_env,
+                    prepared_pdb=prepared_pdb,
+                    ligand_artifacts=ligand_artifacts,
+                    source_files=source_files,
+                    output_dir=system_dir,
+                    dry_run=dry_run,
+                )
+                system_payload = final_system_result.to_dict()
+                final_system_available = system_prmtop.exists() and system_inpcrd.exists()
+                if not final_system_available:
+                    raise FileNotFoundError(
+                        "The deferred final system build did not create 02_system/system.prmtop and "
+                        "system.inpcrd, so RESP charges cannot yet be applied."
+                    )
             parmed_status = amber_env.binaries.get("parmed")
             protein_site_resp_result = apply_site_resp_results(
                 job_dirs=job_dirs,

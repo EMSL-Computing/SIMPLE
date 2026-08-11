@@ -175,7 +175,7 @@ After loading the input, `FreeE.py` detects metal sites, proposes the selected m
 
 Thermodynamic integration, or TI, computes a free-energy difference by gradually changing the Hamiltonian of the system along an alchemical coordinate called `lambda`. At each lambda window, Amber samples the ensemble average of `dV/dlambda`. The final free energy is obtained by numerical integration of those `dV/dlambda` values across the lambda schedule.
 
-For metal binding workflows, SIMPLE treats the selected metal site as the alchemical group. The default protocol separates the transformation into two physical legs:
+For metal binding workflows, SIMPLE treats the selected metal site as the alchemical group. The currently supported Amber 12-6-4 GTI/CUDA default changes charge and van der Waals interactions together along one softcore path. The split protocol is retained for the Amber 12-6 workaround and for future GTI support; it separates the transformation into two physical legs:
 
 1. **Charge-off leg**: the metal charge is gradually removed. This avoids turning off electrostatics and van der Waals interactions at the same time, which can make endpoint sampling unstable.
 2. **VDW-off leg**: after the decharged endpoint is relaxed, the nonbonded van der Waals interaction is removed with softcore TI settings.
@@ -191,8 +191,11 @@ Important TI options in the FreeE TOML are:
 - `metal.selected_site`, `metal.selected_sites`, `metal.formal_charge`, and `metal.formal_charges_by_site` control which detected metal sites are alchemically transformed and what formal charge is used.
 - `ti.implementation_mode = "amber_12_6_workaround"` rebuilds TI-specific metal/ion nonbonded terms to the official Amber 12-6 set before charge-off and VDW-off TI.
 - `ti.implementation_mode = "amber_12_6_4_gti"` keeps 12-6-4 C4 terms and generates CUDA/GTI-style Amber inputs. This path requires a GPU-capable Amber build.
-- `ti.decoupling_mode = "split_q_vdw"` is the recommended path: charge-off first, endpoint relaxation, then VDW-off.
-- `ti.decoupling_mode = "combined_q_vdw"` is an advanced GTI/CUDA path that couples charge and VDW changes in a single softcore route.
+- `ti.decoupling_mode = "combined_q_vdw"` is the current Amber 12-6-4 GTI/CUDA default and couples charge and VDW changes in a single softcore route.
+- `ti.decoupling_mode = "split_q_vdw"` runs charge-off, endpoint relaxation, and VDW-off directories separately. The GTI variant is temporarily unavailable while its split-path implementation is being completed.
+- `ti.sampling_mode = "single_pass"` is the default and recommended baseline. It runs one conventional forward lambda sweep.
+- `ti.sampling_mode = "bidirectional"` is an optional convergence diagnostic. It equilibrates each window, runs one forward decoupling sweep, verifies its endpoint restart, and then runs one reverse recoupling sweep. Averaging the directions is useful only when their hysteresis is acceptably small; a large difference instead indicates insufficient equilibration, slow relaxation, or path dependence. It does not create automatic replicas, so rerun the workflow when independent repeats are needed.
+- `ti.window_equilibration_ns` controls the excluded equilibration before each production window in bidirectional mode.
 - `ti.production_time_ns` controls production length per lambda window.
 - `ti.charge_lambdas` and `ti.vdw_lambdas` define the lambda schedules. They must be sorted, unique, and run from `0.0` to `1.0`.
 - `ti.qoff_dt_ps` and `ti.vdwoff_dt_ps` control the timestep for charge-off and VDW-off windows.
@@ -204,6 +207,8 @@ Important TI options in the FreeE TOML are:
 - `water_reference.water_model`, `water_reference.box_shape`, `water_reference.buffer_angstrom`, and `water_reference.custom_ion_frcmods` control the reference-solvent system.
 - `water_reference.reuse_existing`, `water_reference.reuse_from_library`, and `water_reference.library_key` allow reuse of an existing compatible water-reference setup.
 - `slurm.profile`, `slurm.ntasks`, `slurm.gpus`, `slurm.walltime`, `slurm.partition`, and `slurm.account` control the generated execution scripts.
+
+Combined mode uses a flat layout: inputs are written under `bound/inputs`, a single-pass run writes directly under `output`, and bidirectional results are separated into `output/forward` and `output/reverse`. The `qoff` and `vdwoff` directories are reserved for split mode.
 
 A minimal TI TOML section looks like:
 
@@ -220,8 +225,9 @@ selected_site = 1
 formal_charge = 3
 
 [ti]
-implementation_mode = "amber_12_6_workaround"
-decoupling_mode = "split_q_vdw"
+implementation_mode = "amber_12_6_4_gti"
+decoupling_mode = "combined_q_vdw"
+sampling_mode = "single_pass"
 production_time_ns = 1.0
 charge_lambdas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 1.0]
 vdw_lambdas = [0.0, 0.025, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.975, 1.0]
@@ -325,10 +331,16 @@ python analyses.py
 The general launcher asks for the analysis family:
 
 1. **ABFE calculation**: analyze one or more completed TI cases and report standalone `dG` values. In the current SIMPLE interface, ABFE means single-case `dG` postprocessing of a completed TI case.
-2. **RBFE calculation**: choose one or more completed bound TI cases. For each bound case, SIMPLE separately asks for its water-reference TI case and defaults to a reference with the same REE identity (and matching oxidation state when that metadata is available). SIMPLE computes `ddG = (dG_bound_ti + restraint_correction) - dG_water` for every pair.
+2. **RBFE calculation**: choose one or more completed bound TI cases. SIMPLE collects every bound/water pairing first and starts the calculations only after all selections are confirmed, so multi-case selection is not interrupted by analysis waits. The default water reference favors matching metal identity, oxidation state, charge-compensation mode, and TI decoupling scheme. Incompatible charge-compensation or decoupling schemes are rejected before calculation. SIMPLE computes `ddG = (dG_bound_ti + restraint_correction) - dG_water` for every pair.
 3. **Additional trajectory analysis**: switch to the trajectory analysis wizard for structural observables.
 
 For TI postprocessing, SIMPLE currently uses the trapezoidal TI estimator from existing Amber `DV/DL` output. BAR and MBAR are listed as future analysis options, but the current TI runs do not yet generate the additional overlap information needed for those estimators.
+
+When a selected case contains completed forward and reverse sweeps, the launcher asks whether to use **Forward only** or **Forward + Reverse**. Forward only is the default and is written under `analysis/abfe` or `analysis/rbfe`. Forward + Reverse is an optional convergence diagnostic written separately under `analysis/abfe_forward_reverse` or `analysis/rbfe_forward_reverse`; use its averaged estimate only when the reported hysteresis is acceptably small. Its hierarchical bootstrap resamples both time blocks and complete sweeps, so the confidence interval includes direction disagreement instead of hiding it.
+
+Water-library values are stored separately by analysis sampling source (`forward_only` versus `forward_reverse`). Legacy library entries created before this metadata existed remain selectable for Forward-only RBFE and are marked as legacy/unspecified. New direction-specific contributors are never pooled into the same aggregate.
+
+Bidirectional combined TI has one deliberately narrow recovery rule for a recurrent GTI endpoint failure. If every production window is available except the reverse `lambda=0` window, and the completed forward `lambda=0` output contains a final Amber average, `analyses.py` substitutes that forward endpoint DV/DL for the reverse endpoint because both correspond to the same Hamiltonian. A missing or truncated reverse endpoint is accepted; a missing interior window is not. The result is marked `APPROXIMATE`, the forward and patched-reverse integrals and their hysteresis are reported separately, and the expected and substituted mdout paths are recorded in JSON and CSV outputs. This recovery is preferable to deleting the `0 -> next-lambda` integration interval, but it is not an independent reverse endpoint sample.
 
 For MM-PBSA/GBSA, the primary postprocessing is produced by `FreeE.py` itself through `summary.txt`, `summary.json`, `summary_decomp.txt`, and `summary_decomp.json`. Use the `--refresh-summaries` commands above when Amber `MMPBSA.py` has completed but the SIMPLE summaries need to be regenerated.
 

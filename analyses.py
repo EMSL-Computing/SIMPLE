@@ -54,10 +54,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
-        if args.trajectory:
-            result = run_trajectory_analysis_wizard()
-        else:
-            result = run_analysis_wizard()
+        from amber_metallo.subdirectory_search import (
+            prompt_for_subdirectory_search,
+            subdirectory_search_scope,
+        )
+
+        search_subdirectories = prompt_for_subdirectory_search(Path.cwd())
+        with subdirectory_search_scope(search_subdirectories):
+            if args.trajectory:
+                result = run_trajectory_analysis_wizard()
+            else:
+                result = run_analysis_wizard()
     except Exception:
         print(SUPPORT_HINT, file=sys.stderr)
         raise

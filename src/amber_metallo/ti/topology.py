@@ -68,6 +68,31 @@ class PrmtopAtom:
     atom_type_index: int
 
 
+@dataclass(slots=True)
+class ChargedPrmtopAtom:
+    atom_index: int
+    atom_name: str
+    residue_index: int
+    residue_label: str
+    residue_atom_count: int
+    charge: float
+
+
+@dataclass(slots=True)
+class PrmtopChargeState:
+    net_charge: float
+    atoms: list[ChargedPrmtopAtom]
+
+    def monovalent_atoms(self, *, sign: int) -> list[ChargedPrmtopAtom]:
+        return [
+            atom
+            for atom in self.atoms
+            if atom.residue_atom_count == 1
+            and atom.charge * sign > 0.0
+            and abs(abs(atom.charge) - 1.0) <= 0.15
+        ]
+
+
 def is_ti_compatible_custom_126_frcmod(path: str | Path) -> bool:
     return bool(_TI_COMPATIBLE_126_FRCMOD_PATTERN.match(Path(path).name))
 
@@ -309,6 +334,117 @@ def _prmtop_atoms(sections: dict[str, PrmtopSection]) -> list[PrmtopAtom]:
         )
         for index in range(1, natom + 1)
     ]
+
+
+def inspect_prmtop_charge_state(path: str | Path) -> PrmtopChargeState:
+    _, sections = _parse_prmtop_document(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    required = {"ATOM_NAME", "CHARGE", "RESIDUE_LABEL", "RESIDUE_POINTER"}
+    missing = sorted(required - set(sections))
+    if missing:
+        raise ValueError("The prmtop is missing charge-inspection sections: " + ", ".join(missing))
+    atom_names = _section_values(sections["ATOM_NAME"])
+    charges = [value / 18.2223 for value in _tokens_to_floats(sections["CHARGE"])]
+    residue_labels = _section_values(sections["RESIDUE_LABEL"])
+    residue_pointers = _tokens_to_ints(sections["RESIDUE_POINTER"])
+    atoms: list[ChargedPrmtopAtom] = []
+    natom = len(atom_names)
+    for residue_index, (label, start) in enumerate(zip(residue_labels, residue_pointers), start=1):
+        end = residue_pointers[residue_index] - 1 if residue_index < len(residue_pointers) else natom
+        count = end - start + 1
+        for atom_index in range(start, end + 1):
+            atoms.append(
+                ChargedPrmtopAtom(
+                    atom_index=atom_index,
+                    atom_name=atom_names[atom_index - 1].strip(),
+                    residue_index=residue_index,
+                    residue_label=label.strip(),
+                    residue_atom_count=count,
+                    charge=charges[atom_index - 1],
+                )
+            )
+    return PrmtopChargeState(net_charge=math.fsum(charges), atoms=atoms)
+
+
+def restore_solute_charges_and_c4(
+    *,
+    source_prmtop: str | Path,
+    rebuilt_prmtop: str | Path,
+    output_prmtop: str | Path,
+) -> dict[str, object]:
+    source_version, source_sections = _parse_prmtop_document(
+        Path(source_prmtop).read_text(encoding="utf-8", errors="ignore")
+    )
+    rebuilt_version, rebuilt_sections = _parse_prmtop_document(
+        Path(rebuilt_prmtop).read_text(encoding="utf-8", errors="ignore")
+    )
+    source_atoms = _prmtop_atoms(source_sections)
+    rebuilt_atoms = _prmtop_atoms(rebuilt_sections)
+    solvent_labels = {"WAT", "HOH", "OPC", "SPC", "TIP3", "TIP4", "TIP5"}
+    prefix_count = next(
+        (atom.atom_index - 1 for atom in source_atoms if atom.residue_label.upper() in solvent_labels),
+        len(source_atoms),
+    )
+    if len(rebuilt_atoms) < prefix_count:
+        raise ValueError("The counterion rebuild removed atoms from the non-solvent prefix.")
+    for source_atom, rebuilt_atom in zip(source_atoms[:prefix_count], rebuilt_atoms[:prefix_count], strict=True):
+        if (source_atom.atom_name, source_atom.residue_label) != (rebuilt_atom.atom_name, rebuilt_atom.residue_label):
+            raise ValueError(
+                "The counterion rebuild changed solute atom ordering before atom "
+                f"{source_atom.atom_index}: {source_atom.residue_label}/{source_atom.atom_name} -> "
+                f"{rebuilt_atom.residue_label}/{rebuilt_atom.atom_name}."
+            )
+    source_charges = _tokens_to_floats(source_sections["CHARGE"])
+    rebuilt_charges = _tokens_to_floats(rebuilt_sections["CHARGE"])
+    rebuilt_charges[:prefix_count] = source_charges[:prefix_count]
+    rebuilt_sections["CHARGE"].data_lines = _render_section_values(
+        rebuilt_sections["CHARGE"].format_line, rebuilt_charges
+    )
+
+    c4_transferred = False
+    if "LENNARD_JONES_CCOEF" in source_sections:
+        source_types = {atom.amber_atom_type: atom.atom_type_index for atom in source_atoms}
+        rebuilt_types = {atom.amber_atom_type: atom.atom_type_index for atom in rebuilt_atoms}
+        source_ntypes = max(source_types.values(), default=0)
+        rebuilt_ntypes = max(rebuilt_types.values(), default=0)
+        source_nb = _tokens_to_ints(source_sections["NONBONDED_PARM_INDEX"])
+        rebuilt_nb = _tokens_to_ints(rebuilt_sections["NONBONDED_PARM_INDEX"])
+        source_c4 = _tokens_to_floats(source_sections["LENNARD_JONES_CCOEF"])
+        rebuilt_size = max(rebuilt_nb, default=0)
+        if "LENNARD_JONES_CCOEF" in rebuilt_sections:
+            rebuilt_c4 = _tokens_to_floats(rebuilt_sections["LENNARD_JONES_CCOEF"])
+            if len(rebuilt_c4) < rebuilt_size:
+                rebuilt_c4.extend([0.0] * (rebuilt_size - len(rebuilt_c4)))
+            else:
+                rebuilt_c4 = rebuilt_c4[:rebuilt_size]
+        else:
+            rebuilt_c4 = [0.0] * rebuilt_size
+        for left_label, left_new in rebuilt_types.items():
+            left_old = source_types.get(left_label)
+            if left_old is None:
+                continue
+            for right_label, right_new in rebuilt_types.items():
+                right_old = source_types.get(right_label)
+                if right_old is None:
+                    continue
+                old_lookup = source_nb[(left_old - 1) * source_ntypes + (right_old - 1)]
+                new_lookup = rebuilt_nb[(left_new - 1) * rebuilt_ntypes + (right_new - 1)]
+                if old_lookup > 0 and new_lookup > 0 and old_lookup <= len(source_c4):
+                    rebuilt_c4[new_lookup - 1] = source_c4[old_lookup - 1]
+        rebuilt_sections["LENNARD_JONES_CCOEF"] = PrmtopSection(
+            format_line=source_sections["LENNARD_JONES_CCOEF"].format_line,
+            data_lines=_render_section_values(source_sections["LENNARD_JONES_CCOEF"].format_line, rebuilt_c4),
+        )
+        c4_transferred = True
+
+    target = Path(output_prmtop)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_render_prmtop(rebuilt_version or source_version, rebuilt_sections), encoding="utf-8")
+    return {
+        "output_prmtop": str(target),
+        "restored_charge_atom_count": prefix_count,
+        "c4_transferred": c4_transferred,
+        "net_charge": inspect_prmtop_charge_state(target).net_charge,
+    }
 
 
 def _pair_coefficients(nonbonded_index: list[int], coefficients: list[float], *, ntypes: int) -> dict[tuple[int, int], float]:

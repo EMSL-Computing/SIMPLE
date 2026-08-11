@@ -113,10 +113,12 @@ from amber_metallo.protonation import (
 from amber_metallo.protein_site_resp import (
     ProteinSiteRespResumeCandidate,
     find_protein_site_resp_resume_candidates,
+    load_topology_atoms,
     suggested_low_spin_multiplicity,
     suggested_spin_multiplicity,
 )
 from amber_metallo.reporting import console, emit_key_value_table, print_workflow_summary
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.qm.editor import launch_resp_editor
 from amber_metallo.qm.nwchem import (
     build_default_session_state,
@@ -503,7 +505,20 @@ def _prompt_ph_values() -> list[float]:
 def _workspace_detectable_resp_candidates() -> list[object]:
     candidates: list[object] = []
     seen: set[Path] = set()
-    for manifest_path in Path.cwd().resolve().rglob("resp_apply_manifest.json"):
+    workspace = Path.cwd().resolve()
+    manifest_paths = (
+        workspace.rglob("resp_apply_manifest.json")
+        if search_subdirectories_enabled()
+        else (
+            path
+            for path in (
+                workspace / "resp_apply_manifest.json",
+                workspace / "manifests" / "resp_apply_manifest.json",
+            )
+            if path.is_file()
+        )
+    )
+    for manifest_path in manifest_paths:
         candidate = load_resp_job_candidate(manifest_path.parent.parent)
         if candidate is None or not getattr(candidate, "ready_to_continue", False):
             continue
@@ -523,7 +538,10 @@ def _workspace_detectable_resp_candidates() -> list[object]:
 
 
 def _workspace_detectable_protein_site_resp_candidates() -> list[ProteinSiteRespResumeCandidate]:
-    return find_protein_site_resp_resume_candidates(Path.cwd())
+    return find_protein_site_resp_resume_candidates(
+        Path.cwd(),
+        recursive=search_subdirectories_enabled(),
+    )
 
 
 def _display_protein_site_resp_resume_candidates(
@@ -1911,8 +1929,8 @@ def _display_metal_charge_summary(remaining_sites: list[tuple[object, str]]) -> 
 
 def _charge_choice_description(charge: int) -> str:
     if charge == 1:
-        return "Amber 12-6-4 monovalent set."
-    return "Amber 12-6-4 multivalent set."
+        return "Monovalent formal oxidation state; final ion-model compatibility is checked later."
+    return "Multivalent formal oxidation state; final ion-model compatibility is checked later."
 
 
 def _prompt_metal_charge_assignments(summary, prepare_config: PrepareConfig) -> list[MetalChargeAssignment]:
@@ -2184,7 +2202,10 @@ def _prompt_add_des_component_library() -> None:
             box=box.ROUNDED,
         )
     )
-    candidates = discover_des_library_candidates(Path.cwd())
+    candidates = discover_des_library_candidates(
+        Path.cwd(),
+        recursive=search_subdirectories_enabled(),
+    )
     if candidates:
         _display_des_library_candidates(candidates)
         while True:
@@ -4071,6 +4092,68 @@ def _batch_output_directory(
     return _next_available_directory(root_candidate / ph_token, reserved=reserved)
 
 
+def _protein_config_build_specs(
+    *,
+    input_config: InputConfig,
+    resp_job_dir: str | Path | None,
+    metal_action_plan: _MetalActionPlan,
+    prepare_configs: list[PrepareConfig],
+    metal_charge_assignments: list[list[MetalChargeAssignment]],
+    protonation_variants: list[_ProtonationVariant],
+) -> list[
+    tuple[
+        PrepareConfig,
+        list[MetalChargeAssignment],
+        _ProtonationVariant,
+        Path,
+        tuple[str, ...],
+    ]
+]:
+    """Allocate output folders before either RESP setup or final MD prompts."""
+
+    ph_batch_active = len(protonation_variants) > 1
+    reserved_output_paths: set[Path] = set()
+    specs: list[
+        tuple[
+            PrepareConfig,
+            list[MetalChargeAssignment],
+            _ProtonationVariant,
+            Path,
+            tuple[str, ...],
+        ]
+    ] = []
+    for variant, prepare_config, assignments in zip(
+        metal_action_plan.variants,
+        prepare_configs,
+        metal_charge_assignments,
+        strict=True,
+    ):
+        for protonation_variant in protonation_variants:
+            output_dir_path = _batch_output_directory(
+                input_config,
+                resp_job_dir=resp_job_dir,
+                root_suffix_tokens=variant.suffix_tokens,
+                ph_token=protonation_variant.ph_token if ph_batch_active else None,
+                reserved=reserved_output_paths,
+            )
+            reserved_output_paths.add(output_dir_path)
+            combined_suffix_tokens = variant.suffix_tokens + (
+                (protonation_variant.ph_token,)
+                if ph_batch_active and protonation_variant.ph_token
+                else ()
+            )
+            specs.append(
+                (
+                    prepare_config,
+                    assignments,
+                    protonation_variant,
+                    output_dir_path,
+                    combined_suffix_tokens,
+                )
+            )
+    return specs
+
+
 def _suffixed_write_config_path(path: str | Path, suffix_tokens: tuple[str, ...]) -> Path:
     target = Path(path)
     suffix_label = _variant_suffix_label(suffix_tokens)
@@ -4627,14 +4710,11 @@ def execute_wizard_configs(
     failure_hint: str | None = None,
 ) -> int:
     failures: list[tuple[WorkflowConfig, Exception]] = []
-    succeeded_names: set[str] = set()
-    pending_names: set[str] = set()
-    attempted_names: set[str] = set()
     total = len(configs)
+    outcomes: list[tuple[str, object | None]] = [("not_started", None) for _ in configs]
 
     for index, config in enumerate(configs, start=1):
         output_name = _workflow_output_label(config.output_dir)
-        attempted_names.add(output_name)
         if total > 1:
             console.print(
                 Panel(
@@ -4652,6 +4732,7 @@ def execute_wizard_configs(
             )
         except Exception as exc:
             failures.append((config, exc))
+            outcomes[index - 1] = ("failed", exc)
             failure_message = Text()
             failure_message.append(f"Workflow failed for {output_name}:", style="bold red")
             failure_message.append(f" {exc}")
@@ -4662,34 +4743,192 @@ def execute_wizard_configs(
                 continue
             break
         site_resp_status = str(((result.get("protein_site_resp") or {}).get("status") or ""))
-        if site_resp_status in {"reference_pending", "cluster_review_required", "setup_pending", "review_required"}:
-            pending_names.add(output_name)
+        if site_resp_status in {"reference_pending", "cluster_review_required", "setup_pending"}:
+            outcomes[index - 1] = ("resp_pending", site_resp_status)
+        elif site_resp_status == "review_required":
+            outcomes[index - 1] = ("resp_not_applied", site_resp_status)
         else:
-            succeeded_names.add(output_name)
+            outcomes[index - 1] = ("succeeded", site_resp_status)
         print_workflow_summary(result)
 
     if total > 1 or failures:
         table = Table(title="Batch workflow summary", box=box.SIMPLE_HEAVY)
         table.add_column("Output", style="bold white")
         table.add_column("Status", style="cyan")
-        failed_names = {_workflow_output_label(config.output_dir): exc for config, exc in failures}
-        for config in configs:
+        for config, (outcome, detail) in zip(configs, outcomes, strict=True):
             name = _workflow_output_label(config.output_dir)
-            if name in failed_names:
+            if outcome == "failed":
                 status = Text("Failed", style="bold red")
-                status.append(f" ({failed_names[name]})")
-            elif name in pending_names:
+                status.append(f" ({detail})")
+            elif outcome == "resp_pending":
                 status = Text("RESP pending", style="bold yellow")
-            elif name in succeeded_names:
+            elif outcome == "resp_not_applied":
+                status = Text("RESP not applied", style="bold yellow")
+            elif outcome == "succeeded":
                 status = Text("Succeeded", style="bold green")
-            elif name in attempted_names:
-                status = Text("Stopped", style="bold yellow")
             else:
                 status = Text("Not started", style="dim")
             table.add_row(Text(name), status)
         console.print(table)
 
     return 0 if not failures else 1
+
+
+def _prompt_new_protein_site_resp_config(
+    *,
+    remaining_metal_site_count: int,
+    batch_charge_map: dict[tuple[int, str], int],
+) -> ProteinSiteRespConfig | None:
+    if remaining_metal_site_count <= 0:
+        return None
+    _print_step_header(
+        4,
+        "Choose Metal-Site Protein Charges",
+        "Keep standard force-field charges or stop after preparing an expert protein-site RESP/NWChem job.",
+    )
+    console.print(
+        Panel(
+            "[bold]Standard FF[/bold] remains the validated default.\n"
+            "[bold yellow]Site-specific RESP[/bold yellow] redistributes partial charges on selected coordinating "
+            "protein residues while fixing the metal at its integer oxidation state and preserving every target "
+            "residue's total charge. Solvation, 12-6-4 selection, MD duration, and CPU/GPU settings are deliberately "
+            "deferred until the NWChem result is available.",
+            title="[bold]Protein Metal-Site Charge Model[/bold]",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+    )
+    if not _prompt_yes_no(
+        "Prepare site-specific RESP charges for the directly coordinating residues?",
+        default=False,
+    ):
+        return None
+
+    scope_choices = [
+        WizardChoice(
+            ProteinSiteRespScope.SIDECHAIN.value,
+            "Side chain (recommended)",
+            "Fit CB-and-beyond atoms while fixing backbone, caps, metal, water, and other QM environment charges.",
+        ),
+        WizardChoice(
+            ProteinSiteRespScope.WHOLE_RESIDUE.value,
+            "Whole residue",
+            "Fit all atoms of each coordinating residue while preserving each residue's total charge.",
+        ),
+    ]
+    _display_choice_table("Protein-site RESP scope", scope_choices)
+    scope = ProteinSiteRespScope(
+        _prompt_choice(
+            "Choose the protein-site RESP scope",
+            scope_choices,
+            default_key=ProteinSiteRespScope.SIDECHAIN.value,
+        )
+    )
+    suggestion_rows: list[str] = []
+    for (_site, element), charge in sorted(batch_charge_map.items()):
+        suggestion = suggested_spin_multiplicity(element, charge)
+        low_spin = suggested_low_spin_multiplicity(element, charge)
+        suggestion_rows.append(
+            f"{element}{charge:+d}: default/high-spin "
+            f"{suggestion if suggestion is not None else 'no curated suggestion'}; low-spin "
+            f"{low_spin if low_spin is not None else 'no conventional alternative'}"
+        )
+    console.print(
+        "[bold cyan]Spin guidance:[/bold cyan] "
+        + (", ".join(suggestion_rows) if suggestion_rows else "No curated suggestion is available.")
+        + "\n[dim]SIMPLE will now build only the unsolvated reference topology. It will then show each connected "
+        "metal cluster and ask you to review the donor/fixed-environment residues and confirm the multiplicity "
+        "before writing the NWChem and Tahoma files.[/dim]"
+    )
+    return ProteinSiteRespConfig(
+        mode=ProteinSiteRespMode.RESP,
+        scope=scope,
+        apply_mode=RespApplyMode.NEW_DIRECTORY,
+    )
+
+
+def _build_protein_site_resp_setup_result(
+    *,
+    input_config: InputConfig,
+    protein_ff: str,
+    system_ligand_ff: str,
+    ligands_config: LigandsConfig,
+    resp_config: ProteinSiteRespConfig,
+    config_build_specs: list[
+        tuple[
+            PrepareConfig,
+            list[MetalChargeAssignment],
+            _ProtonationVariant,
+            Path,
+            tuple[str, ...],
+        ]
+    ],
+    write_config: str | None,
+) -> WizardBuildResult:
+    configs: list[WorkflowConfig] = []
+    suffixes: list[tuple[str, ...]] = []
+    base_job_name = _base_output_name(input_config)
+    for prepare_config, assignments, protonation_variant, output_dir_path, suffix_tokens in config_build_specs:
+        job_name_tokens = suffix_tokens
+        if (
+            protonation_variant.protonation_config.enabled
+            and protonation_variant.ph_token
+            and protonation_variant.ph_token not in job_name_tokens
+        ):
+            job_name_tokens = suffix_tokens + (protonation_variant.ph_token,)
+        configs.append(
+            WorkflowConfig(
+                input=input_config,
+                prepare=prepare_config,
+                protonation=protonation_variant.protonation_config.model_copy(deep=True),
+                protein_site_resp=resp_config.model_copy(deep=True),
+                ligands=ligands_config.model_copy(deep=True),
+                # This is a reference-only configuration.  SPC/E ordinary 12-6
+                # files provide a neutral setup basis; the user chooses the
+                # final 12-6-4/water pair only after RESP completes.
+                system=SystemConfig(
+                    protein_ff=protein_ff,
+                    ligand_ff=system_ligand_ff,
+                    metal_model=MetalModel.MODEL_1264,
+                    apply_1264=False,
+                    c4_parameter_set=DESC4ParameterSet.SPCE_LIMERZ,
+                    metal_charges=assignments,
+                    water_model="spce",
+                    salt=SaltConfig(),
+                ),
+                md=MDConfig(),
+                slurm=SlurmConfig(
+                    profile=SlurmProfile.CPU,
+                    partition=None,
+                    account=None,
+                    ntasks=8,
+                    gpus=0,
+                    walltime="24:00:00",
+                    binary_override=None,
+                    job_name=_workflow_job_name(base_job_name, job_name_tokens),
+                ),
+                output_dir=str(output_dir_path),
+            )
+        )
+        suffixes.append(suffix_tokens)
+
+    if len(configs) == 1:
+        console.print(f"[bold cyan]Protein-site RESP case:[/bold cyan] {configs[0].output_dir}")
+    else:
+        table = Table(title="Protein-site RESP setup cases", box=box.SIMPLE_HEAVY)
+        table.add_column("No.", style="bold cyan", justify="right", no_wrap=True)
+        table.add_column("Case directory", style="bold white")
+        for index, config in enumerate(configs, start=1):
+            table.add_row(str(index), config.output_dir)
+        console.print(table)
+    console.print(
+        "[blink bold cyan]Processing...[/] SIMPLE will prepare the unsolvated reference, ask for the "
+        "site residues and spin multiplicity, write the NWChem/Tahoma assets, mark the workflow pending, "
+        "and stop. No solvation or MD/execution settings will be requested in this run."
+    )
+    result = WizardBuildResult(configs=configs, variant_suffixes=suffixes)
+    result.saved_config_paths.extend(_save_wizard_configs(result, write_config))
+    return result
 
 
 def _resume_input_config(candidate: ProteinSiteRespResumeCandidate) -> InputConfig:
@@ -4700,9 +4939,12 @@ def _resume_input_config(candidate: ProteinSiteRespResumeCandidate) -> InputConf
     prepared_pdb = str(payload.get("prepared_system_pdb") or "").strip()
     if prepared_pdb and Path(prepared_pdb).expanduser().exists():
         return InputConfig(source=InputSource.PDB_FILE, path=str(Path(prepared_pdb).expanduser().resolve()))
-    fallback = candidate.workflow_root / "02_system" / "system.pdb"
-    if fallback.exists():
-        return InputConfig(source=InputSource.PDB_FILE, path=str(fallback.resolve()))
+    for fallback in (
+        candidate.workflow_root / "02_system" / "system.pdb",
+        candidate.workflow_root / "02_system" / "system.unsolvated.pdb",
+    ):
+        if fallback.exists():
+            return InputConfig(source=InputSource.PDB_FILE, path=str(fallback.resolve()))
     raise ValueError(f"The original structure for RESP job {candidate.job_dir} is no longer available.")
 
 
@@ -4719,43 +4961,242 @@ def _resume_cluster_config(candidate: ProteinSiteRespResumeCandidate) -> Protein
     )
 
 
-def _prompt_legacy_resume_md_settings() -> tuple[MDConfig, SlurmConfig]:
-    console.print(
-        Panel(
-            "This RESP job was created before SIMPLE stored an automatic workflow-config snapshot. "
-            "The prepared topology and RESP atom mapping are intact, but the previous MD/Slurm choices "
-            "cannot be recovered. Confirm those continuation settings below; the protein will not be rebuilt.",
-            title="[bold yellow]MD settings needed for this older RESP job[/bold yellow]",
-            border_style="yellow",
-            box=box.ROUNDED,
+def _candidate_formal_metal_states(
+    candidates: list[ProteinSiteRespResumeCandidate],
+) -> list[dict[str, object]]:
+    states: list[dict[str, object]] = []
+    seen: set[tuple[int, str, int]] = set()
+    for candidate in candidates:
+        for raw_state in candidate.payload.get("formal_metal_states") or []:
+            if not isinstance(raw_state, dict):
+                continue
+            site = int(raw_state.get("site") or 0)
+            element = str(raw_state.get("element") or "").strip().title()
+            charge = int(raw_state.get("formal_charge") or 0)
+            key = (site, element, charge)
+            if site <= 0 or not element or key in seen:
+                continue
+            seen.add(key)
+            states.append({"site": site, "element": element, "formal_charge": charge})
+    return sorted(states, key=lambda item: (int(item["site"]), str(item["element"])))
+
+
+def _case_metal_charge_assignments(
+    config: WorkflowConfig,
+    candidates: list[ProteinSiteRespResumeCandidate],
+) -> list[MetalChargeAssignment]:
+    """Preserve each paused workflow's own oxidation-state assignments."""
+
+    charge_map = {int(item.site): int(item.charge) for item in config.system.metal_charges}
+    for state in _candidate_formal_metal_states(candidates):
+        charge_map.setdefault(int(state["site"]), int(state["formal_charge"]))
+    return [
+        MetalChargeAssignment(site=site, charge=charge)
+        for site, charge in sorted(charge_map.items())
+    ]
+
+
+def _reference_system_net_charge(workflow_root: Path) -> int | None:
+    system_dir = workflow_root / "02_system"
+    try:
+        atoms = load_topology_atoms(
+            system_dir / "system.unsolvated.prmtop",
+            system_dir / "system.unsolvated.pdb",
         )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return int(round(sum(float(atom.charge) for atom in atoms)))
+
+
+def _prompt_completed_protein_site_resp_settings(
+    *,
+    config: WorkflowConfig,
+    candidates: list[ProteinSiteRespResumeCandidate],
+    amber_env,
+    case_configs: list[WorkflowConfig] | None = None,
+) -> WorkflowConfig:
+    """Collect one shared set of final settings after NWChem RESP completes."""
+
+    workflow_root = candidates[0].workflow_root
+    states = _candidate_formal_metal_states(candidates)
+    metal_charges = _case_metal_charge_assignments(config, candidates)
+    metal_species = [
+        (str(state["element"]), int(state["formal_charge"]))
+        for state in states
+    ]
+
+    _print_step_header(
+        4,
+        "Choose the Final Metal Treatment",
+        "The RESP result is complete. Select the final 12-6-4 parameter set before solvation.",
+    )
+    metal_choices = _metal_model_choices()
+    _display_choice_table("Metal treatment model", metal_choices)
+    metal_model = MetalModel(
+        _prompt_choice(
+            "Choose the metal treatment model",
+            metal_choices,
+            default_key=MetalModel.MODEL_1264.value,
+        )
+    )
+    c4_parameter_set = DESC4ParameterSet.SPCE_LIMERZ
+    if metal_model == MetalModel.MODEL_1264:
+        parameter_choices = _metal_c4_parameter_set_choices(metal_species)
+        _display_choice_table("Metal 12-6-4 parameter set", parameter_choices)
+        c4_parameter_set = DESC4ParameterSet(
+            _prompt_choice(
+                "Choose the metal 12-6-4 parameter set",
+                parameter_choices,
+                default_key=DESC4ParameterSet.OPC_DUVAIL.value,
+            )
+        )
+
+    _print_step_header(
+        5,
+        "Choose Solvation and Ion Settings",
+        "Select the final solvent model, box geometry, and ion conditions now that RESP is complete.",
+    )
+    prompt_configs = case_configs or [config]
+    candidates_by_root: dict[Path, list[ProteinSiteRespResumeCandidate]] = {}
+    for candidate in candidates:
+        candidates_by_root.setdefault(candidate.workflow_root.resolve(), []).append(candidate)
+    assignments_by_variant = [
+        _case_metal_charge_assignments(
+            case_config,
+            candidates_by_root.get(case_config.output_path(), candidates),
+        )
+        for case_config in prompt_configs
+    ]
+    prepare_configs = [case_config.prepare for case_config in prompt_configs]
+    pre_monovalent, pre_multivalent = _aggregate_ion_parameter_requirements(
+        SaltConfig(),
+        assignments_by_variant,
+        prepare_configs,
+    )
+    water_model, custom_ion_frcmods = _prompt_water_model_selection(
+        amber_env,
+        include_monovalent=pre_monovalent,
+        include_multivalent=pre_multivalent,
+        c4_parameter_set=c4_parameter_set,
+        default_water_model=(
+            "opc" if c4_parameter_set == DESC4ParameterSet.OPC_DUVAIL else "spce"
+        ),
+    )
+    box_choices = _box_shape_choices()
+    _display_choice_table("Solvation box options", box_choices)
+    box_shape = BoxShape(
+        _prompt_choice(
+            "Choose the solvation box shape",
+            box_choices,
+            default_key=BoxShape.OCT.value,
+        )
+    )
+    buffer_angstrom = _prompt_positive_float("Solvent buffer (Angstrom)", default=10.0)
+    estimated_charge = _reference_system_net_charge(workflow_root)
+    _display_charge_preview(
+        estimated_charge,
+        "Exact net charge from the unsolvated topology used to generate this protein-site RESP job."
+        if estimated_charge is not None
+        else "The unsolvated reference charge could not be read; final TLeap will report the exact charge.",
+    )
+    salt_config = _prompt_salt_config(estimated_charge)
+    include_monovalent, include_multivalent = _aggregate_ion_parameter_requirements(
+        salt_config,
+        assignments_by_variant,
+        prepare_configs,
+    )
+    water_model, custom_ion_frcmods = _resolve_water_model_requirements_after_salt(
+        amber_env,
+        water_model=water_model,
+        custom_ion_frcmods=custom_ion_frcmods,
+        include_monovalent=include_monovalent,
+        include_multivalent=include_multivalent,
+        c4_parameter_set=c4_parameter_set,
+    )
+
+    _print_step_header(
+        6,
+        "Choose the MD Protocol",
+        "Pick the equilibration strategy and final production settings.",
     )
     protocol = _prompt_md_protocol()
     temperature = typer.prompt("Target temperature (K)", default=300.0, type=float)
     pressure = typer.prompt("Target pressure (bar)", default=1.0, type=float)
     production_time = _prompt_positive_float("Production time (ns)", default=100.0)
-    profile = _prompt_execution_profile()
-    return (
-        MDConfig(
-            protocol=protocol,
-            temperature_k=temperature,
-            pressure_bar=pressure,
-            production_time_ns=production_time,
-        ),
-        SlurmConfig(profile=profile),
+    restraint_input = config.input
+    try:
+        if restraint_input.source == InputSource.PDB_FILE and not Path(str(restraint_input.path)).expanduser().exists():
+            restraint_input = _resume_input_config(candidates[0])
+    except (OSError, ValueError):
+        restraint_input = _resume_input_config(candidates[0])
+    restraint_mask, restraint_weight = _prompt_custom_restraints(
+        restraint_input,
+        None,
+        config.prepare,
+        config.protonation,
+        len({int(state["site"]) for state in states}),
     )
+
+    _print_step_header(
+        7,
+        "Choose the Execution Script",
+        "Select CPU/pmemd.MPI or GPU/pmemd.cuda for the completed workflow.",
+    )
+    profile = _prompt_execution_profile()
+
+    config.system = SystemConfig(
+        protein_ff=config.system.protein_ff,
+        ligand_ff=config.system.ligand_ff,
+        metal_model=metal_model,
+        apply_1264=metal_model == MetalModel.MODEL_1264,
+        c4_parameter_set=c4_parameter_set,
+        metal_charges=metal_charges,
+        water_model=water_model,
+        box_shape=box_shape,
+        buffer_angstrom=buffer_angstrom,
+        salt=salt_config,
+        custom_ion_frcmods=custom_ion_frcmods,
+    )
+    config.md = MDConfig(
+        protocol=protocol,
+        temperature_k=temperature,
+        pressure_bar=pressure,
+        production_time_ns=production_time,
+        focused_restraint_mask=restraint_mask or None,
+        focused_restraint_mask_numbering=(
+            ResidueMaskNumbering.PREPARED if restraint_mask else ResidueMaskNumbering.PDB
+        ),
+        focused_restraint_weight=restraint_weight,
+    )
+    config.slurm = SlurmConfig(
+        profile=profile,
+        partition=None,
+        account=None,
+        ntasks=8,
+        gpus=1 if profile == SlurmProfile.GPU else 0,
+        walltime="24:00:00",
+        binary_override=None,
+        job_name=workflow_root.name,
+    )
+    return config
 
 
 def _build_protein_site_resp_resume_result(
     selection: _ProteinSiteRespResumeSelection,
     write_config: str | None,
+    *,
+    amber_env,
 ) -> WizardBuildResult:
     grouped: dict[Path, list[ProteinSiteRespResumeCandidate]] = {}
     for candidate in selection.candidates:
         grouped.setdefault(candidate.workflow_root, []).append(candidate)
 
-    legacy_settings: tuple[MDConfig, SlurmConfig] | None = None
-    configs: list[WorkflowConfig] = []
+    if not grouped:
+        raise ValueError("At least one completed protein-site RESP job must be selected.")
+
+    continuation_cases: list[
+        tuple[Path, list[ProteinSiteRespResumeCandidate], WorkflowConfig, ProteinSiteRespScope]
+    ] = []
     suffixes: list[tuple[str, ...]] = []
     summary_table = Table(title="Protein-site RESP continuation plan", box=box.SIMPLE_HEAVY)
     summary_table.add_column("Workflow output", style="bold cyan", overflow="fold")
@@ -4766,21 +5207,11 @@ def _build_protein_site_resp_resume_result(
         snapshot_path = workflow_root / "workflow_config.toml"
         if snapshot_path.exists():
             config = load_config(snapshot_path)
-            settings_label = "saved workflow settings"
         else:
-            if legacy_settings is None:
-                legacy_settings = _prompt_legacy_resume_md_settings()
-            md_config, slurm_config = legacy_settings
             config = WorkflowConfig(
                 input=_resume_input_config(candidates[0]),
-                md=md_config.model_copy(deep=True),
-                slurm=slurm_config.model_copy(
-                    deep=True,
-                    update={"job_name": workflow_root.name},
-                ),
                 output_dir=str(workflow_root),
             )
-            settings_label = "newly confirmed MD/Slurm settings"
 
         scopes = {
             ProteinSiteRespScope(str(candidate.payload.get("scope") or ProteinSiteRespScope.SIDECHAIN.value))
@@ -4791,24 +5222,55 @@ def _build_protein_site_resp_resume_result(
                 f"Selected RESP jobs under {workflow_root} use different fitting scopes and cannot be applied together."
             )
         config.output_dir = str(workflow_root)
+        continuation_cases.append((workflow_root, candidates, config, next(iter(scopes))))
+
+    all_candidates = [
+        candidate
+        for _workflow_root, candidates, _config, _scope in continuation_cases
+        for candidate in candidates
+    ]
+    shared_config = _prompt_completed_protein_site_resp_settings(
+        config=continuation_cases[0][2].model_copy(deep=True),
+        candidates=all_candidates,
+        amber_env=amber_env,
+        case_configs=[case[2] for case in continuation_cases],
+    )
+
+    configs: list[WorkflowConfig] = []
+    for workflow_root, candidates, config, scope in continuation_cases:
+        case_metal_charges = _case_metal_charge_assignments(config, candidates)
+        config.system = shared_config.system.model_copy(
+            deep=True,
+            update={
+                "protein_ff": config.system.protein_ff,
+                "ligand_ff": config.system.ligand_ff,
+                "metal_charges": case_metal_charges,
+            },
+        )
+        config.md = shared_config.md.model_copy(deep=True)
+        config.slurm = shared_config.slurm.model_copy(
+            deep=True,
+            update={"job_name": workflow_root.name},
+        )
+        config.output_dir = str(workflow_root)
         config.protein_site_resp = ProteinSiteRespConfig(
             mode=ProteinSiteRespMode.RESP,
-            scope=next(iter(scopes)),
+            scope=scope,
             apply_mode=RespApplyMode.APPLY_EXISTING,
             search_roots=[str(workflow_root)],
             job_dirs=[str(candidate.job_dir) for candidate in candidates],
             resume_existing_system=True,
             clusters=[_resume_cluster_config(candidate) for candidate in candidates],
         )
-        config.slurm.job_name = config.slurm.job_name or workflow_root.name
         configs.append(config)
         suffixes.append((workflow_root.name,))
-        summary_table.add_row(str(workflow_root), str(len(candidates)), settings_label)
+        summary_table.add_row(str(workflow_root), str(len(candidates)), "shared final settings")
 
     console.print(summary_table)
     console.print(
         "[blink bold cyan]Processing...[/] SIMPLE will refit any grid-only result, show the charge review, "
-        "patch the selected existing topology, and then generate the MD/Slurm files."
+        "build the deferred final solvated system when needed, patch the reviewed charges, and then "
+        "generate the MD/Slurm files."
     )
     result = WizardBuildResult(configs=configs, variant_suffixes=suffixes)
     result.saved_config_paths.extend(_save_wizard_configs(result, write_config))
@@ -4825,7 +5287,11 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
     )
     prompted_input = _prompt_input_config()
     if isinstance(prompted_input, _ProteinSiteRespResumeSelection):
-        return _build_protein_site_resp_resume_result(prompted_input, write_config)
+        return _build_protein_site_resp_resume_result(
+            prompted_input,
+            write_config,
+            amber_env=amber_env,
+        )
     if len(prompted_input) == 3:
         input_config, inspection_summary, detected_resp_candidate = prompted_input
         des_config = None
@@ -4901,9 +5367,9 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
 
     _print_step_header(
         2,
-        "Choose Force Fields and Metal Treatment",
-        "Select the force fields and confirm the metal treatment and oxidation states "
-        "before reviewing protonation-state changes.",
+        "Choose Force Fields and Metal Oxidation States",
+        "Select the force fields and confirm metal oxidation states before reviewing protonation-state changes. "
+        "The final 12-6-4/water model is chosen later.",
     )
 
     needs_nonstandard_molecules = input_config.source == InputSource.SMALL_MOLECULE or bool(kept_ligands)
@@ -5045,38 +5511,16 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
     remaining_metal_sites = _remaining_metal_sites(inspection_summary, preview_prepare_config)
     remaining_metal_site_count = len(remaining_metal_sites) + len(preview_prepare_config.metal_insertions)
 
-    metal_model = MetalModel.MODEL_1264
-    if remaining_metal_site_count > 0:
-        metal_choices = _metal_model_choices()
-        _display_choice_table("Metal treatment model", metal_choices)
-        metal_model = MetalModel(
-            _prompt_choice("Choose the metal treatment model", metal_choices, default_key=MetalModel.MODEL_1264.value)
-        )
-    else:
-        console.print("[dim]No metal sites remain after Step 1, so metal-model selection is skipped.[/dim]")
-
     variant_metal_charge_assignments = [[] for _ in variant_prepare_configs]
     batch_charge_map: dict[tuple[int, str], int] = {}
-    c4_parameter_set = DESC4ParameterSet.OPC_DUVAIL
-    if remaining_metal_site_count > 0 and metal_model == MetalModel.MODEL_1264:
+    if remaining_metal_site_count > 0:
         batch_charge_map = _prompt_batch_metal_charge_assignments(inspection_summary, variant_prepare_configs)
         variant_metal_charge_assignments = [
             _variant_metal_charge_assignments(inspection_summary, prepare_config, batch_charge_map)
             for prepare_config in variant_prepare_configs
         ]
-        selected_metal_species = [
-            (element, charge)
-            for (_site, element), charge in batch_charge_map.items()
-        ]
-        parameter_choices = _metal_c4_parameter_set_choices(selected_metal_species)
-        _display_choice_table("Metal 12-6-4 parameter set", parameter_choices)
-        c4_parameter_set = DESC4ParameterSet(
-            _prompt_choice(
-                "Choose the metal 12-6-4 parameter set",
-                parameter_choices,
-                default_key=DESC4ParameterSet.OPC_DUVAIL.value,
-            )
-        )
+    else:
+        console.print("[dim]No metal sites remain after Step 1, so metal oxidation-state selection is skipped.[/dim]")
 
     _print_step_header(
         3,
@@ -5091,83 +5535,75 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
     )
     protonation_configs = [variant.protonation_config for variant in protonation_variants]
     protonation_preview_config = protonation_configs[0]
-    ph_batch_active = len(protonation_variants) > 1
+
+    ligand_net_charge, ligand_multiplicity = _lookup_assignment(
+        ligand_parameter_assignments,
+        ligand_residue_name,
+    )
+    ligands_config = LigandsConfig(
+        mode=ligand_mode,
+        charge_method=ligand_charge_method,
+        manual_files=manual_files,
+        residue_name=ligand_residue_name,
+        net_charge=ligand_net_charge,
+        multiplicity=ligand_multiplicity,
+        parameter_assignments=ligand_parameter_assignments,
+        resp_job_dir=resp_job_dir,
+        resp_group_file=resp_group_file,
+        resp_session_file=resp_session_file,
+        resp_apply_mode=resp_apply_mode,
+    )
+    config_build_specs = _protein_config_build_specs(
+        input_config=input_config,
+        resp_job_dir=resp_job_dir,
+        metal_action_plan=metal_action_plan,
+        prepare_configs=variant_prepare_configs,
+        metal_charge_assignments=variant_metal_charge_assignments,
+        protonation_variants=protonation_variants,
+    )
 
     protein_site_resp_config = ProteinSiteRespConfig()
-    if remaining_metal_site_count > 0 and metal_model == MetalModel.MODEL_1264:
-        _print_step_header(
-            4,
-            "Choose Metal-Site Protein Charges",
-            "Keep standard ff19SB charges or prepare an expert, site-specific RESP redistribution "
-            "for directly coordinating protein residues.",
+    if input_config.source != InputSource.SMALL_MOLECULE:
+        requested_site_resp = _prompt_new_protein_site_resp_config(
+            remaining_metal_site_count=remaining_metal_site_count,
+            batch_charge_map=batch_charge_map,
         )
-        console.print(
-            Panel(
-                "[bold]Standard FF[/bold] is the validated default for the 12-6-4 model.\n"
-                "[bold yellow]Site-specific RESP[/bold yellow] can be useful when metal coordination is expected to "
-                "strongly polarize HIS/CYS/ASP/GLU/MET side chains, but it is a hybrid model outside the original "
-                "12-6-4 parameter combination. The metal point charge remains fixed at its integer oxidation-state "
-                "charge, and every target residue keeps its original total charge.",
-                title="[bold]Protein Metal-Site Charge Model[/bold]",
-                border_style="yellow",
-                box=box.ROUNDED,
+        if requested_site_resp is not None:
+            return _build_protein_site_resp_setup_result(
+                input_config=input_config,
+                protein_ff=protein_ff,
+                system_ligand_ff=system_ligand_ff,
+                ligands_config=ligands_config,
+                resp_config=requested_site_resp,
+                config_build_specs=config_build_specs,
+                write_config=write_config,
+            )
+
+    metal_model = MetalModel.MODEL_1264
+    c4_parameter_set = DESC4ParameterSet.OPC_DUVAIL
+    if remaining_metal_site_count > 0:
+        metal_choices = _metal_model_choices()
+        _display_choice_table("Metal treatment model", metal_choices)
+        metal_model = MetalModel(
+            _prompt_choice(
+                "Choose the metal treatment model",
+                metal_choices,
+                default_key=MetalModel.MODEL_1264.value,
             )
         )
-        if _prompt_yes_no("Prepare site-specific RESP charges for the directly coordinating residues?", default=False):
-            scope_choices = [
-                WizardChoice(
-                    ProteinSiteRespScope.SIDECHAIN.value,
-                    "Side chain (recommended)",
-                    "Fit CB-and-beyond atoms while fixing backbone, caps, metal, water, and other QM environment charges.",
-                ),
-                WizardChoice(
-                    ProteinSiteRespScope.WHOLE_RESIDUE.value,
-                    "Whole residue",
-                    "Fit all atoms of each coordinating residue while preserving each residue's total charge.",
-                ),
+        if metal_model == MetalModel.MODEL_1264:
+            selected_metal_species = [
+                (element, charge)
+                for (_site, element), charge in batch_charge_map.items()
             ]
-            _display_choice_table("Protein-site RESP scope", scope_choices)
-            scope = ProteinSiteRespScope(
+            parameter_choices = _metal_c4_parameter_set_choices(selected_metal_species)
+            _display_choice_table("Metal 12-6-4 parameter set", parameter_choices)
+            c4_parameter_set = DESC4ParameterSet(
                 _prompt_choice(
-                    "Choose the protein-site RESP scope",
-                    scope_choices,
-                    default_key=ProteinSiteRespScope.SIDECHAIN.value,
+                    "Choose the metal 12-6-4 parameter set",
+                    parameter_choices,
+                    default_key=DESC4ParameterSet.OPC_DUVAIL.value,
                 )
-            )
-            suggestion_rows = []
-            for (_site, element), charge in sorted(batch_charge_map.items()):
-                suggestion = suggested_spin_multiplicity(element, charge)
-                low_spin = suggested_low_spin_multiplicity(element, charge)
-                suggestion_rows.append(
-                    f"{element}{charge:+d}: default/high-spin "
-                    f"{suggestion if suggestion is not None else 'no curated suggestion'}; low-spin "
-                    f"{low_spin if low_spin is not None else 'no conventional alternative'}"
-                )
-            console.print(
-                "[bold cyan]Spin guidance:[/bold cyan] "
-                + (", ".join(suggestion_rows) if suggestion_rows else "No curated suggestion is available.")
-                + "\n[dim]After TLeap establishes the exact atom mapping, SIMPLE will show every connected metal "
-                "cluster and require explicit confirmation of its multiplicity and donor/environment lists.[/dim]"
-            )
-            search_root = typer.prompt(
-                _back_prompt_suffix("Folder to search automatically for prior site-RESP jobs"),
-                default=str(Path.cwd()),
-            ).strip()
-            if _is_back_token(search_root):
-                raise WizardBack()
-            explicit_job = typer.prompt(
-                _back_prompt_suffix("Specific completed site-RESP job folder (blank for automatic detection)"),
-                default="",
-                show_default=False,
-            ).strip()
-            if _is_back_token(explicit_job):
-                raise WizardBack()
-            protein_site_resp_config = ProteinSiteRespConfig(
-                mode=ProteinSiteRespMode.RESP,
-                scope=scope,
-                apply_mode=RespApplyMode.DETECT,
-                search_roots=[search_root] if search_root else [],
-                job_dirs=[explicit_job] if explicit_job else [],
             )
 
     _print_step_header(
@@ -5263,44 +5699,6 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
     )
 
     profile = _prompt_execution_profile()
-    reserved_output_paths: set[Path] = set()
-    config_build_specs: list[
-        tuple[
-            PrepareConfig,
-            list[MetalChargeAssignment],
-            _ProtonationVariant,
-            Path,
-            tuple[str, ...],
-        ]
-    ] = []
-    for variant, prepare_config, metal_charge_assignments in zip(
-        metal_action_plan.variants,
-        variant_prepare_configs,
-        variant_metal_charge_assignments,
-        strict=True,
-    ):
-        for protonation_variant in protonation_variants:
-            output_dir_path = _batch_output_directory(
-                input_config,
-                resp_job_dir=resp_job_dir,
-                root_suffix_tokens=variant.suffix_tokens,
-                ph_token=protonation_variant.ph_token if ph_batch_active else None,
-                reserved=reserved_output_paths,
-            )
-            reserved_output_paths.add(output_dir_path)
-            combined_suffix_tokens = variant.suffix_tokens + (
-                (protonation_variant.ph_token,) if ph_batch_active and protonation_variant.ph_token else ()
-            )
-            config_build_specs.append(
-                (
-                    prepare_config,
-                    metal_charge_assignments,
-                    protonation_variant,
-                    output_dir_path,
-                    combined_suffix_tokens,
-                )
-            )
-
     output_dir_paths = [item[3] for item in config_build_specs]
 
     if len(output_dir_paths) == 1:
@@ -5323,20 +5721,6 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
         f"Structure preparation and workflow file generation will begin now for {len(output_dir_paths)} output(s)."
     )
 
-    ligand_net_charge, ligand_multiplicity = _lookup_assignment(ligand_parameter_assignments, ligand_residue_name)
-    ligands_config = LigandsConfig(
-        mode=ligand_mode,
-        charge_method=ligand_charge_method,
-        manual_files=manual_files,
-        residue_name=ligand_residue_name,
-        net_charge=ligand_net_charge,
-        multiplicity=ligand_multiplicity,
-        parameter_assignments=ligand_parameter_assignments,
-        resp_job_dir=resp_job_dir,
-        resp_group_file=resp_group_file,
-        resp_session_file=resp_session_file,
-        resp_apply_mode=resp_apply_mode,
-    )
     md_config = MDConfig(
         protocol=protocol,
         temperature_k=temperature,
@@ -5395,7 +5779,7 @@ def _build_wizard_configs_once(write_config: str | None) -> WizardBuildResult:
                     partition=None,
                     account=None,
                     ntasks=8,
-                    gpus=1,
+                    gpus=1 if profile == SlurmProfile.GPU else 0,
                     walltime="24:00:00",
                     binary_override=None,
                     job_name=job_name,

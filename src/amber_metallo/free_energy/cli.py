@@ -34,6 +34,7 @@ from amber_metallo.free_energy.mmpbsa import (
 )
 from amber_metallo.free_energy.trajectory import count_trajectory_frames
 from amber_metallo.reporting import console, print_notice, write_json
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti.analysis import (
     assess_site_stability,
     default_formal_charge,
@@ -55,9 +56,11 @@ from amber_metallo.ti.cli import (
     _prompt_complex_input_selection,
     _prompt_complex_input_selections,
     _prompt_snapshot_mode,
+    _prompt_ti_charge_compensation_mode,
     _prompt_ti_decoupling_mode,
     _prompt_ti_execution_profile,
     _prompt_ti_implementation_mode,
+    _prompt_ti_sampling_mode,
     _resolve_water_reference_settings,
     _resolve_water_reference_source_choice,
 )
@@ -65,10 +68,12 @@ from amber_metallo.ti.config import (
     ComplexInputConfig,
     MetalSelectionConfig,
     SnapshotConfig,
+    TIChargeCompensationMode,
     TIDecouplingMode,
     TIMetalSelectionMode,
     TIImplementationMode,
     TIProtocolConfig,
+    TISamplingMode,
     WaterReferenceConfig,
 )
 
@@ -577,18 +582,23 @@ def _discover_existing_mmpbsa_outputs(workflow_root: Path) -> tuple[str, Path | 
 
 def _iter_batch_case_roots(search_root: Path) -> list[Path]:
     roots: list[Path] = []
-    direct_ph_children = [child for child in search_root.iterdir() if child.is_dir() and _PH_DIR_RE.match(child.name)]
+    direct_ph_children = (
+        [child for child in search_root.iterdir() if child.is_dir() and _PH_DIR_RE.match(child.name)]
+        if search_subdirectories_enabled()
+        else []
+    )
     if direct_ph_children or _looks_like_main_workflow_root(search_root):
         roots.append(search_root)
-    roots.extend(
-        child
-        for child in sorted(search_root.iterdir(), key=lambda item: item.name.lower())
-        if child.is_dir()
-        and (
-            _looks_like_main_workflow_root(child)
-            or any(grandchild.is_dir() and _PH_DIR_RE.match(grandchild.name) for grandchild in child.iterdir())
+    if search_subdirectories_enabled():
+        roots.extend(
+            child
+            for child in sorted(search_root.iterdir(), key=lambda item: item.name.lower())
+            if child.is_dir()
+            and (
+                _looks_like_main_workflow_root(child)
+                or any(grandchild.is_dir() and _PH_DIR_RE.match(grandchild.name) for grandchild in child.iterdir())
+            )
         )
-    )
     seen: set[Path] = set()
     ordered_roots: list[Path] = []
     for root in roots:
@@ -619,10 +629,15 @@ def _discover_mmpbsa_batch_cases(search_root: Path) -> list[MMPBSABatchDiscovery
                     matching_output_dirs=matching_output_dirs,
                 )
             )
-        for ph_dir in sorted(
-            [child for child in case_root.iterdir() if child.is_dir() and _PH_DIR_RE.match(child.name)],
-            key=lambda item: item.name.lower(),
-        ):
+        ph_dirs = (
+            sorted(
+                [child for child in case_root.iterdir() if child.is_dir() and _PH_DIR_RE.match(child.name)],
+                key=lambda item: item.name.lower(),
+            )
+            if search_subdirectories_enabled()
+            else []
+        )
+        for ph_dir in ph_dirs:
             selectable, workflow_note = _quick_workflow_readiness(ph_dir)
             existing_status, existing_output_dir, matching_output_dirs = _discover_existing_mmpbsa_outputs(ph_dir)
             discoveries.append(
@@ -651,6 +666,11 @@ def _is_general_scan_skipped_dir(path: Path) -> bool:
 
 
 def _iter_general_scan_files(search_root: Path) -> list[Path]:
+    if not search_subdirectories_enabled():
+        try:
+            return [path for path in search_root.iterdir() if path.is_file()]
+        except OSError:
+            return []
     files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(search_root):
         current = Path(dirpath)
@@ -815,7 +835,10 @@ def _display_general_mmpbsa_inputs(search_root: Path, discoveries: list[GeneralM
             discovery.existing_status.capitalize(),
         )
     console.print(table)
-    console.print(f"[dim]Scanned {search_root.resolve()} recursively for general AMBER topology/trajectory inputs.[/dim]")
+    scope = "recursively" if search_subdirectories_enabled() else "without entering subdirectories"
+    console.print(
+        f"[dim]Scanned {search_root.resolve()} {scope} for general AMBER topology/trajectory inputs.[/dim]"
+    )
 
 
 def _prompt_general_mmpbsa_input_selection(
@@ -1224,7 +1247,10 @@ def _display_mmpbsa_batch_cases(search_root: Path, discoveries: list[MMPBSABatch
             discovery.existing_output_text(batch_root=search_root),
         )
     console.print(table)
-    console.print(f"[dim]Scanned {search_root.resolve()} for PDBID_METAL and PDBID_METAL/PHx workflow folders.[/dim]")
+    scope = "including subdirectories" if search_subdirectories_enabled() else "without entering subdirectories"
+    console.print(
+        f"[dim]Scanned {search_root.resolve()} {scope} for PDBID_METAL and PDBID_METAL/PHx workflow folders.[/dim]"
+    )
     console.print("[dim]Existing-output paths are shown relative to the batch root.[/dim]")
 
 
@@ -1620,12 +1646,20 @@ def _build_single_free_energy_wizard_config(
                 )
         if shared_ti_settings is None:
             snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
+            ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
+            ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
         else:
             snapshot_mode = shared_ti_settings.snapshot.mode
             if snapshot_mode.value == "cluster" and not all(item.stable for item in selected_assessments):
                 snapshot_mode = _prompt_snapshot_mode(selected_stable=False)
             else:
                 console.print(f"[dim]Batch snapshot setting reused: {snapshot_mode.value}.[/dim]")
+            ti_sampling_mode = shared_ti_settings.ti.sampling_mode
+            ti_charge_compensation_mode = shared_ti_settings.ti.charge_compensation_mode
+            console.print(
+                f"[dim]Batch TI sampling/charge settings reused: {ti_sampling_mode.value}, "
+                f"{ti_charge_compensation_mode.value}.[/dim]"
+            )
         if in_place_ti:
             formal_charge = _infer_charge_from_selected_site(selected) or default_formal_charge(selected.element)
             water_reference_enabled = typer.confirm(
@@ -1713,6 +1747,8 @@ def _build_single_free_energy_wizard_config(
             ti=TIProtocolConfig(
                 implementation_mode=ti_implementation_mode,
                 decoupling_mode=ti_decoupling_mode,
+                sampling_mode=ti_sampling_mode,
+                charge_compensation_mode=ti_charge_compensation_mode,
             ),
             water_reference=WaterReferenceConfig(
                 enabled=water_reference_enabled,

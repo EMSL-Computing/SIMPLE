@@ -5,6 +5,30 @@ from pathlib import Path
 from amber_metallo.config import SlurmConfig
 
 
+def _nwchem_resp_failure_function() -> list[str]:
+    """Render a Bash check for failures that launchers do not always propagate."""
+
+    return [
+        "nwchem_resp_failed()",
+        "{",
+        '  local log_file="$1"',
+        "  local grid_file",
+        '  if [ ! -s "$log_file" ]; then',
+        "    return 0",
+        "  fi",
+        "  if grep -Eiq 'dft energy failed|not reaching convergence criteria|there is an error in the input file|mpi_abort|received an error in communication|ga error' \"$log_file\"; then",
+        "    return 0",
+        "  fi",
+        "  for grid_file in ./*.grid; do",
+        '    if [ -s "$grid_file" ]; then',
+        "      return 1",
+        "    fi",
+        "  done",
+        "  return 0",
+        "}",
+    ]
+
+
 def _generic_header(*, job_name: str) -> list[str]:
     return [
         "#!/bin/bash",
@@ -58,13 +82,22 @@ def render_resp_slurm_script(
     if retry_input:
         lines.insert(lines.index('cp "$INPUT_DIR/resp_fit.py" "$OUTPUT_DIR/"'), f'cp "$INPUT_DIR/{retry_input}" "$OUTPUT_DIR/"')
         run_index = lines.index('echo "Running NWChem RESP job"')
-        lines[run_index : run_index + 2] = [
+        lines[run_index : run_index + 2] = _nwchem_resp_failure_function() + [
+            "",
             'rm -f ./*.grid ./site_resp_precondition.movecs ./site_resp_charges.json ./site_resp_charges.txt',
             'echo "Running NWChem RESP job (SCF-stabilized primary input)"',
-            'if ! $RUNNER resp_job.nw > resp_job.log; then',
-            '  echo "Primary SCF did not converge; retrying with PBE orbital preconditioning"',
+            "primary_status=0",
+            '$RUNNER resp_job.nw > resp_job.log 2>&1 || primary_status=$?',
+            'if [ "$primary_status" -ne 0 ] || nwchem_resp_failed resp_job.log; then',
+            '  echo "Primary SCF did not produce a valid ESP grid; retrying with small-basis PBE orbital preconditioning"',
             '  rm -f ./*.grid ./site_resp_precondition.movecs',
-            f'  $RUNNER {retry_input} > resp_job_retry.log',
+            "  retry_status=0",
+            f'  $RUNNER {retry_input} > resp_job_retry.log 2>&1 || retry_status=$?',
+            '  if [ "$retry_status" -ne 0 ] || nwchem_resp_failed resp_job_retry.log; then',
+            '    echo "ERROR: Both NWChem RESP SCF attempts failed. Inspect resp_job.log and resp_job_retry.log." >&2',
+            '    [ "$retry_status" -ne 0 ] || retry_status=1',
+            '    exit "$retry_status"',
+            "  fi",
             'fi',
         ]
     return "\n".join(lines) + "\n"
@@ -132,13 +165,22 @@ def render_tahoma_resp_script(*, job_root: Path, job_name: str, retry_input: str
     if retry_input:
         lines.insert(lines.index('cp "$INPUT_DIR/resp_fit.py" "$RUN_DIR/"'), f'cp "$INPUT_DIR/{retry_input}" "$RUN_DIR/"')
         run_index = lines.index('echo "Running Tahoma RESP job"')
-        lines[run_index : run_index + 2] = [
+        lines[run_index : run_index + 2] = _nwchem_resp_failure_function() + [
+            "",
             'rm -f ./*.grid ./site_resp_precondition.movecs ./site_resp_charges.json ./site_resp_charges.txt',
             'echo "Running Tahoma RESP job (SCF-stabilized primary input)"',
-            'if ! srun --mpi=pmi2 -N "$SLURM_NNODES" -n "$SLURM_NPROCS" apptainer exec --bind /big_scratch "$NWBIN" nwchem resp_job.nw > resp_job.log; then',
-            '  echo "Primary SCF did not converge; retrying with PBE orbital preconditioning"',
+            "primary_status=0",
+            'srun --mpi=pmi2 -N "$SLURM_NNODES" -n "$SLURM_NPROCS" apptainer exec --bind /big_scratch "$NWBIN" nwchem resp_job.nw > resp_job.log 2>&1 || primary_status=$?',
+            'if [ "$primary_status" -ne 0 ] || nwchem_resp_failed resp_job.log; then',
+            '  echo "Primary SCF did not produce a valid ESP grid; retrying with small-basis PBE orbital preconditioning"',
             '  rm -f ./*.grid ./site_resp_precondition.movecs',
-            f'  srun --mpi=pmi2 -N "$SLURM_NNODES" -n "$SLURM_NPROCS" apptainer exec --bind /big_scratch "$NWBIN" nwchem {retry_input} > resp_job_retry.log',
+            "  retry_status=0",
+            f'  srun --mpi=pmi2 -N "$SLURM_NNODES" -n "$SLURM_NPROCS" apptainer exec --bind /big_scratch "$NWBIN" nwchem {retry_input} > resp_job_retry.log 2>&1 || retry_status=$?',
+            '  if [ "$retry_status" -ne 0 ] || nwchem_resp_failed resp_job_retry.log; then',
+            '    echo "ERROR: Both NWChem RESP SCF attempts failed. Inspect resp_job.log and resp_job_retry.log." >&2',
+            '    [ "$retry_status" -ne 0 ] || retry_status=1',
+            '    exit "$retry_status"',
+            "  fi",
             'fi',
         ]
     return "\n".join(lines) + "\n"

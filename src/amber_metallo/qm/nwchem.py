@@ -18,6 +18,7 @@ from amber_metallo.qm.resp_fit import (
 )
 from amber_metallo.qm.slurm import render_resp_slurm_script, render_tahoma_resp_script
 from amber_metallo.reporting import write_json
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -141,6 +142,24 @@ _SUPPORTED_RESP_METALS = {
     "Mn",
     "Fe",
     "Sc",
+    "Y",
+    "La",
+    "Ce",
+    "Pr",
+    "Nd",
+    "Pm",
+    "Sm",
+    "Eu",
+    "Gd",
+    "Tb",
+    "Dy",
+    "Ho",
+    "Er",
+    "Tm",
+    "Yb",
+    "Lu",
+}
+_DEF2_ECP_RARE_EARTH_ELEMENTS = {
     "Y",
     "La",
     "Ce",
@@ -1367,12 +1386,35 @@ def _aux_basis_for(basis: str) -> str:
     return ""
 
 
+def _def2_ecp_rare_earth_elements(molecule: MoleculeData) -> list[str]:
+    elements: list[str] = []
+    seen: set[str] = set()
+    for atom in molecule.atoms:
+        element = _normalize_element(atom.element)
+        if element in _DEF2_ECP_RARE_EARTH_ELEMENTS and element not in seen:
+            seen.add(element)
+            elements.append(element)
+    return elements
+
+
+def _render_def2_ecp_block(elements: list[str]) -> str:
+    if not elements:
+        return ""
+    return "\n".join(
+        [
+            "ecp bse",
+            *(f" {element} library def2-ecp" for element in elements),
+            "end",
+        ]
+    )
+
+
 def _xc_keyword(functional: str) -> str:
     # PBE is used internally only to precondition difficult open-shell metal
     # orbitals before the requested r2SCAN single point; it is not exposed as
     # a selectable final RESP level.
     if str(functional).strip().lower() == "pbe":
-        return "pbe"
+        return "xpbe96 cpbe96"
     normalized = _normalize_functional(functional, default=QM_DEFAULT_DFT_FUNCTIONAL)
     if normalized == "hf":
         return "hfexch 1.0"
@@ -1389,7 +1431,12 @@ def _render_dft_theory_block(
     reset_existing: bool = False,
     vectors_input_atomic: bool = False,
     vectors_input_file: str | None = None,
+    vectors_project_basis: str | None = None,
     vectors_output_file: str | None = None,
+    basis_name: str = "ao basis",
+    select_basis: bool = False,
+    quadratic_convergence: bool = False,
+    use_bse_def2_library: bool = False,
     convergence_profile: str = "default",
 ) -> str:
     if convergence_profile == "metal_robust":
@@ -1408,9 +1455,12 @@ def _render_dft_theory_block(
                 'unset "basis:cd*"',
             ]
         )
+    basis_header = f'basis "{basis_name}" spherical'
+    if use_bse_def2_library and basis.lower().startswith("def2-"):
+        basis_header += " bse"
     lines.extend(
         [
-            'basis "ao basis" spherical',
+            basis_header,
             f" * library {basis}",
             "end",
         ]
@@ -1418,6 +1468,8 @@ def _render_dft_theory_block(
     aux_basis = _aux_basis_for(basis)
     if aux_basis:
         lines.append(aux_basis)
+    if select_basis:
+        lines.append(f'set "ao basis" "{basis_name}"')
     lines.extend(
         [
             "dft",
@@ -1428,7 +1480,9 @@ def _render_dft_theory_block(
             convergence,
         ]
     )
-    if vectors_input_file:
+    if vectors_input_file and vectors_project_basis:
+        vector_line = f' vectors input project "{vectors_project_basis}" "{vectors_input_file}"'
+    elif vectors_input_file:
         vector_line = f' vectors input "{vectors_input_file}"'
     elif vectors_input_atomic:
         vector_line = " vectors input atomic"
@@ -1438,6 +1492,8 @@ def _render_dft_theory_block(
         vector_line += f' output "{vectors_output_file}"'
     if vector_line:
         lines.append(vector_line)
+    if quadratic_convergence:
+        lines.append(" cgmin")
     lines.extend(
         [
             ' noprint "final vectors analysis"',
@@ -1447,7 +1503,11 @@ def _render_dft_theory_block(
     return "\n".join(lines)
 
 
-def _render_optimization_step_block(qm_settings: dict[str, Any]) -> str:
+def _render_optimization_step_block(
+    qm_settings: dict[str, Any],
+    *,
+    use_bse_def2_library: bool = False,
+) -> str:
     geometry = dict(qm_settings.get("geometry") or {})
     dft_optimization = dict(geometry.get("dft_optimization") or {})
     resources = dict(qm_settings.get("resources") or {})
@@ -1478,6 +1538,7 @@ def _render_optimization_step_block(qm_settings: dict[str, Any]) -> str:
             multiplicity=int(qm_settings.get("multiplicity") or 1),
             grid=str(resources.get("grid") or QM_DEFAULT_GRID),
             maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
+            use_bse_def2_library=use_bse_def2_library,
         )
     )
     blocks.append("\n".join(["driver", " maxiter 100", "end", "task dft optimize ignore"]))
@@ -1499,19 +1560,36 @@ def _resolve_resp_theory(qm_settings: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def _render_resp_reference_block(qm_settings: dict[str, Any], *, convergence_profile: str = "default") -> str:
+def _render_resp_reference_block(
+    qm_settings: dict[str, Any],
+    *,
+    convergence_profile: str = "default",
+    use_bse_def2_library: bool = False,
+) -> str:
     resources = dict(qm_settings.get("resources") or {})
     functional, basis = _resolve_resp_theory(qm_settings)
     if convergence_profile == "metal_retry":
+        # Difficult transition-metal states often fail before an ESP grid is
+        # written even with aggressive damping.  Converge a cheaper PBE/
+        # def2-SVP reference first, then project those orbitals into the final
+        # basis.  This follows NWChem's documented small-to-large basis
+        # projection recovery strategy while preserving the requested final
+        # r2SCAN/def2-TZVP ESP level.
+        small_basis_name = "site_resp_small"
+        final_basis_name = "site_resp_final"
         preconditioner = _render_dft_theory_block(
             functional="pbe",
-            basis=basis,
+            basis="def2-svp",
             multiplicity=int(qm_settings.get("multiplicity") or 1),
             grid=str(resources.get("grid") or QM_DEFAULT_GRID),
             maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
             reset_existing=True,
             vectors_input_atomic=True,
             vectors_output_file="site_resp_precondition.movecs",
+            basis_name=small_basis_name,
+            select_basis=True,
+            quadratic_convergence=True,
+            use_bse_def2_library=use_bse_def2_library,
             convergence_profile="metal_retry",
         )
         final = _render_dft_theory_block(
@@ -1522,6 +1600,10 @@ def _render_resp_reference_block(qm_settings: dict[str, Any], *, convergence_pro
             maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
             reset_existing=True,
             vectors_input_file="site_resp_precondition.movecs",
+            vectors_project_basis=small_basis_name,
+            basis_name=final_basis_name,
+            select_basis=True,
+            use_bse_def2_library=use_bse_def2_library,
             convergence_profile="metal_retry",
         )
         return "\n\n".join([preconditioner, "task dft", final, "task dft"])
@@ -1535,6 +1617,7 @@ def _render_resp_reference_block(qm_settings: dict[str, Any], *, convergence_pro
                 maxiter=int(resources.get("maxiter") or QM_DEFAULT_MAXITER),
                 reset_existing=True,
                 vectors_input_atomic=True,
+                use_bse_def2_library=use_bse_def2_library,
                 convergence_profile=convergence_profile,
             ),
             "task dft",
@@ -1555,6 +1638,8 @@ def render_nwchem_input(
         multiplicity=int(raw_qm.get("multiplicity") or 1),
     )
     validate_qm_settings_for_molecule(molecule, qm)
+    rare_earth_elements = _def2_ecp_rare_earth_elements(molecule)
+    use_bse_def2_library = bool(rare_earth_elements)
     template = _RESP_TEMPLATE_PATH.read_text(encoding="utf-8")
     return template.format(
         title=f"RESP_{session_state['residue_name']}",
@@ -1562,8 +1647,16 @@ def render_nwchem_input(
         geometry_block=_render_geometry_block(molecule),
         net_charge=int(qm["net_charge"]),
         multiplicity=int(qm["multiplicity"]),
-        optimization_step_block=_render_optimization_step_block(qm),
-        resp_reference_block=_render_resp_reference_block(qm, convergence_profile=convergence_profile),
+        ecp_block=_render_def2_ecp_block(rare_earth_elements),
+        optimization_step_block=_render_optimization_step_block(
+            qm,
+            use_bse_def2_library=use_bse_def2_library,
+        ),
+        resp_reference_block=_render_resp_reference_block(
+            qm,
+            convergence_profile=convergence_profile,
+            use_bse_def2_library=use_bse_def2_library,
+        ),
     )
 
 
@@ -2103,7 +2196,19 @@ def find_resp_job_candidates(
 
     root = Path(search_root).expanduser().resolve()
     if root.exists():
-        for manifest_path in root.rglob("resp_apply_manifest.json"):
+        manifest_paths = (
+            root.rglob("resp_apply_manifest.json")
+            if search_subdirectories_enabled()
+            else (
+                path
+                for path in (
+                    root / "resp_apply_manifest.json",
+                    root / "manifests" / "resp_apply_manifest.json",
+                )
+                if path.is_file()
+            )
+        )
+        for manifest_path in manifest_paths:
             _maybe_add(manifest_path.parent.parent)
 
     candidates.sort(
@@ -2150,7 +2255,19 @@ def find_resp_source_candidates(
 
     root = Path(search_root).expanduser().resolve()
     if root.exists():
-        for manifest_path in root.rglob("resp_apply_manifest.json"):
+        manifest_paths = (
+            root.rglob("resp_apply_manifest.json")
+            if search_subdirectories_enabled()
+            else (
+                path
+                for path in (
+                    root / "resp_apply_manifest.json",
+                    root / "manifests" / "resp_apply_manifest.json",
+                )
+                if path.is_file()
+            )
+        )
+        for manifest_path in manifest_paths:
             _maybe_add(manifest_path.parent.parent)
 
     candidates.sort(

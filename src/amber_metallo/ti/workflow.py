@@ -9,7 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from amber_metallo.amber.leap import build_system_with_tleap
-from amber_metallo.config import MetalChargeAssignment, MetalModel, SaltConfig, SlurmConfig, SlurmProfile, SystemConfig
+from amber_metallo.config import (
+    MetalChargeAssignment,
+    MetalModel,
+    SaltConfig,
+    SaltKind,
+    SaltMode,
+    SlurmConfig,
+    SlurmProfile,
+    SystemConfig,
+)
 from amber_metallo.environment import detect_amber_environment
 from amber_metallo.reporting import activity_status, console, print_notice, write_json
 from amber_metallo.ti import abfe as ti_abfe
@@ -25,7 +34,15 @@ from amber_metallo.ti.analysis import (
     run_last_snapshot_extraction,
     select_site,
 )
-from amber_metallo.ti.config import TIDecouplingMode, SnapshotMode, TIImplementationMode, TIWorkflowConfig
+from amber_metallo.ti.config import (
+    TIChargeCompensationMode,
+    TIDecouplingMode,
+    SnapshotMode,
+    TIImplementationMode,
+    TISamplingMode,
+    TIWorkflowConfig,
+)
+from amber_metallo.ti.counterions import CounterionPlan, prepare_charge_compensating_counterions
 from amber_metallo.ti.protocols import (
     generate_bound_start_preparation_inputs,
     generate_qoff_endpoint_preparation_inputs,
@@ -40,6 +57,7 @@ from amber_metallo.ti.restraints import (
 )
 from amber_metallo.ti.slurm import QoffCoordinateBridge, write_leg_slurm_scripts
 from amber_metallo.ti.topology import (
+    inspect_prmtop_charge_state,
     missing_required_1264_charge_families,
     missing_required_126_charge_families,
     prepare_decharged_topology,
@@ -50,7 +68,7 @@ from amber_metallo.ti.topology import (
 )
 
 
-WATER_REFERENCE_SCHEME_VERSION = "water-ref-v6-disjoint-qoff-water-metadata"
+WATER_REFERENCE_SCHEME_VERSION = "water-ref-v8-counterion-periodic-box"
 
 
 def _copy_if_present(source: str | Path | None, destination_dir: Path) -> str | None:
@@ -83,6 +101,38 @@ def _uses_in_place_bound_only_ti(config: TIWorkflowConfig) -> bool:
 
 def _uses_split_qoff_disjoint_topology(config: TIWorkflowConfig) -> bool:
     return not _uses_combined_gti_decoupling(config)
+
+
+def _water_reference_salt(config: TIWorkflowConfig) -> SaltConfig:
+    if config.ti.charge_compensation_mode == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS:
+        return SaltConfig(kind=SaltKind.NACL, mode=SaltMode.NEUTRALIZE)
+    return SaltConfig()
+
+
+def _neutrality_validation(
+    *,
+    initial_prmtop: str | Path,
+    endpoint_prmtop: str | Path,
+    enabled: bool,
+    dry_run: bool,
+) -> dict[str, object]:
+    if not enabled:
+        return {"status": "not_requested"}
+    if dry_run:
+        return {"status": "deferred_dry_run"}
+    initial_charge = inspect_prmtop_charge_state(initial_prmtop).net_charge
+    endpoint_charge = inspect_prmtop_charge_state(endpoint_prmtop).net_charge
+    if abs(initial_charge) > 0.05 or abs(endpoint_charge) > 0.05:
+        raise RuntimeError(
+            "Charge-neutral TI topology validation failed: "
+            f"initial={initial_charge:+.6f} e, endpoint={endpoint_charge:+.6f} e."
+        )
+    return {
+        "status": "passed",
+        "initial_charge": initial_charge,
+        "endpoint_charge": endpoint_charge,
+        "tolerance": 0.05,
+    }
 
 
 def _qoff_disjoint_metadata_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -377,6 +427,12 @@ def _write_water_reference_manifest(
     qoff_metadata: dict[str, Any] | None,
     water_decharged_prmtop: Path,
     official_126_frcmods: list[str],
+    system_start_coord: Path | None = None,
+    counterion_plan: CounterionPlan | None = None,
+    alchemical_atom_indices: list[int] | None = None,
+    counterion_mask: str | None = None,
+    qoff_counterion_mask: str | None = None,
+    neutrality_validation: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     required_paths = [
         entry_dir / "system.prmtop",
@@ -404,6 +460,13 @@ def _write_water_reference_manifest(
         "system_manifest": system_manifest,
         "prep_manifest_path": str(entry_dir / "prep" / "prep_manifest.json"),
         "prep_start_coord": str(entry_dir / "prep" / "outputs" / "04_eq.rst7"),
+        "system_start_coord": str(system_start_coord or (entry_dir / "system.inpcrd")),
+        "counterion_plan": None if counterion_plan is None else counterion_plan.to_dict(),
+        "alchemical_atom_indices": list(alchemical_atom_indices or [1]),
+        "alchemical_atom_mask": _atom_mask_from_indices(list(alchemical_atom_indices or [1])),
+        "counterion_mask": counterion_mask,
+        "qoff_counterion_mask": qoff_counterion_mask,
+        "neutrality_validation": neutrality_validation or {"status": "not_requested"},
         "ti_input_prmtop": str(ti_input_prmtop),
         "qoff_prmtop": str(qoff_prmtop),
         "qoff_disjoint_metadata": qoff_metadata,
@@ -573,7 +636,7 @@ def _prepare_multi_water_reference(
             water_model=config.water_reference.water_model,
             box_shape=config.water_reference.box_shape,
             buffer_angstrom=config.water_reference.buffer_angstrom,
-            salt=SaltConfig(),
+            salt=_water_reference_salt(config),
             custom_ion_frcmods=official_126_frcmods,
         )
         with activity_status(
@@ -589,12 +652,38 @@ def _prepare_multi_water_reference(
                 output_dir=cache_dir,
                 dry_run=dry_run,
             )
-        generate_water_reference_preparation_inputs(
-            inherited_settings=inherited_settings,
-            output_dir=cache_dir,
+    metal_atom_indices = list(range(1, len(selected_sites) + 1))
+    water_counterion_plan: CounterionPlan | None = None
+    water_source_prmtop = cache_dir / "system.prmtop"
+    water_start_coord = cache_dir / "system.inpcrd"
+    if config.ti.charge_compensation_mode == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS:
+        water_counterion_plan = prepare_charge_compensating_counterions(
+            source_prmtop=water_source_prmtop,
+            source_pdb=cache_dir / "system.pdb",
+            source_coord=water_start_coord,
+            metal_atom_indices=metal_atom_indices,
+            formal_charges=[formal_charges_by_site[item.site] for item in selected_sites],
+            output_dir=cache_dir / "counterion_prep",
+            water_model=config.water_reference.water_model,
+            ion_frcmods=official_126_frcmods,
+            amber_env=amber_env,
+            config=config.ti,
+            dry_run=dry_run,
         )
+        water_source_prmtop = Path(water_counterion_plan.topology_path)
+        water_start_coord = Path(water_counterion_plan.start_coord_path)
+    water_counterion_mask = None if water_counterion_plan is None else water_counterion_plan.counterion_mask
+    generate_water_reference_preparation_inputs(
+        inherited_settings=inherited_settings,
+        output_dir=cache_dir,
+        positional_restraint_mask=water_counterion_mask,
+        restraint_force_constant=config.ti.counterion_restraint_force_constant,
+    )
 
-    water_atom_indices = list(range(1, len(selected_sites) + 1))
+    water_atom_indices = [
+        *metal_atom_indices,
+        *([] if water_counterion_plan is None else water_counterion_plan.counterion_atom_indices),
+    ]
     water_atom_mask = _atom_mask_from_indices(water_atom_indices)
     elements_by_index = {index: selected.element for index, selected in enumerate(selected_sites, start=1)}
     charges_by_index = {
@@ -602,7 +691,7 @@ def _prepare_multi_water_reference(
         for index, selected in enumerate(selected_sites, start=1)
     }
     ti_input_topology = prepare_ti_input_topology(
-        input_prmtop=cache_dir / "system.prmtop",
+        input_prmtop=water_source_prmtop,
         output_dir=cache_dir,
         label="water_ref",
         implementation_mode=config.ti.implementation_mode,
@@ -624,6 +713,13 @@ def _prepare_multi_water_reference(
         dry_run=dry_run,
         preserve_c4=_uses_gti_1264(config),
     )
+    water_neutrality_validation = _neutrality_validation(
+        initial_prmtop=ti_input_topology["ti_prmtop"],
+        endpoint_prmtop=water_decharged["decharged_prmtop"],
+        enabled=config.ti.charge_compensation_mode
+        == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS,
+        dry_run=dry_run,
+    )
     water_qoff_topology: dict[str, Any] | None = None
     if _uses_split_qoff_disjoint_topology(config):
         water_qoff_topology = prepare_qoff_disjoint_topology(
@@ -633,6 +729,25 @@ def _prepare_multi_water_reference(
             alchemical_atom_index=water_atom_indices[0],
             alchemical_atom_indices=water_atom_indices,
             dry_run=dry_run,
+        )
+    water_qoff_counterion_mask = water_counterion_mask
+    if (
+        water_qoff_topology is not None
+        and water_counterion_plan is not None
+        and water_counterion_plan.counterion_atom_indices
+    ):
+        duplicate_map = _qoff_duplicate_map_from_metadata(water_qoff_topology)
+        water_qoff_counterion_mask = _atom_mask_from_indices(
+            sorted(
+                {
+                    *water_counterion_plan.counterion_atom_indices,
+                    *[
+                        duplicate_map[index]
+                        for index in water_counterion_plan.counterion_atom_indices
+                        if index in duplicate_map
+                    ],
+                }
+            )
         )
     generate_ti_inputs(
         config=config.ti,
@@ -644,6 +759,8 @@ def _prepare_multi_water_reference(
         qoff_timask1=None if water_qoff_topology is None else str(water_qoff_topology["qoff_timask1"]),
         qoff_timask2=None if water_qoff_topology is None else str(water_qoff_topology["qoff_timask2"]),
         qoff_charge_mask=None if water_qoff_topology is None else str(water_qoff_topology["qoff_crgmask"]),
+        positional_restraint_mask=water_counterion_mask,
+        qoff_positional_restraint_mask=water_qoff_counterion_mask,
     )
     required_paths = [
         cache_dir / "system.prmtop",
@@ -669,6 +786,13 @@ def _prepare_multi_water_reference(
         "system_manifest_path": str(cache_dir / "system_manifest.json"),
         "prep_manifest_path": str(cache_dir / "prep" / "prep_manifest.json"),
         "prep_start_coord": str(cache_dir / "prep" / "outputs" / "04_eq.rst7"),
+        "system_start_coord": str(water_start_coord),
+        "counterion_plan": None if water_counterion_plan is None else water_counterion_plan.to_dict(),
+        "alchemical_atom_indices": water_atom_indices,
+        "alchemical_atom_mask": water_atom_mask,
+        "counterion_mask": water_counterion_mask,
+        "qoff_counterion_mask": water_qoff_counterion_mask,
+        "neutrality_validation": water_neutrality_validation,
         "ti_input_prmtop": str(ti_input_topology["ti_prmtop"]),
         "qoff_prmtop": str(water_qoff_topology["qoff_prmtop"]) if water_qoff_topology else str(ti_input_topology["ti_prmtop"]),
         "qoff_disjoint_metadata": qoff_metadata,
@@ -734,7 +858,7 @@ def _prepare_water_reference(
             water_model=config.water_reference.water_model,
             box_shape=config.water_reference.box_shape,
             buffer_angstrom=config.water_reference.buffer_angstrom,
-            salt=SaltConfig(),
+            salt=_water_reference_salt(config),
             custom_ion_frcmods=official_126_frcmods,
         )
         with activity_status(
@@ -751,12 +875,39 @@ def _prepare_water_reference(
                 dry_run=dry_run,
             )
 
-        generate_water_reference_preparation_inputs(
-            inherited_settings=inherited_settings,
-            output_dir=cache_dir,
+    water_counterion_plan: CounterionPlan | None = None
+    water_source_prmtop = cache_dir / "system.prmtop"
+    water_start_coord = cache_dir / "system.inpcrd"
+    if config.ti.charge_compensation_mode == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS:
+        water_counterion_plan = prepare_charge_compensating_counterions(
+            source_prmtop=water_source_prmtop,
+            source_pdb=cache_dir / "system.pdb",
+            source_coord=water_start_coord,
+            metal_atom_indices=[1],
+            formal_charges=[formal_charge],
+            output_dir=cache_dir / "counterion_prep",
+            water_model=config.water_reference.water_model,
+            ion_frcmods=official_126_frcmods,
+            amber_env=amber_env,
+            config=config.ti,
+            dry_run=dry_run,
         )
+        water_source_prmtop = Path(water_counterion_plan.topology_path)
+        water_start_coord = Path(water_counterion_plan.start_coord_path)
+    water_counterion_mask = None if water_counterion_plan is None else water_counterion_plan.counterion_mask
+    water_atom_indices = [
+        1,
+        *([] if water_counterion_plan is None else water_counterion_plan.counterion_atom_indices),
+    ]
+    water_atom_mask = _atom_mask_from_indices(water_atom_indices)
+    generate_water_reference_preparation_inputs(
+        inherited_settings=inherited_settings,
+        output_dir=cache_dir,
+        positional_restraint_mask=water_counterion_mask,
+        restraint_force_constant=config.ti.counterion_restraint_force_constant,
+    )
     ti_input_topology = prepare_ti_input_topology(
-        input_prmtop=cache_dir / "system.prmtop",
+        input_prmtop=water_source_prmtop,
         output_dir=cache_dir,
         label="water_ref",
         implementation_mode=config.ti.implementation_mode,
@@ -766,14 +917,24 @@ def _prepare_water_reference(
         alchemical_atom_index=1,
         alchemical_element=metal_element,
         alchemical_charge=formal_charge,
+        alchemical_atom_indices=water_atom_indices,
+        alchemical_elements_by_index={1: metal_element},
+        alchemical_charges_by_index={1: formal_charge},
     )
     water_decharged = prepare_decharged_topology(
         input_prmtop=Path(str(ti_input_topology["ti_prmtop"])),
-        atom_mask="@1",
+        atom_mask=water_atom_mask,
         output_dir=cache_dir,
         label="water",
         dry_run=dry_run,
         preserve_c4=_uses_gti_1264(config),
+    )
+    water_neutrality_validation = _neutrality_validation(
+        initial_prmtop=ti_input_topology["ti_prmtop"],
+        endpoint_prmtop=water_decharged["decharged_prmtop"],
+        enabled=config.ti.charge_compensation_mode
+        == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS,
+        dry_run=dry_run,
     )
     water_qoff_topology: dict[str, Any] | None = None
     if _uses_split_qoff_disjoint_topology(config):
@@ -782,18 +943,40 @@ def _prepare_water_reference(
             output_dir=cache_dir,
             label="water",
             alchemical_atom_index=1,
+            alchemical_atom_indices=water_atom_indices,
             dry_run=dry_run,
+        )
+    water_qoff_counterion_mask = water_counterion_mask
+    if (
+        water_qoff_topology is not None
+        and water_counterion_plan is not None
+        and water_counterion_plan.counterion_atom_indices
+    ):
+        duplicate_map = _qoff_duplicate_map_from_metadata(water_qoff_topology)
+        water_qoff_counterion_mask = _atom_mask_from_indices(
+            sorted(
+                {
+                    *water_counterion_plan.counterion_atom_indices,
+                    *[
+                        duplicate_map[index]
+                        for index in water_counterion_plan.counterion_atom_indices
+                        if index in duplicate_map
+                    ],
+                }
+            )
         )
     generate_ti_inputs(
         config=config.ti,
         inherited_settings=inherited_settings,
-        atom_mask="@1",
+        atom_mask=water_atom_mask,
         restraint_file=None,
         output_dir=cache_dir,
         qoff_start_source="restart",
         qoff_timask1=None if water_qoff_topology is None else str(water_qoff_topology["qoff_timask1"]),
         qoff_timask2=None if water_qoff_topology is None else str(water_qoff_topology["qoff_timask2"]),
         qoff_charge_mask=None if water_qoff_topology is None else str(water_qoff_topology["qoff_crgmask"]),
+        positional_restraint_mask=water_counterion_mask,
+        qoff_positional_restraint_mask=water_qoff_counterion_mask,
     )
     manifest = _write_water_reference_manifest(
         entry_dir=cache_dir,
@@ -806,6 +989,12 @@ def _prepare_water_reference(
         qoff_metadata=water_qoff_topology,
         water_decharged_prmtop=Path(water_decharged["decharged_prmtop"]),
         official_126_frcmods=official_126_frcmods,
+        system_start_coord=water_start_coord,
+        counterion_plan=water_counterion_plan,
+        alchemical_atom_indices=water_atom_indices,
+        counterion_mask=water_counterion_mask,
+        qoff_counterion_mask=water_qoff_counterion_mask,
+        neutrality_validation=water_neutrality_validation,
     )
     return cache_dir, manifest, reused
 
@@ -1082,7 +1271,10 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
                 amber_env=amber_env,
                 formal_charges=list(formal_charges_by_site.values()),
             )
-            if config.water_reference.enabled
+            if (
+                config.water_reference.enabled
+                or config.ti.charge_compensation_mode == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS
+            )
             else []
         )
     else:
@@ -1188,7 +1380,34 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
     inherited_settings = parse_cntrl_settings(config.complex_input.production_mdin_path)
     bound_dir = root / "bound"
     bound_dir.mkdir(parents=True, exist_ok=True)
-    bound_prmtop = Path(_copy_if_present(config.complex_input.prmtop_path, bound_dir) or config.complex_input.prmtop_path)
+    bound_counterion_plan: CounterionPlan | None = None
+    bound_source_prmtop = Path(config.complex_input.prmtop_path)
+    bound_start_coord = copied_selected_rst7
+    all_alchemical_atom_indices = list(selected_atom_indices)
+    bound_counterion_mask: str | None = None
+    if config.ti.charge_compensation_mode == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS:
+        bound_counterion_plan = prepare_charge_compensating_counterions(
+            source_prmtop=bound_source_prmtop,
+            source_pdb=copied_selected_pdb,
+            source_coord=copied_selected_rst7,
+            metal_atom_indices=selected_atom_indices,
+            formal_charges=[formal_charges_by_site[item.site] for item in selected_sites],
+            output_dir=bound_dir / "counterion_prep",
+            water_model=config.water_reference.water_model,
+            ion_frcmods=ti_ion_frcmods,
+            amber_env=amber_env,
+            config=config.ti,
+            dry_run=dry_run,
+        )
+        bound_source_prmtop = Path(bound_counterion_plan.topology_path)
+        bound_start_coord = Path(bound_counterion_plan.start_coord_path)
+        bound_counterion_mask = bound_counterion_plan.counterion_mask
+        all_alchemical_atom_indices.extend(bound_counterion_plan.counterion_atom_indices)
+        all_alchemical_atom_indices = sorted(set(all_alchemical_atom_indices))
+        alchemical_atom_mask = _atom_mask_from_indices(all_alchemical_atom_indices)
+        if bound_counterion_plan.requires_preparation:
+            bound_start_source = "counterion_rebuild_cpu_prep"
+    bound_prmtop = Path(_copy_if_present(bound_source_prmtop, bound_dir) or bound_source_prmtop)
     bound_ti_topology = prepare_ti_input_topology(
         input_prmtop=bound_prmtop,
         output_dir=bound_dir,
@@ -1200,7 +1419,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         alchemical_atom_index=selected.atom_index,
         alchemical_element=selected.element,
         alchemical_charge=formal_charge,
-        alchemical_atom_indices=selected_atom_indices,
+        alchemical_atom_indices=all_alchemical_atom_indices,
         alchemical_elements_by_index={item.atom_index: item.element for item in selected_sites},
         alchemical_charges_by_index={item.atom_index: formal_charges_by_site[item.site] for item in selected_sites},
     )
@@ -1260,6 +1479,13 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         dry_run=dry_run,
         preserve_c4=_uses_gti_1264(config),
     )
+    bound_neutrality_validation = _neutrality_validation(
+        initial_prmtop=bound_ti_topology["ti_prmtop"],
+        endpoint_prmtop=bound_decharged["decharged_prmtop"],
+        enabled=config.ti.charge_compensation_mode
+        == TIChargeCompensationMode.CO_ALCHEMICAL_COUNTERIONS,
+        dry_run=dry_run,
+    )
     bound_qoff_topology: dict[str, Any] | None = None
     bound_qoff_restraint_file: str | None = None
     if _uses_split_qoff_disjoint_topology(config):
@@ -1268,7 +1494,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             output_dir=bound_dir,
             label="bound",
             alchemical_atom_index=selected.atom_index,
-            alchemical_atom_indices=selected_atom_indices,
+            alchemical_atom_indices=all_alchemical_atom_indices,
             dry_run=dry_run,
         )
         if multi_site and restraint_setups:
@@ -1289,18 +1515,45 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
                 ),
                 from_dir=bound_dir,
             )
+    bound_qoff_counterion_mask = bound_counterion_mask
+    if (
+        bound_qoff_topology is not None
+        and bound_counterion_plan is not None
+        and bound_counterion_plan.counterion_atom_indices
+    ):
+        duplicate_map = _qoff_duplicate_map_from_metadata(bound_qoff_topology)
+        qoff_counterion_indices = [
+            *bound_counterion_plan.counterion_atom_indices,
+            *[
+                duplicate_map[index]
+                for index in bound_counterion_plan.counterion_atom_indices
+                if index in duplicate_map
+            ],
+        ]
+        bound_qoff_counterion_mask = _atom_mask_from_indices(sorted(set(qoff_counterion_indices)))
     bound_restraint_path = (
         None
         if combined_restraint_file is None
         else Path(_relative_path(combined_restraint_file, from_dir=bound_dir)).as_posix()
     )
     bound_start_prep_stages = None
-    if production_restart_path is None:
+    if production_restart_path is None or (
+        bound_counterion_plan is not None and bound_counterion_plan.requires_preparation
+    ):
+        bound_prep_config = config.ti
+        if bound_counterion_plan is not None and bound_counterion_plan.requires_preparation:
+            bound_prep_config = config.ti.model_copy(
+                update={
+                    "bound_start_min_cycles": config.ti.counterion_prep_min_cycles,
+                    "bound_start_eq_ns": config.ti.counterion_prep_eq_ns,
+                }
+            )
         bound_start_prep_stages = generate_bound_start_preparation_inputs(
-            config=config.ti,
+            config=bound_prep_config,
             inherited_settings=inherited_settings,
             restraint_file=bound_restraint_path,
             output_dir=bound_dir,
+            positional_restraint_mask=bound_counterion_mask,
         )
     bound_windows = generate_ti_inputs(
         config=config.ti,
@@ -1313,6 +1566,8 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         qoff_timask2=None if bound_qoff_topology is None else str(bound_qoff_topology["qoff_timask2"]),
         qoff_charge_mask=None if bound_qoff_topology is None else str(bound_qoff_topology["qoff_crgmask"]),
         qoff_restraint_file=None if bound_qoff_restraint_file is None else Path(bound_qoff_restraint_file).as_posix(),
+        positional_restraint_mask=bound_counterion_mask,
+        qoff_positional_restraint_mask=bound_qoff_counterion_mask,
     )
     bound_endpoint_prep_stages = None
     if not _uses_combined_gti_decoupling(config):
@@ -1321,6 +1576,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             inherited_settings=inherited_settings,
             restraint_file=bound_restraint_path,
             output_dir=bound_dir,
+            positional_restraint_mask=bound_counterion_mask,
         )
 
     water_dir: Path | None = None
@@ -1348,7 +1604,14 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
     elif config.water_reference.reuse_from_library:
         water_term_source = "library"
         water_library_key = config.water_reference.library_key
-        water_library_snapshot = ti_abfe.get_water_library_entry_by_key(water_library_key or "")
+        water_library_snapshot = ti_abfe.get_water_library_entry_by_key(
+            water_library_key or "",
+            sampling_selection=(
+                ti_abfe.SAMPLING_SELECTION_FORWARD_REVERSE
+                if config.ti.sampling_mode == TISamplingMode.BIDIRECTIONAL
+                else ti_abfe.SAMPLING_SELECTION_FORWARD_ONLY
+            ),
+        )
         if water_library_snapshot is None:
             raise ValueError(
                 "The selected water-reference library entry could not be found. "
@@ -1381,9 +1644,17 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
                     dry_run=dry_run,
                 )
         water_decharged_topology = water_dir / "water_decharged.prmtop"
+        water_counterion_mask = water_manifest.get("counterion_mask")
+        water_qoff_counterion_mask = water_manifest.get("qoff_counterion_mask")
+        water_alchemical_atom_mask = str(
+            water_manifest.get("alchemical_atom_mask")
+            or (_atom_mask_from_indices(list(range(1, len(selected_sites) + 1))) if multi_site else "@1")
+        )
         water_prep_stages = generate_water_reference_preparation_inputs(
             inherited_settings=inherited_settings,
             output_dir=water_dir,
+            positional_restraint_mask=None if water_counterion_mask is None else str(water_counterion_mask),
+            restraint_force_constant=config.ti.counterion_restraint_force_constant,
         )
         water_qoff_metadata = (
             None if _uses_combined_gti_decoupling(config) else _qoff_disjoint_metadata_from_manifest(water_manifest)
@@ -1391,7 +1662,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         water_windows = generate_ti_inputs(
             config=config.ti,
             inherited_settings=inherited_settings,
-            atom_mask=_atom_mask_from_indices(list(range(1, len(selected_sites) + 1))) if multi_site else "@1",
+            atom_mask=water_alchemical_atom_mask,
             restraint_file=None,
             output_dir=water_dir,
             qoff_start_source="restart",
@@ -1404,6 +1675,10 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             qoff_charge_mask=None
             if water_qoff_metadata is None
             else str(water_qoff_metadata["qoff_crgmask"]),
+            positional_restraint_mask=None if water_counterion_mask is None else str(water_counterion_mask),
+            qoff_positional_restraint_mask=None
+            if water_qoff_counterion_mask is None
+            else str(water_qoff_counterion_mask),
         )
         if not _uses_combined_gti_decoupling(config):
             water_endpoint_prep_stages = generate_qoff_endpoint_preparation_inputs(
@@ -1411,6 +1686,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
                 inherited_settings=inherited_settings,
                 restraint_file=None,
                 output_dir=water_dir,
+                positional_restraint_mask=None if water_counterion_mask is None else str(water_counterion_mask),
             )
 
     slurm_dir = root / "slurm"
@@ -1431,7 +1707,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         runtime_output_root=str(bound_runtime_output_dir.resolve()),
         prep_stages=bound_start_prep_stages,
         prep_prmtop=None if bound_start_prep_stages is None else str(Path(str(bound_ti_topology["ti_prmtop"])).resolve()),
-        prep_start_coord=None if bound_start_prep_stages is None else str(copied_selected_rst7.resolve()),
+        prep_start_coord=None if bound_start_prep_stages is None else str(bound_start_coord.resolve()),
         endpoint_prep_stages=bound_endpoint_prep_stages,
         endpoint_prep_prmtop=str(Path(bound_decharged["decharged_prmtop"]).resolve()),
         windows=bound_windows,
@@ -1440,8 +1716,9 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             Path(str(bound_qoff_topology["qoff_prmtop"] if bound_qoff_topology else bound_ti_topology["ti_prmtop"])).resolve()
         ),
         vdw_prmtop=str(Path(bound_decharged["decharged_prmtop"]).resolve()),
-        start_coord=str(copied_selected_rst7.resolve()),
+        start_coord=str(bound_start_coord.resolve()),
         qoff_coordinate_bridge=bound_qoff_bridge,
+        ti_config=config.ti,
         output_dir=slurm_dir,
     )
     if water_dir is not None and water_manifest is not None and water_decharged_topology is not None and water_windows is not None:
@@ -1463,7 +1740,9 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             runtime_output_root=str(water_runtime_output_dir.resolve()),
             prep_stages=water_prep_stages,
             prep_prmtop=str(Path(str(water_manifest["ti_input_prmtop"])).resolve()),
-            prep_start_coord=str((water_dir / "system.inpcrd").resolve()),
+            prep_start_coord=str(
+                Path(str(water_manifest.get("system_start_coord") or (water_dir / "system.inpcrd"))).resolve()
+            ),
             endpoint_prep_stages=water_endpoint_prep_stages,
             endpoint_prep_prmtop=str(water_decharged_topology.resolve()),
             windows=water_windows,
@@ -1472,6 +1751,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             vdw_prmtop=str(water_decharged_topology.resolve()),
             start_coord=str(Path(water_manifest["prep_start_coord"]).resolve()),
             qoff_coordinate_bridge=water_qoff_bridge,
+            ti_config=config.ti,
             output_dir=water_slurm_dir,
         )
 
@@ -1482,6 +1762,21 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         "ti_selection_mode": config.metal.selection_mode.value,
         "ti_implementation_mode": config.ti.implementation_mode.value,
         "ti_decoupling_mode": config.ti.decoupling_mode.value,
+        "ti_sampling_mode": config.ti.sampling_mode.value,
+        "ti_sampling_protocol": {
+            "replicas": 1,
+            "window_equilibration_ns": config.ti.window_equilibration_ns
+            if config.ti.sampling_mode == TISamplingMode.BIDIRECTIONAL
+            else 0.0,
+            "directions": ["forward", "reverse"]
+            if config.ti.sampling_mode == TISamplingMode.BIDIRECTIONAL
+            else ["forward"],
+        },
+        "charge_compensation_mode": config.ti.charge_compensation_mode.value,
+        "bound_counterion_plan": None
+        if bound_counterion_plan is None
+        else bound_counterion_plan.to_dict(),
+        "bound_neutrality_validation": bound_neutrality_validation,
         "selected_site": selected.to_dict(),
         "selected_sites": [item.to_dict() for item in selected_sites],
         "selected_formal_charge": formal_charge,
@@ -1520,13 +1815,13 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         "bound_decharged_topology": bound_decharged["decharged_prmtop"],
         "water_decharged_topology": None if water_decharged_topology is None else str(water_decharged_topology),
         "bound_start_source": bound_start_source,
-        "bound_start_restart": str(copied_selected_rst7),
+        "bound_start_restart": str(bound_start_coord),
         "bound_production_restart_source": None if production_restart_path is None else str(production_restart_path),
         "bound_start_preparation": None
         if bound_start_prep_stages is None
         else {
             "prep_prmtop": str(Path(str(bound_ti_topology["ti_prmtop"])).resolve()),
-            "prep_start_coord": str(copied_selected_rst7.resolve()),
+            "prep_start_coord": str(bound_start_coord.resolve()),
             "prep_manifest": str(bound_dir / "bound_start_prep" / "prep_manifest.json"),
             "stages": [stage.to_dict() for stage in bound_start_prep_stages],
         },

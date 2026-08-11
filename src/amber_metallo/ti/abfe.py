@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 from amber_metallo.reporting import console, write_json
+from amber_metallo.subdirectory_search import search_subdirectories_enabled
 
 try:
     from rich import box
@@ -24,6 +25,9 @@ CASE_TYPE_WATER = "water"
 SOURCE_KIND_SIMULATION = "simulation"
 SOURCE_KIND_LIBRARY = "library"
 METHOD_TI = "ti"
+SAMPLING_SELECTION_FORWARD_REVERSE = "forward_reverse"
+SAMPLING_SELECTION_FORWARD_ONLY = "forward_only"
+SAMPLING_SELECTION_LEGACY_UNSPECIFIED = "legacy_unspecified"
 DECOUPLING_SCHEME_COMBINED = "Combined"
 DECOUPLING_SCHEME_SPLIT = "Split"
 DECOUPLING_SCHEME_MIXED = "Mixed"
@@ -77,6 +81,19 @@ class TIWindowExpectation:
     input_path: Path
     output_path: Path
     title: str
+    replica: int = 1
+    direction: str = "forward"
+    run_id: str = "legacy"
+    substitute_output_path: Path | None = None
+    substitution_reason: str | None = None
+
+    @property
+    def analysis_output_path(self) -> Path:
+        return self.substitute_output_path or self.output_path
+
+    @property
+    def endpoint_substituted(self) -> bool:
+        return self.substitute_output_path is not None
 
 
 def _decoupling_scheme_from_phase_counts(*, qoff_count: int, vdwoff_count: int) -> str:
@@ -119,6 +136,78 @@ def decoupling_scheme_for_case(case: AnalysisCaseDiscovery) -> str:
     return scheme or DECOUPLING_SCHEME_UNKNOWN
 
 
+def case_has_bidirectional_sampling(case: AnalysisCaseDiscovery) -> bool:
+    protocol = case.metadata.get("ti_sampling_protocol") or {}
+    mode = str(protocol.get("mode") or "").strip().lower()
+    directions = {str(item).strip().lower() for item in (protocol.get("directions") or [])}
+    return mode in {"bidirectional", "replicated_bidirectional"} or "reverse" in directions
+
+
+def _normalize_sampling_selection(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {SAMPLING_SELECTION_FORWARD_REVERSE, SAMPLING_SELECTION_FORWARD_ONLY}:
+        raise ValueError(
+            "sampling_selection must be 'forward_reverse' or 'forward_only'."
+        )
+    return normalized
+
+
+def _charge_compensation_mode(case: AnalysisCaseDiscovery) -> str:
+    value = str(case.metadata.get("charge_compensation_mode") or "unknown").strip().lower()
+    return value or "unknown"
+
+
+def rbfe_pair_compatibility(
+    bound_case: AnalysisCaseDiscovery,
+    water_case: AnalysisCaseDiscovery,
+) -> tuple[list[str], list[str]]:
+    """Return blocking errors and non-blocking warnings for an RBFE leg pair."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    bound_charge_mode = _charge_compensation_mode(bound_case)
+    water_charge_mode = _charge_compensation_mode(water_case)
+    known_charge_modes = {bound_charge_mode, water_charge_mode} - {"unknown", ""}
+    if len(known_charge_modes) > 1:
+        errors.append(
+            "Bound and water legs use different charge-compensation modes "
+            f"({bound_charge_mode} vs {water_charge_mode}). Use a water reference generated with the same TI protocol."
+        )
+
+    bound_scheme = decoupling_scheme_for_case(bound_case)
+    water_scheme = decoupling_scheme_for_case(water_case)
+    if (
+        bound_scheme not in {DECOUPLING_SCHEME_UNKNOWN, DECOUPLING_SCHEME_MIXED}
+        and water_scheme not in {DECOUPLING_SCHEME_UNKNOWN, DECOUPLING_SCHEME_MIXED}
+        and bound_scheme != water_scheme
+    ):
+        errors.append(
+            "Bound and water legs use different TI decoupling schemes "
+            f"({bound_scheme} vs {water_scheme}). Select a matching water reference."
+        )
+
+    if bound_charge_mode == "co_alchemical_counterions":
+        for label, case in (("Bound", bound_case), ("Water", water_case)):
+            validation = case.metadata.get("neutrality_validation") or {}
+            status = str(validation.get("status") or "missing").strip().lower()
+            if status not in {"passed", "missing"}:
+                errors.append(f"{label} charge-neutrality validation status is '{status}', not 'passed'.")
+            elif status == "missing":
+                warnings.append(
+                    f"{label} case has no recorded charge-neutrality validation; inspect its manifest before trusting ddG."
+                )
+
+    if case_has_bidirectional_sampling(bound_case) != case_has_bidirectional_sampling(water_case):
+        warnings.append(
+            "Only one RBFE leg has reverse-sweep data; the two legs therefore use different sampling depth."
+        )
+
+    bound_schedule = bound_case.metadata.get("ti_lambda_schedule") or {}
+    water_schedule = water_case.metadata.get("ti_lambda_schedule") or {}
+    if bound_schedule and water_schedule and bound_schedule != water_schedule:
+        warnings.append("Bound and water legs use different lambda schedules; verify that this was intentional.")
+    return errors, warnings
+
+
 @dataclass(slots=True)
 class AnalysisWindowResult:
     phase: str
@@ -134,6 +223,11 @@ class AnalysisWindowResult:
     parser_mode: str
     quality: Literal["ok", "warning"]
     warning: str | None = None
+    replica: int = 1
+    direction: str = "forward"
+    run_id: str = "legacy"
+    expected_mdout_path: Path | None = None
+    endpoint_substituted: bool = False
     bootstrap_pool: list[float] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -151,6 +245,11 @@ class AnalysisWindowResult:
             "parser_mode": self.parser_mode,
             "quality": self.quality,
             "warning": self.warning,
+            "replica": self.replica,
+            "direction": self.direction,
+            "run_id": self.run_id,
+            "expected_mdout_path": None if self.expected_mdout_path is None else str(self.expected_mdout_path),
+            "endpoint_substituted": self.endpoint_substituted,
         }
 
 
@@ -164,6 +263,8 @@ class PhaseAnalysis:
     bootstrap_samples: list[float] = field(default_factory=list, repr=False)
     quality: Literal["ok", "warning"] = "ok"
     warnings: list[str] = field(default_factory=list)
+    sampling_runs: list[dict[str, Any]] = field(default_factory=list)
+    forward_reverse_difference_kcal_mol: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,6 +274,8 @@ class PhaseAnalysis:
             "bootstrap_ci95": self.bootstrap_ci95.to_dict(),
             "quality": self.quality,
             "warnings": self.warnings,
+            "sampling_runs": self.sampling_runs,
+            "forward_reverse_difference_kcal_mol": self.forward_reverse_difference_kcal_mol,
             "windows": [window.to_dict() for window in self.windows],
         }
 
@@ -186,6 +289,7 @@ class SingleCaseAnalysisResult:
     propagated_sem_kcal_mol: float
     bootstrap_ci95: ConfidenceInterval
     output_dir: Path
+    sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY
     restraint_correction_kcal_mol: float | None = None
     corrected_delta_g_kcal_mol: float | None = None
     corrected_propagated_sem_kcal_mol: float | None = None
@@ -204,6 +308,7 @@ class SingleCaseAnalysisResult:
             "delta_g_kcal_mol": self.delta_g_kcal_mol,
             "propagated_sem_kcal_mol": self.propagated_sem_kcal_mol,
             "bootstrap_ci95": self.bootstrap_ci95.to_dict(),
+            "sampling_selection": self.sampling_selection,
             "restraint_correction_kcal_mol": self.restraint_correction_kcal_mol,
             "corrected_delta_g_kcal_mol": self.corrected_delta_g_kcal_mol,
             "corrected_propagated_sem_kcal_mol": self.corrected_propagated_sem_kcal_mol,
@@ -224,6 +329,7 @@ class RBFEAnalysisResult:
     propagated_sem_kcal_mol: float
     bootstrap_ci95: ConfidenceInterval
     output_dir: Path
+    sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY
     quality: Literal["ok", "warning"] = "ok"
     warnings: list[str] = field(default_factory=list)
     bootstrap_samples: list[float] = field(default_factory=list, repr=False)
@@ -235,6 +341,7 @@ class RBFEAnalysisResult:
             "ddg_kcal_mol": self.ddg_kcal_mol,
             "propagated_sem_kcal_mol": self.propagated_sem_kcal_mol,
             "bootstrap_ci95": self.bootstrap_ci95.to_dict(),
+            "sampling_selection": self.sampling_selection,
             "quality": self.quality,
             "warnings": self.warnings,
             "output_dir": str(self.output_dir),
@@ -253,10 +360,18 @@ def decoupling_scheme_for_result(result: SingleCaseAnalysisResult) -> str:
 
 def _decoupling_scheme_detail(scheme: str) -> str:
     if scheme == DECOUPLING_SCHEME_COMBINED:
-        return "Combined (qoff-only softcore)"
+        return "Combined (single softcore path)"
     if scheme == DECOUPLING_SCHEME_SPLIT:
         return "Split (qoff + vdwoff)"
     return scheme
+
+
+def _sampling_selection_detail(selection: str) -> str:
+    if selection == SAMPLING_SELECTION_FORWARD_ONLY:
+        return "Forward only (default)"
+    if selection == SAMPLING_SELECTION_LEGACY_UNSPECIFIED:
+        return "Legacy library value (direction metadata unavailable)"
+    return "Forward + Reverse (optional convergence diagnostic)"
 
 
 def repo_root() -> Path:
@@ -385,6 +500,15 @@ def _format_mean_sem(value: float | None, sem: float | None) -> str:
     return f"{value:.6f} +/- {sem:.6f}"
 
 
+def _case_max_hysteresis(result: SingleCaseAnalysisResult) -> float | None:
+    values = [
+        phase.forward_reverse_difference_kcal_mol
+        for phase in (result.qoff, result.vdwoff)
+        if phase.forward_reverse_difference_kcal_mol is not None
+    ]
+    return max(values) if values else None
+
+
 def _trapezoid_weights(lambdas: list[float]) -> list[float]:
     if not lambdas:
         return []
@@ -482,25 +606,121 @@ def _window_statistics(parse: ParsedDVDL) -> tuple[float, float, float, str, int
 def _load_expected_windows(ti_manifest_path: Path, output_root: Path) -> list[TIWindowExpectation]:
     payload = _load_json(ti_manifest_path)
     windows = payload.get("windows") or []
+    flat_combined_layout = payload.get("output_layout") == "combined_flat"
     expectations: list[TIWindowExpectation] = []
-    for item in windows:
-        if not isinstance(item, dict):
+    runs = payload.get("runs") or []
+    sampling = payload.get("sampling_protocol") or {}
+    if str(sampling.get("mode") or "single_pass") == "single_pass":
+        runs = []
+    resolved_runs = runs or [{"replica": 1, "direction": "forward", "run_id": "legacy", "output_root": ""}]
+    for run in resolved_runs:
+        if not isinstance(run, dict):
             continue
-        input_path = Path(str(item.get("filename", "")))
-        phase = str(item.get("phase") or "").strip()
-        if not phase or not input_path.name:
-            continue
-        output_path = output_root / phase / f"{input_path.stem}.out"
-        expectations.append(
-            TIWindowExpectation(
-                phase=phase,
-                clambda=float(item.get("clambda", 0.0)),
-                input_path=input_path,
-                output_path=output_path,
-                title=str(item.get("title") or input_path.stem),
+        run_output_root = Path(str(run.get("output_root") or ""))
+        replica = int(run.get("replica") or 1)
+        direction = str(run.get("direction") or "forward")
+        run_id = str(run.get("run_id") or f"replica_{replica:02d}/{direction}")
+        for item in windows:
+            if not isinstance(item, dict):
+                continue
+            input_path = Path(str(item.get("filename", "")))
+            phase = str(item.get("phase") or "").strip()
+            if not phase or not input_path.name:
+                continue
+            run_root = output_root / run_output_root
+            output_path = (
+                run_root / f"{input_path.stem}.out"
+                if flat_combined_layout
+                else run_root / phase / f"{input_path.stem}.out"
             )
-        )
+            expectations.append(
+                TIWindowExpectation(
+                    phase=phase,
+                    clambda=float(item.get("clambda", 0.0)),
+                    input_path=input_path,
+                    output_path=output_path,
+                    title=str(item.get("title") or input_path.stem),
+                    replica=replica,
+                    direction=direction,
+                    run_id=run_id,
+                )
+            )
+    _configure_bidirectional_endpoint_substitution(
+        expectations,
+        sampling_mode=str(sampling.get("mode") or "single_pass"),
+    )
     return expectations
+
+
+def _lambda_schedule_payload(expectations: list[TIWindowExpectation]) -> dict[str, list[float]]:
+    return {
+        phase: sorted({item.clambda for item in expectations if item.phase == phase})
+        for phase in ("qoff", "vdwoff")
+    }
+
+
+def _has_complete_final_average(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        return parse_mdout_dvdl(path).parser_mode == "final_average_block"
+    except (OSError, ValueError):
+        return False
+
+
+def _configure_bidirectional_endpoint_substitution(
+    expectations: list[TIWindowExpectation],
+    *,
+    sampling_mode: str,
+) -> None:
+    if sampling_mode not in {"bidirectional", "replicated_bidirectional"}:
+        return
+    grouped: dict[tuple[str, int], list[TIWindowExpectation]] = {}
+    for expectation in expectations:
+        grouped.setdefault((expectation.phase, expectation.replica), []).append(expectation)
+    for group in grouped.values():
+        reverse_zero = [
+            item
+            for item in group
+            if item.direction == "reverse" and math.isclose(item.clambda, 0.0, abs_tol=1.0e-12)
+        ]
+        if len(reverse_zero) != 1:
+            continue
+        target = reverse_zero[0]
+        if _has_complete_final_average(target.output_path):
+            continue
+        # This fallback is intentionally narrow: every other production window
+        # must exist, and only the terminal reverse lambda=0 result may fail.
+        if any(not item.output_path.exists() for item in group if item is not target):
+            continue
+        forward_zero = [
+            item
+            for item in group
+            if item.direction == "forward" and math.isclose(item.clambda, 0.0, abs_tol=1.0e-12)
+        ]
+        if len(forward_zero) != 1 or not _has_complete_final_average(forward_zero[0].output_path):
+            continue
+        target.substitute_output_path = forward_zero[0].output_path
+        target.substitution_reason = (
+            "Reverse lambda=0 production output is missing or incomplete; "
+            "the completed forward lambda=0 DV/DL was substituted at the identical Hamiltonian endpoint."
+        )
+
+
+def _endpoint_substitution_payload(expectations: list[TIWindowExpectation]) -> list[dict[str, Any]]:
+    return [
+        {
+            "phase": item.phase,
+            "replica": item.replica,
+            "direction": item.direction,
+            "lambda": item.clambda,
+            "expected_output_path": str(item.output_path),
+            "substitute_output_path": str(item.analysis_output_path),
+            "reason": item.substitution_reason,
+        }
+        for item in expectations
+        if item.endpoint_substituted
+    ]
 
 
 def _summarize_completion(expectations: list[TIWindowExpectation]) -> tuple[str, bool]:
@@ -509,14 +729,25 @@ def _summarize_completion(expectations: list[TIWindowExpectation]) -> tuple[str,
     for phase in ("qoff", "vdwoff"):
         phase_windows = [item for item in expectations if item.phase == phase]
         expected = len(phase_windows)
-        present = sum(1 for item in phase_windows if item.output_path.exists())
+        present = sum(1 for item in phase_windows if item.output_path.exists() or item.endpoint_substituted)
         phase_counts[phase] = (present, expected)
         if present != expected:
             complete = False
     summary = ", ".join(
         f"{phase} {phase_counts[phase][0]}/{phase_counts[phase][1]}" for phase in ("qoff", "vdwoff")
     )
+    substitution_count = sum(1 for item in expectations if item.endpoint_substituted)
+    if substitution_count:
+        summary += f" ({substitution_count} reverse endpoint substituted)"
     return summary, complete
+
+
+def _readiness_note(expectations: list[TIWindowExpectation], *, complete: bool) -> str:
+    if not complete:
+        return "Incomplete TI outputs"
+    if any(item.endpoint_substituted for item in expectations):
+        return "Ready with approximation: reverse lambda=0 uses the completed forward endpoint"
+    return "Ready"
 
 
 def _bootstrap_integral(
@@ -533,10 +764,46 @@ def _bootstrap_integral(
     for _ in range(iterations):
         dvdl_points: list[tuple[float, float]] = []
         for window in ordered:
-            pool = window.bootstrap_pool or [window.delta_g_source_value]
-            picked = [pool[rng.randrange(len(pool))] for _ in range(len(pool))]
-            dvdl_points.append((window.clambda, _safe_mean(picked)))
+            dvdl_points.append((window.clambda, _resampled_window_mean(window, rng)))
         samples.append(integrate_trapezoid(dvdl_points))
+    return samples
+
+
+def _resampled_window_mean(window: AnalysisWindowResult, rng: random.Random) -> float:
+    pool = window.bootstrap_pool or [window.delta_g_source_value]
+    picked = [pool[rng.randrange(len(pool))] for _ in range(len(pool))]
+    # The Amber final-average DV/DL is the point estimate used for integration.
+    # Recenter block resamples on that same value so the CI and point estimate
+    # cannot silently describe different estimators.
+    return _safe_mean(picked) + window.delta_g_source_value - _safe_mean(pool)
+
+
+def _bootstrap_grouped_mean(
+    grouped: dict[str, list[AnalysisWindowResult]],
+    *,
+    seed_label: str,
+    iterations: int = _DEFAULT_BOOTSTRAP_ITERATIONS,
+) -> list[float]:
+    if not grouped:
+        return []
+    rng = random.Random(_stable_seed(seed_label))
+    samples: list[float] = []
+    for _ in range(iterations):
+        shared_window_means: dict[str, float] = {}
+        run_integrals: list[float] = []
+        for run_windows in grouped.values():
+            points: list[tuple[float, float]] = []
+            for window in sorted(run_windows, key=lambda item: item.clambda):
+                source_key = str(window.mdout_path.resolve())
+                if source_key not in shared_window_means:
+                    shared_window_means[source_key] = _resampled_window_mean(window, rng)
+                points.append((window.clambda, shared_window_means[source_key]))
+            run_integrals.append(integrate_trapezoid(points))
+        # Resample complete sweeps as well as the within-window block means.
+        # Without this second level, a forward/reverse disagreement contributes
+        # to the reported SEM but is completely absent from the bootstrap CI.
+        picked_runs = [run_integrals[rng.randrange(len(run_integrals))] for _ in range(len(run_integrals))]
+        samples.append(_safe_mean(picked_runs))
     return samples
 
 
@@ -579,21 +846,23 @@ def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed
     warnings: list[str] = []
     quality: Literal["ok", "warning"] = "ok"
     for expectation in phase_windows:
-        parsed = parse_mdout_dvdl(expectation.output_path)
+        analysis_output_path = expectation.analysis_output_path
+        parsed = parse_mdout_dvdl(analysis_output_path)
         sample_mean, sample_std, sem, sem_mode, sample_count, block_count, bootstrap_pool = _window_statistics(parsed)
-        warning = parsed.warning
+        warning_parts = [item for item in (expectation.substitution_reason, parsed.warning) if item]
+        warning = " ".join(warning_parts) or None
         window_quality: Literal["ok", "warning"] = "ok"
-        if parsed.parser_mode != "final_average_block" or sem_mode != "block_average":
+        if expectation.endpoint_substituted or parsed.parser_mode != "final_average_block" or sem_mode != "block_average":
             window_quality = "warning"
         if warning:
-            warnings.append(f"{expectation.output_path.name}: {warning}")
+            warnings.append(f"{expectation.output_path}: {warning}")
         if window_quality == "warning":
             quality = "warning"
         parsed_windows.append(
             AnalysisWindowResult(
                 phase=phase,
                 clambda=expectation.clambda,
-                mdout_path=expectation.output_path,
+                mdout_path=analysis_output_path,
                 delta_g_source_value=parsed.value,
                 sample_mean_dvdl=sample_mean,
                 sample_std_dvdl=sample_std,
@@ -605,7 +874,74 @@ def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed
                 quality=window_quality,
                 warning=warning,
                 bootstrap_pool=bootstrap_pool,
+                replica=expectation.replica,
+                direction=expectation.direction,
+                run_id=expectation.run_id,
+                expected_mdout_path=expectation.output_path if expectation.endpoint_substituted else None,
+                endpoint_substituted=expectation.endpoint_substituted,
             )
+        )
+    grouped: dict[str, list[AnalysisWindowResult]] = {}
+    for window in parsed_windows:
+        grouped.setdefault(window.run_id, []).append(window)
+    if len(grouped) > 1:
+        run_summaries: list[dict[str, Any]] = []
+        for run_id, run_windows in grouped.items():
+            ordered = sorted(run_windows, key=lambda item: item.clambda)
+            value = integrate_trapezoid((item.clambda, item.delta_g_source_value) for item in ordered)
+            weights = _trapezoid_weights([item.clambda for item in ordered])
+            within_sem = math.sqrt(
+                math.fsum((weight * item.sem_dvdl) ** 2 for weight, item in zip(weights, ordered))
+            )
+            run_summaries.append(
+                {
+                    "run_id": run_id,
+                    "replica": ordered[0].replica,
+                    "direction": ordered[0].direction,
+                    "delta_g_kcal_mol": value,
+                    "within_run_sem_kcal_mol": within_sem,
+                    "approximate": any(item.endpoint_substituted for item in ordered),
+                    "substituted_windows": sum(1 for item in ordered if item.endpoint_substituted),
+                }
+            )
+        run_values = [float(item["delta_g_kcal_mol"]) for item in run_summaries]
+        delta_g = _safe_mean(run_values)
+        between_run_sem = _sample_sem(run_values)
+        source_coefficients: dict[str, tuple[float, float]] = {}
+        run_count = len(grouped)
+        for run_windows in grouped.values():
+            ordered = sorted(run_windows, key=lambda item: item.clambda)
+            for weight, window in zip(_trapezoid_weights([item.clambda for item in ordered]), ordered):
+                source_key = str(window.mdout_path.resolve())
+                previous_coefficient, previous_sem = source_coefficients.get(source_key, (0.0, window.sem_dvdl))
+                source_coefficients[source_key] = (
+                    previous_coefficient + (weight / run_count),
+                    max(previous_sem, window.sem_dvdl),
+                )
+        within_run_sem = math.sqrt(
+            math.fsum((coefficient * sem) ** 2 for coefficient, sem in source_coefficients.values())
+        )
+        propagated_sem = math.sqrt(between_run_sem**2 + within_run_sem**2)
+        bootstrap_samples = _bootstrap_grouped_mean(grouped, seed_label=f"{seed_label}:grouped")
+        forward = [float(item["delta_g_kcal_mol"]) for item in run_summaries if item["direction"] == "forward"]
+        reverse = [float(item["delta_g_kcal_mol"]) for item in run_summaries if item["direction"] == "reverse"]
+        hysteresis = abs(_safe_mean(forward) - _safe_mean(reverse)) if forward and reverse else None
+        if hysteresis is not None and hysteresis > max(1.0, 2.0 * within_run_sem):
+            quality = "warning"
+            warnings.append(
+                f"Forward/reverse hysteresis is {hysteresis:.3f} kcal/mol, larger than the convergence threshold."
+            )
+        return PhaseAnalysis(
+            phase=phase,
+            delta_g_kcal_mol=delta_g,
+            propagated_sem_kcal_mol=propagated_sem,
+            bootstrap_ci95=_confidence_interval(bootstrap_samples or [delta_g]),
+            windows=parsed_windows,
+            bootstrap_samples=bootstrap_samples,
+            quality=quality,
+            warnings=warnings,
+            sampling_runs=run_summaries,
+            forward_reverse_difference_kcal_mol=hysteresis,
         )
     lambdas = [item.clambda for item in parsed_windows]
     weights = _trapezoid_weights(lambdas)
@@ -636,6 +972,8 @@ def inspect_water_case(path: str | Path) -> AnalysisCaseDiscovery | None:
     if not ti_manifest_path.exists():
         return None
     expectations = _load_expected_windows(ti_manifest_path, root / "output")
+    ti_manifest = _load_json(ti_manifest_path)
+    sampling_protocol = ti_manifest.get("sampling_protocol") or {"mode": "single_pass"}
     completion_summary, complete = _summarize_completion(expectations)
     decoupling_scheme = _decoupling_scheme_from_expectations(expectations)
     metal = str(manifest.get("metal") or "Metal")
@@ -654,7 +992,7 @@ def inspect_water_case(path: str | Path) -> AnalysisCaseDiscovery | None:
         display_name=root.name,
         description=description,
         completion_summary=completion_summary,
-        readiness_note="Ready" if complete else "Incomplete TI outputs",
+        readiness_note=_readiness_note(expectations, complete=complete),
         selectable=complete,
         metadata={
             "ti_manifest_path": str(ti_manifest_path),
@@ -664,6 +1002,14 @@ def inspect_water_case(path: str | Path) -> AnalysisCaseDiscovery | None:
             "metals": metals,
             "water_model": str(manifest.get("water_model") or "tip3p").lower(),
             "ti_decoupling_scheme": decoupling_scheme,
+            "ti_sampling_protocol": sampling_protocol,
+            "endpoint_substitutions": _endpoint_substitution_payload(expectations),
+            "charge_compensation_mode": str(
+                (manifest.get("ti_protocol") or {}).get("charge_compensation_mode")
+                or ("co_alchemical_counterions" if manifest.get("counterion_plan") else "none")
+            ),
+            "neutrality_validation": manifest.get("neutrality_validation") or {},
+            "ti_lambda_schedule": _lambda_schedule_payload(expectations),
         },
     )
 
@@ -681,6 +1027,8 @@ def inspect_bound_case(path: str | Path) -> AnalysisCaseDiscovery | None:
         return None
     output_root = Path(str(manifest.get("bound_runtime_output_dir"))).expanduser().resolve()
     expectations = _load_expected_windows(ti_manifest_path, output_root)
+    ti_manifest = _load_json(ti_manifest_path)
+    sampling_protocol = ti_manifest.get("sampling_protocol") or {"mode": "single_pass"}
     completion_summary, complete = _summarize_completion(expectations)
     decoupling_scheme = _decoupling_scheme_from_expectations(expectations)
     selected_sites = manifest.get("selected_sites") or ([] if manifest.get("selected_site") is None else [manifest.get("selected_site")])
@@ -700,7 +1048,7 @@ def inspect_bound_case(path: str | Path) -> AnalysisCaseDiscovery | None:
         display_name=root.name,
         description=description,
         completion_summary=completion_summary,
-        readiness_note="Ready" if complete else "Incomplete TI outputs",
+        readiness_note=_readiness_note(expectations, complete=complete),
         selectable=complete,
         metadata={
             "snapshot_source": snapshot_source,
@@ -715,6 +1063,11 @@ def inspect_bound_case(path: str | Path) -> AnalysisCaseDiscovery | None:
             "ti_manifest_path": str(ti_manifest_path),
             "output_root": str(output_root),
             "ti_decoupling_scheme": decoupling_scheme,
+            "ti_sampling_protocol": sampling_protocol,
+            "endpoint_substitutions": _endpoint_substitution_payload(expectations),
+            "charge_compensation_mode": manifest.get("charge_compensation_mode") or "none",
+            "neutrality_validation": manifest.get("bound_neutrality_validation") or {},
+            "ti_lambda_schedule": _lambda_schedule_payload(expectations),
         },
     )
 
@@ -730,14 +1083,17 @@ def inspect_analysis_case(path: str | Path, *, case_type: str | None = None) -> 
 def _candidate_case_directories(search_dir: Path) -> list[Path]:
     resolved = search_dir.expanduser().resolve()
     candidates = [resolved]
-    candidates.extend(sorted((item for item in resolved.iterdir() if item.is_dir()), key=lambda item: item.name.lower()))
-    if (resolved / "water_ref").is_dir():
+    if search_subdirectories_enabled():
         candidates.extend(
-            sorted(
-                (item for item in (resolved / "water_ref").iterdir() if item.is_dir()),
-                key=lambda item: item.name.lower(),
-            )
+            sorted((item for item in resolved.iterdir() if item.is_dir()), key=lambda item: item.name.lower())
         )
+        if (resolved / "water_ref").is_dir():
+            candidates.extend(
+                sorted(
+                    (item for item in (resolved / "water_ref").iterdir() if item.is_dir()),
+                    key=lambda item: item.name.lower(),
+                )
+            )
     unique: list[Path] = []
     seen: set[Path] = set()
     for item in candidates:
@@ -800,12 +1156,119 @@ def _ensure_bound_library_payload() -> dict[str, Any]:
     return payload
 
 
-def lookup_water_library_entry(metal: str, formal_charge: int, water_model: str) -> dict[str, Any] | None:
-    return get_water_library_entry_by_key(water_library_key(metal, formal_charge, water_model))
+def _library_key_parts(key: str) -> tuple[str, str | None]:
+    base_key, separator, suffix = str(key).partition("::")
+    if separator and suffix in {
+        SAMPLING_SELECTION_FORWARD_ONLY,
+        SAMPLING_SELECTION_FORWARD_REVERSE,
+        SAMPLING_SELECTION_LEGACY_UNSPECIFIED,
+    }:
+        return base_key, suffix
+    return str(key), None
 
 
-def get_water_library_entry_by_key(key: str) -> dict[str, Any] | None:
-    return _ensure_water_library_payload().get("entries", {}).get(key)
+def _library_sampling_groups(entry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    groups = entry.get("sampling_groups")
+    if isinstance(groups, dict) and groups:
+        return {
+            str(selection): group
+            for selection, group in groups.items()
+            if isinstance(group, dict) and isinstance(group.get("aggregate"), dict)
+        }
+    aggregate = entry.get("aggregate")
+    if isinstance(aggregate, dict) and aggregate:
+        return {
+            SAMPLING_SELECTION_LEGACY_UNSPECIFIED: {
+                "contributors": entry.get("contributors") or {},
+                "aggregate": aggregate,
+            }
+        }
+    return {}
+
+
+def _library_group_snapshot(
+    entry: dict[str, Any],
+    *,
+    base_key: str,
+    sampling_selection: str,
+    group: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = dict(entry)
+    snapshot["base_key"] = base_key
+    snapshot["key"] = f"{base_key}::{sampling_selection}"
+    snapshot["sampling_selection"] = sampling_selection
+    snapshot["contributors"] = group.get("contributors") or {}
+    snapshot["aggregate"] = group.get("aggregate") or {}
+    return snapshot
+
+
+def _select_library_group(
+    entry: dict[str, Any],
+    *,
+    base_key: str,
+    sampling_selection: str | None,
+) -> dict[str, Any] | None:
+    groups = _library_sampling_groups(entry)
+    if not groups:
+        return None
+    requested = sampling_selection
+    if requested is None:
+        requested = next(
+            (
+                selection
+                for selection in (
+                    SAMPLING_SELECTION_FORWARD_ONLY,
+                    SAMPLING_SELECTION_LEGACY_UNSPECIFIED,
+                    SAMPLING_SELECTION_FORWARD_REVERSE,
+                )
+                if selection in groups
+            ),
+            None,
+        )
+    if requested in groups:
+        return _library_group_snapshot(
+            entry,
+            base_key=base_key,
+            sampling_selection=requested,
+            group=groups[requested],
+        )
+    if requested == SAMPLING_SELECTION_FORWARD_ONLY and SAMPLING_SELECTION_LEGACY_UNSPECIFIED in groups:
+        return _library_group_snapshot(
+            entry,
+            base_key=base_key,
+            sampling_selection=SAMPLING_SELECTION_LEGACY_UNSPECIFIED,
+            group=groups[SAMPLING_SELECTION_LEGACY_UNSPECIFIED],
+        )
+    return None
+
+
+def lookup_water_library_entry(
+    metal: str,
+    formal_charge: int,
+    water_model: str,
+    *,
+    sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY,
+) -> dict[str, Any] | None:
+    return get_water_library_entry_by_key(
+        water_library_key(metal, formal_charge, water_model),
+        sampling_selection=sampling_selection,
+    )
+
+
+def get_water_library_entry_by_key(
+    key: str,
+    *,
+    sampling_selection: str | None = None,
+) -> dict[str, Any] | None:
+    base_key, key_selection = _library_key_parts(key)
+    entry = _ensure_water_library_payload().get("entries", {}).get(base_key)
+    if not isinstance(entry, dict):
+        return None
+    return _select_library_group(
+        entry,
+        base_key=base_key,
+        sampling_selection=key_selection or sampling_selection,
+    )
 
 
 def _decoupling_scheme_from_library_entry(entry: dict[str, Any]) -> str:
@@ -826,37 +1289,88 @@ def _decoupling_scheme_from_library_entry(entry: dict[str, Any]) -> str:
     return DECOUPLING_SCHEME_UNKNOWN
 
 
-def discover_water_library_cases() -> list[AnalysisCaseDiscovery]:
+def discover_water_library_cases(
+    *,
+    sampling_selection: str | None = None,
+) -> list[AnalysisCaseDiscovery]:
+    if sampling_selection is not None:
+        sampling_selection = _normalize_sampling_selection(sampling_selection)
     payload = _ensure_water_library_payload()
     discoveries: list[AnalysisCaseDiscovery] = []
     for key, entry in sorted(payload.get("entries", {}).items()):
-        aggregate = entry.get("aggregate") or {}
-        total = aggregate.get("total") or {}
-        ci95 = total.get("bootstrap_ci95") or {}
-        decoupling_scheme = _decoupling_scheme_from_library_entry(entry)
-        discoveries.append(
-            AnalysisCaseDiscovery(
-                root=water_ref_library_path(),
-                case_type=CASE_TYPE_WATER,
-                display_name=f"{entry.get('metal', 'Metal')}{entry.get('formal_charge', '?')}+_{str(entry.get('water_model', 'tip3p')).upper()}",
-                description=f"{entry.get('metal', 'Metal')}{entry.get('formal_charge', '?')}+ in {str(entry.get('water_model', 'tip3p')).upper()} water",
-                completion_summary=f"Library mean from {aggregate.get('n_cases', 0)} case(s)",
-                readiness_note="Library aggregate",
-                selectable=True,
-                source_kind=SOURCE_KIND_LIBRARY,
-                library_key=key,
-                library_snapshot=entry,
-                metadata={
-                    "metal": entry.get("metal"),
-                    "formal_charge": entry.get("formal_charge"),
-                    "water_model": entry.get("water_model"),
-                    "delta_g_kcal_mol": total.get("delta_g_kcal_mol"),
-                    "propagated_sem_kcal_mol": total.get("propagated_sem_kcal_mol"),
-                    "bootstrap_ci95": ci95,
-                    "ti_decoupling_scheme": decoupling_scheme,
-                },
+        if not isinstance(entry, dict):
+            continue
+        for group_selection, group in _library_sampling_groups(entry).items():
+            if sampling_selection is not None and group_selection != sampling_selection:
+                if not (
+                    sampling_selection == SAMPLING_SELECTION_FORWARD_ONLY
+                    and group_selection == SAMPLING_SELECTION_LEGACY_UNSPECIFIED
+                ):
+                    continue
+            snapshot = _library_group_snapshot(
+                entry,
+                base_key=key,
+                sampling_selection=group_selection,
+                group=group,
             )
-        )
+            aggregate = snapshot.get("aggregate") or {}
+            total = aggregate.get("total") or {}
+            ci95 = total.get("bootstrap_ci95") or {}
+            decoupling_scheme = _decoupling_scheme_from_library_entry(snapshot)
+            selection_label = {
+                SAMPLING_SELECTION_FORWARD_ONLY: "Forward",
+                SAMPLING_SELECTION_FORWARD_REVERSE: "ForwardReverse",
+                SAMPLING_SELECTION_LEGACY_UNSPECIFIED: "Legacy",
+            }.get(group_selection, group_selection)
+            is_legacy = group_selection == SAMPLING_SELECTION_LEGACY_UNSPECIFIED
+            discoveries.append(
+                AnalysisCaseDiscovery(
+                    root=water_ref_library_path(),
+                    case_type=CASE_TYPE_WATER,
+                    display_name=(
+                        f"{entry.get('metal', 'Metal')}{entry.get('formal_charge', '?')}+_"
+                        f"{str(entry.get('water_model', 'tip3p')).upper()}_{selection_label}"
+                    ),
+                    description=(
+                        f"{entry.get('metal', 'Metal')}{entry.get('formal_charge', '?')}+ in "
+                        f"{str(entry.get('water_model', 'tip3p')).upper()} water [{selection_label}]"
+                    ),
+                    completion_summary=f"Library mean from {aggregate.get('n_cases', 0)} case(s)",
+                    readiness_note=(
+                        "Legacy library aggregate; direction metadata unavailable, accepted for Forward-only analysis"
+                        if is_legacy
+                        else f"Library aggregate ({selection_label})"
+                    ),
+                    selectable=True,
+                    source_kind=SOURCE_KIND_LIBRARY,
+                    library_key=str(snapshot["key"]),
+                    library_snapshot=snapshot,
+                    metadata={
+                        "metal": entry.get("metal"),
+                        "formal_charge": entry.get("formal_charge"),
+                        "water_model": entry.get("water_model"),
+                        "delta_g_kcal_mol": total.get("delta_g_kcal_mol"),
+                        "propagated_sem_kcal_mol": total.get("propagated_sem_kcal_mol"),
+                        "bootstrap_ci95": ci95,
+                        "ti_decoupling_scheme": decoupling_scheme,
+                        "charge_compensation_mode": aggregate.get("charge_compensation_mode") or "unknown",
+                        "neutrality_validation": aggregate.get("neutrality_validation") or {},
+                        "library_sampling_selection": group_selection,
+                        "ti_sampling_protocol": {
+                            "mode": (
+                                "bidirectional"
+                                if group_selection == SAMPLING_SELECTION_FORWARD_REVERSE
+                                else group_selection
+                            ),
+                            "directions": (
+                                ["forward", "reverse"]
+                                if group_selection == SAMPLING_SELECTION_FORWARD_REVERSE
+                                else ["forward"]
+                            ),
+                        },
+                    },
+                )
+            )
     return discoveries
 
 
@@ -869,9 +1383,28 @@ def _resolve_case(case_or_root: AnalysisCaseDiscovery | str | Path, *, case_type
     return discovery
 
 
-def _result_from_library_case(case: AnalysisCaseDiscovery) -> SingleCaseAnalysisResult:
+def _result_from_library_case(
+    case: AnalysisCaseDiscovery,
+    *,
+    sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY,
+) -> SingleCaseAnalysisResult:
     if case.source_kind != SOURCE_KIND_LIBRARY or case.library_snapshot is None:
         raise ValueError("The provided case is not a library-backed water reference.")
+    sampling_selection = _normalize_sampling_selection(sampling_selection)
+    library_selection = str(
+        case.metadata.get("library_sampling_selection")
+        or case.library_snapshot.get("sampling_selection")
+        or SAMPLING_SELECTION_LEGACY_UNSPECIFIED
+    )
+    legacy_forward_fallback = (
+        sampling_selection == SAMPLING_SELECTION_FORWARD_ONLY
+        and library_selection == SAMPLING_SELECTION_LEGACY_UNSPECIFIED
+    )
+    if library_selection != sampling_selection and not legacy_forward_fallback:
+        raise ValueError(
+            "The selected water-library value was generated for "
+            f"'{library_selection}', not '{sampling_selection}'. Select a matching library entry."
+        )
     aggregate = case.library_snapshot.get("aggregate") or {}
     qoff = aggregate.get("qoff") or {}
     vdwoff = aggregate.get("vdwoff") or {}
@@ -899,6 +1432,15 @@ def _result_from_library_case(case: AnalysisCaseDiscovery) -> SingleCaseAnalysis
         windows=[],
         bootstrap_samples=[float(vdwoff.get("delta_g_kcal_mol", 0.0))],
     )
+    warnings = (
+        [
+            "This is a legacy water-library value without direction metadata; it is being treated as "
+            "Forward-only for backward compatibility."
+        ]
+        if legacy_forward_fallback
+        else []
+    )
+    aggregate_quality = str(aggregate.get("quality") or "ok")
     return SingleCaseAnalysisResult(
         case=case,
         qoff=qoff_analysis,
@@ -910,8 +1452,9 @@ def _result_from_library_case(case: AnalysisCaseDiscovery) -> SingleCaseAnalysis
             float((total.get("bootstrap_ci95") or {}).get("high", 0.0)),
         ),
         output_dir=output_dir,
-        quality=str(aggregate.get("quality") or "ok"),
-        warnings=[],
+        sampling_selection=sampling_selection,
+        quality="warning" if warnings or aggregate_quality == "warning" else "ok",
+        warnings=warnings,
         bootstrap_samples=[float(total.get("delta_g_kcal_mol", 0.0))],
     )
 
@@ -921,9 +1464,14 @@ def _write_windows_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     headers = [
         "case_type",
         "source_kind",
+        "run_id",
+        "replica",
+        "direction",
         "phase",
         "lambda",
         "mdout_path",
+        "expected_mdout_path",
+        "endpoint_substituted",
         "delta_g_source_value",
         "sample_mean_dvdl",
         "sample_std_dvdl",
@@ -949,6 +1497,7 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
         f"Case: {result.case.display_name}",
         f"Type: {result.case.case_type}",
         f"TI decoupling: {_decoupling_scheme_detail(decoupling_scheme)}",
+        f"Sampling included: {_sampling_selection_detail(result.sampling_selection)}",
         f"Description: {result.case.description}",
         f"Quality: {result.quality}",
     ]
@@ -968,15 +1517,16 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
         lines.append("This report summarizes the standalone water-reference dG.")
     else:
         lines.append("This report summarizes the standalone bound-case TI dG.")
+    phase_label = "combined" if decoupling_scheme == DECOUPLING_SCHEME_COMBINED else "qoff"
     lines.extend(
         [
             "",
-            f"qoff: {_format_mean_sem(result.qoff.delta_g_kcal_mol, result.qoff.propagated_sem_kcal_mol)} kcal/mol",
-            f"qoff 95% CI: {_format_ci95(result.qoff.bootstrap_ci95)}",
+            f"{phase_label}: {_format_mean_sem(result.qoff.delta_g_kcal_mol, result.qoff.propagated_sem_kcal_mol)} kcal/mol",
+            f"{phase_label} 95% CI: {_format_ci95(result.qoff.bootstrap_ci95)}",
         ]
     )
     if decoupling_scheme == DECOUPLING_SCHEME_COMBINED:
-        lines.append("vdwoff: N/A (combined qoff-only softcore)")
+        lines.append("vdwoff: N/A (combined single softcore path)")
     else:
         lines.extend(
             [
@@ -984,6 +1534,19 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
                 f"vdwoff 95% CI: {_format_ci95(result.vdwoff.bootstrap_ci95)}",
             ]
         )
+    if result.qoff.sampling_runs:
+        lines.extend(["", "Bidirectional sweeps:"])
+        for sampling_run in result.qoff.sampling_runs:
+            approximation = " [APPROXIMATE: forward lambda=0 substituted]" if sampling_run.get("approximate") else ""
+            lines.append(
+                f"- {sampling_run.get('direction')}: {float(sampling_run.get('delta_g_kcal_mol', 0.0)):.6f} "
+                f"kcal/mol{approximation}"
+            )
+        if result.qoff.forward_reverse_difference_kcal_mol is not None:
+            lines.append(
+                "- forward/reverse hysteresis: "
+                f"{result.qoff.forward_reverse_difference_kcal_mol:.6f} kcal/mol"
+            )
     lines.extend(
         [
             f"Total dG: {_format_mean_sem(result.delta_g_kcal_mol, result.propagated_sem_kcal_mol)} kcal/mol",
@@ -1008,6 +1571,7 @@ def render_rbfe_report(result: RBFEAnalysisResult) -> str:
         f"Water case: {result.water.case.display_name}",
         f"Bound TI decoupling: {_decoupling_scheme_detail(decoupling_scheme_for_result(result.bound))}",
         f"Water TI decoupling: {_decoupling_scheme_detail(decoupling_scheme_for_result(result.water))}",
+        f"Sampling included: {_sampling_selection_detail(result.sampling_selection)}",
         "Formula: ddG = (dG_bound_ti + restraint_correction) - dG_water",
         "",
         f"Bound qoff: {_format_mean_sem(result.bound.qoff.delta_g_kcal_mol, result.bound.qoff.propagated_sem_kcal_mol)} kcal/mol",
@@ -1019,18 +1583,48 @@ def render_rbfe_report(result: RBFEAnalysisResult) -> str:
         f"Final ddG: {_format_mean_sem(result.ddg_kcal_mol, result.propagated_sem_kcal_mol)} kcal/mol",
         f"Final ddG 95% CI: {_format_ci95(result.bootstrap_ci95)}",
     ]
+    bound_hysteresis = _case_max_hysteresis(result.bound)
+    water_hysteresis = _case_max_hysteresis(result.water)
+    if bound_hysteresis is not None or water_hysteresis is not None:
+        lines.extend(
+            [
+                "",
+                "Direction diagnostics:",
+                f"- Bound max |Forward-Reverse|: {_format_mean_sem(bound_hysteresis, None)} kcal/mol",
+                f"- Water max |Forward-Reverse|: {_format_mean_sem(water_hysteresis, None)} kcal/mol",
+            ]
+        )
     if result.warnings:
         lines.extend(["", "Warnings:"])
         lines.extend(f"- {warning}" for warning in result.warnings)
     return "\n".join(lines) + "\n"
 
 
+def _result_library_sampling_selection(result: SingleCaseAnalysisResult) -> str:
+    has_reverse = any(
+        window.direction == "reverse"
+        for phase in (result.qoff, result.vdwoff)
+        for window in phase.windows
+    )
+    return (
+        SAMPLING_SELECTION_FORWARD_REVERSE
+        if result.sampling_selection == SAMPLING_SELECTION_FORWARD_REVERSE and has_reverse
+        else SAMPLING_SELECTION_FORWARD_ONLY
+    )
+
+
 def _water_contributor_record(result: SingleCaseAnalysisResult) -> dict[str, Any]:
+    library_sampling_selection = _result_library_sampling_selection(result)
     return {
         "case_root": str(result.case.root),
         "display_name": result.case.display_name,
         "quality": result.quality,
+        "warnings": result.warnings,
+        "endpoint_substitutions": result.case.metadata.get("endpoint_substitutions") or [],
         "ti_decoupling_scheme": decoupling_scheme_for_result(result),
+        "sampling_selection": library_sampling_selection,
+        "charge_compensation_mode": _charge_compensation_mode(result.case),
+        "neutrality_validation": result.case.metadata.get("neutrality_validation") or {},
         "qoff": _phase_metric_payload(
             result.qoff.delta_g_kcal_mol,
             result.qoff.propagated_sem_kcal_mol,
@@ -1073,6 +1667,64 @@ def _aggregate_metric(
     return _phase_metric_payload(mean_value, sem, ci95)
 
 
+def _aggregate_water_contributors(
+    contributors: dict[str, dict[str, Any]],
+    *,
+    key: str,
+    sampling_selection: str,
+) -> dict[str, Any]:
+    contributor_values = list(contributors.values())
+    decoupling_schemes = sorted(
+        {
+            str(item.get("ti_decoupling_scheme")).strip()
+            for item in contributor_values
+            if str(item.get("ti_decoupling_scheme") or "").strip()
+        }
+    )
+    charge_compensation_modes = sorted(
+        {
+            str(item.get("charge_compensation_mode") or "unknown").strip().lower()
+            for item in contributor_values
+        }
+    )
+    neutrality_statuses = {
+        str((item.get("neutrality_validation") or {}).get("status") or "missing").strip().lower()
+        for item in contributor_values
+    }
+    return {
+        "sampling_selection": sampling_selection,
+        "n_cases": len(contributor_values),
+        "quality": "warning" if any(item.get("quality") == "warning" for item in contributor_values) else "ok",
+        "ti_decoupling_scheme": (
+            decoupling_schemes[0]
+            if len(decoupling_schemes) == 1
+            else (DECOUPLING_SCHEME_MIXED if decoupling_schemes else DECOUPLING_SCHEME_UNKNOWN)
+        ),
+        "ti_decoupling_schemes": decoupling_schemes,
+        "charge_compensation_mode": (
+            charge_compensation_modes[0] if len(charge_compensation_modes) == 1 else "mixed"
+        ),
+        "neutrality_validation": {
+            "status": "passed" if neutrality_statuses == {"passed"} else "mixed_or_missing"
+        },
+        "qoff": _aggregate_metric(
+            contributor_values,
+            "qoff",
+            seed_label=f"{key}:{sampling_selection}:qoff",
+        ),
+        "vdwoff": _aggregate_metric(
+            contributor_values,
+            "vdwoff",
+            seed_label=f"{key}:{sampling_selection}:vdwoff",
+        ),
+        "total": _aggregate_metric(
+            contributor_values,
+            "total",
+            seed_label=f"{key}:{sampling_selection}:total",
+        ),
+    }
+
+
 def _update_water_ref_library(result: SingleCaseAnalysisResult) -> None:
     if result.case.case_type != CASE_TYPE_WATER or result.case.source_kind != SOURCE_KIND_SIMULATION:
         return
@@ -1080,6 +1732,7 @@ def _update_water_ref_library(result: SingleCaseAnalysisResult) -> None:
     formal_charge = int(result.case.metadata.get("formal_charge") or 0)
     water_model = str(result.case.metadata.get("water_model") or "tip3p")
     key = water_library_key(metal, formal_charge, water_model)
+    library_sampling_selection = _result_library_sampling_selection(result)
     payload = _ensure_water_library_payload()
     entries = payload["entries"]
     entry = entries.setdefault(
@@ -1089,32 +1742,38 @@ def _update_water_ref_library(result: SingleCaseAnalysisResult) -> None:
             "metal": metal,
             "formal_charge": formal_charge,
             "water_model": water_model,
-            "contributors": {},
+            "sampling_groups": {},
         },
     )
-    contributors = entry.setdefault("contributors", {})
-    contributors[str(result.case.root)] = _water_contributor_record(result)
-    contributor_values = list(contributors.values())
-    decoupling_schemes = sorted(
-        {
-            str(item.get("ti_decoupling_scheme")).strip()
-            for item in contributor_values
-            if str(item.get("ti_decoupling_scheme") or "").strip()
+    sampling_groups = entry.setdefault("sampling_groups", {})
+    if not sampling_groups and isinstance(entry.get("aggregate"), dict) and entry.get("aggregate"):
+        sampling_groups[SAMPLING_SELECTION_LEGACY_UNSPECIFIED] = {
+            "contributors": dict(entry.get("contributors") or {}),
+            "aggregate": dict(entry["aggregate"]),
         }
+    group = sampling_groups.setdefault(
+        library_sampling_selection,
+        {"contributors": {}, "aggregate": {}},
     )
-    entry["aggregate"] = {
-        "n_cases": len(contributor_values),
-        "quality": "warning" if any(item.get("quality") == "warning" for item in contributor_values) else "ok",
-        "ti_decoupling_scheme": (
-            decoupling_schemes[0]
-            if len(decoupling_schemes) == 1
-            else (DECOUPLING_SCHEME_MIXED if decoupling_schemes else DECOUPLING_SCHEME_UNKNOWN)
-        ),
-        "ti_decoupling_schemes": decoupling_schemes,
-        "qoff": _aggregate_metric(contributor_values, "qoff", seed_label=f"{key}:qoff"),
-        "vdwoff": _aggregate_metric(contributor_values, "vdwoff", seed_label=f"{key}:vdwoff"),
-        "total": _aggregate_metric(contributor_values, "total", seed_label=f"{key}:total"),
-    }
+    contributors = group.setdefault("contributors", {})
+    contributors[str(result.case.root)] = _water_contributor_record(result)
+    group["aggregate"] = _aggregate_water_contributors(
+        contributors,
+        key=key,
+        sampling_selection=library_sampling_selection,
+    )
+    preferred_group = (
+        sampling_groups.get(SAMPLING_SELECTION_FORWARD_ONLY)
+        or sampling_groups.get(SAMPLING_SELECTION_LEGACY_UNSPECIFIED)
+        or sampling_groups.get(SAMPLING_SELECTION_FORWARD_REVERSE)
+        or group
+    )
+    # Keep the historical top-level fields as a Forward-first compatibility
+    # alias while all new data lives in direction-specific sampling groups.
+    entry["contributors"] = dict(preferred_group.get("contributors") or {})
+    entry["aggregate"] = dict(preferred_group.get("aggregate") or {})
+    entry["library_schema_version"] = 2
+    payload["library_schema_version"] = 2
     _save_library_json(water_ref_library_path(), payload)
 
 
@@ -1122,12 +1781,21 @@ def _update_bound_library(result: SingleCaseAnalysisResult) -> None:
     if result.case.case_type != CASE_TYPE_BOUND or result.case.source_kind != SOURCE_KIND_SIMULATION:
         return
     payload = _ensure_bound_library_payload()
-    payload["cases"][str(result.case.root)] = {
+    library_sampling_selection = _result_library_sampling_selection(result)
+    library_case_key = str(result.case.root)
+    if library_sampling_selection != SAMPLING_SELECTION_FORWARD_ONLY:
+        library_case_key = f"{library_case_key}::{library_sampling_selection}"
+    payload["cases"][library_case_key] = {
         "case_root": str(result.case.root),
         "display_name": result.case.display_name,
         "description": result.case.description,
         "quality": result.quality,
+        "warnings": result.warnings,
+        "endpoint_substitutions": result.case.metadata.get("endpoint_substitutions") or [],
         "ti_decoupling_scheme": decoupling_scheme_for_result(result),
+        "sampling_selection": library_sampling_selection,
+        "charge_compensation_mode": _charge_compensation_mode(result.case),
+        "neutrality_validation": result.case.metadata.get("neutrality_validation") or {},
         "snapshot_source": result.case.metadata.get("snapshot_source"),
         "qoff": _phase_metric_payload(result.qoff.delta_g_kcal_mol, result.qoff.propagated_sem_kcal_mol, result.qoff.bootstrap_ci95),
         "vdwoff": _phase_metric_payload(
@@ -1158,9 +1826,16 @@ def _persist_single_case_result(result: SingleCaseAnalysisResult) -> SingleCaseA
                 {
                     "case_type": result.case.case_type,
                     "source_kind": result.case.source_kind,
+                    "run_id": window.run_id,
+                    "replica": window.replica,
+                    "direction": window.direction,
                     "phase": window.phase,
                     "lambda": f"{window.clambda:.3f}",
                     "mdout_path": str(window.mdout_path),
+                    "expected_mdout_path": ""
+                    if window.expected_mdout_path is None
+                    else str(window.expected_mdout_path),
+                    "endpoint_substituted": window.endpoint_substituted,
                     "delta_g_source_value": window.delta_g_source_value,
                     "sample_mean_dvdl": window.sample_mean_dvdl,
                     "sample_std_dvdl": window.sample_std_dvdl,
@@ -1191,9 +1866,16 @@ def _persist_rbfe_result(result: RBFEAnalysisResult) -> RBFEAnalysisResult:
                     {
                         "case_type": leg_name,
                         "source_kind": single.case.source_kind,
+                        "run_id": window.run_id,
+                        "replica": window.replica,
+                        "direction": window.direction,
                         "phase": window.phase,
                         "lambda": f"{window.clambda:.3f}",
                         "mdout_path": str(window.mdout_path),
+                        "expected_mdout_path": ""
+                        if window.expected_mdout_path is None
+                        else str(window.expected_mdout_path),
+                        "endpoint_substituted": window.endpoint_substituted,
                         "delta_g_source_value": window.delta_g_source_value,
                         "sample_mean_dvdl": window.sample_mean_dvdl,
                         "sample_std_dvdl": window.sample_std_dvdl,
@@ -1215,17 +1897,23 @@ def analyze_single_case(
     case_or_root: AnalysisCaseDiscovery | str | Path,
     *,
     case_type: str | None = None,
+    sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY,
 ) -> SingleCaseAnalysisResult:
+    sampling_selection = _normalize_sampling_selection(sampling_selection)
     case = _resolve_case(case_or_root, case_type=case_type)
     if case.source_kind == SOURCE_KIND_LIBRARY:
-        return _result_from_library_case(case)
+        return _result_from_library_case(case, sampling_selection=sampling_selection)
     if not case.selectable:
         raise ValueError(case.readiness_note)
     ti_manifest_path = Path(str(case.metadata["ti_manifest_path"]))
     output_root = Path(str(case.metadata["output_root"]))
     expectations = _load_expected_windows(ti_manifest_path, output_root)
-    qoff = _phase_analysis("qoff", expectations, seed_label=f"{case.root}:qoff")
-    vdwoff = _phase_analysis("vdwoff", expectations, seed_label=f"{case.root}:vdwoff")
+    if sampling_selection == SAMPLING_SELECTION_FORWARD_ONLY:
+        expectations = [item for item in expectations if item.direction == "forward"]
+        if not expectations:
+            raise ValueError("No forward TI windows were found in this case.")
+    qoff = _phase_analysis("qoff", expectations, seed_label=f"{case.root}:{sampling_selection}:qoff")
+    vdwoff = _phase_analysis("vdwoff", expectations, seed_label=f"{case.root}:{sampling_selection}:vdwoff")
     total_delta_g = qoff.delta_g_kcal_mol + vdwoff.delta_g_kcal_mol
     total_sem = math.sqrt(qoff.propagated_sem_kcal_mol**2 + vdwoff.propagated_sem_kcal_mol**2)
     total_bootstrap = _combine_bootstrap_samples(
@@ -1242,7 +1930,10 @@ def analyze_single_case(
         delta_g_kcal_mol=total_delta_g,
         propagated_sem_kcal_mol=total_sem,
         bootstrap_ci95=_confidence_interval(total_bootstrap or [total_delta_g]),
-        output_dir=case.root / "analysis" / "abfe",
+        output_dir=case.root / "analysis" / (
+            "abfe" if sampling_selection == SAMPLING_SELECTION_FORWARD_ONLY else "abfe_forward_reverse"
+        ),
+        sampling_selection=sampling_selection,
         quality=quality,
         warnings=warnings,
         bootstrap_samples=total_bootstrap,
@@ -1261,16 +1952,32 @@ def analyze_single_case(
 def analyze_rbfe(
     bound_case_or_root: AnalysisCaseDiscovery | str | Path,
     water_case_or_root: AnalysisCaseDiscovery | str | Path,
+    *,
+    sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY,
 ) -> RBFEAnalysisResult:
+    sampling_selection = _normalize_sampling_selection(sampling_selection)
     bound_case = _resolve_case(bound_case_or_root, case_type=CASE_TYPE_BOUND)
     if not bound_case.selectable:
         raise ValueError(bound_case.readiness_note)
-    bound = analyze_single_case(bound_case, case_type=CASE_TYPE_BOUND)
     water_case = water_case_or_root if isinstance(water_case_or_root, AnalysisCaseDiscovery) else _resolve_case(water_case_or_root, case_type=CASE_TYPE_WATER)
+    if not water_case.selectable:
+        raise ValueError(water_case.readiness_note)
+    compatibility_errors, compatibility_warnings = rbfe_pair_compatibility(bound_case, water_case)
+    if compatibility_errors:
+        raise ValueError("Incompatible RBFE pair: " + " ".join(compatibility_errors))
+    bound = analyze_single_case(
+        bound_case,
+        case_type=CASE_TYPE_BOUND,
+        sampling_selection=sampling_selection,
+    )
     if isinstance(water_case, AnalysisCaseDiscovery) and water_case.source_kind == SOURCE_KIND_LIBRARY:
-        water = _result_from_library_case(water_case)
+        water = _result_from_library_case(water_case, sampling_selection=sampling_selection)
     else:
-        water = analyze_single_case(water_case, case_type=CASE_TYPE_WATER)
+        water = analyze_single_case(
+            water_case,
+            case_type=CASE_TYPE_WATER,
+            sampling_selection=sampling_selection,
+        )
     corrected_bound = bound.corrected_delta_g_kcal_mol if bound.corrected_delta_g_kcal_mol is not None else bound.delta_g_kcal_mol
     corrected_bound_sem = (
         bound.corrected_propagated_sem_kcal_mol
@@ -1284,7 +1991,7 @@ def analyze_rbfe(
         water.bootstrap_samples or [water.delta_g_kcal_mol],
         operation="subtract",
     )
-    warnings = [*bound.warnings, *water.warnings]
+    warnings = [*compatibility_warnings, *bound.warnings, *water.warnings]
     quality: Literal["ok", "warning"] = "warning" if warnings or bound.quality == "warning" or water.quality == "warning" else "ok"
     result = RBFEAnalysisResult(
         bound=bound,
@@ -1292,7 +1999,10 @@ def analyze_rbfe(
         ddg_kcal_mol=ddg,
         propagated_sem_kcal_mol=ddg_sem,
         bootstrap_ci95=_confidence_interval(ddg_bootstrap or [ddg]),
-        output_dir=bound.case.root / "analysis" / "rbfe",
+        output_dir=bound.case.root / "analysis" / (
+            "rbfe" if sampling_selection == SAMPLING_SELECTION_FORWARD_ONLY else "rbfe_forward_reverse"
+        ),
+        sampling_selection=sampling_selection,
         quality=quality,
         warnings=warnings,
         bootstrap_samples=ddg_bootstrap,
@@ -1321,6 +2031,8 @@ def print_analysis_summary(
             table.add_column("ddG", style="cyan", justify="right")
             table.add_column("SEM", style="green", justify="right")
             table.add_column("95% CI", style="magenta", justify="right")
+            table.add_column("Bound |F-R|", style="yellow", justify="right")
+            table.add_column("Water |F-R|", style="yellow", justify="right")
             for item in rbfe_results:
                 table.add_row(
                     item.bound.case.display_name,
@@ -1328,11 +2040,13 @@ def print_analysis_summary(
                     f"{item.ddg_kcal_mol:.6f}",
                     f"{item.propagated_sem_kcal_mol:.6f}",
                     _format_ci95(item.bootstrap_ci95),
+                    _format_mean_sem(_case_max_hysteresis(item.bound), None),
+                    _format_mean_sem(_case_max_hysteresis(item.water), None),
                 )
             console.print(table)
             console.print(
                 f"[dim]Analyzed {len(rbfe_results)} RBFE pair(s). Individual outputs were saved under each "
-                "bound case's analysis/rbfe directory.[/dim]"
+                "bound case's analysis directory.[/dim]"
             )
             return
         table = Table(title="Batch Single-Case dG", box=box.SIMPLE_HEAVY)
@@ -1358,7 +2072,10 @@ def print_analysis_summary(
                 _format_ci95(item.bootstrap_ci95),
             )
         console.print(table)
-        console.print(f"[dim]Analyzed {len(result)} completed TI case(s). Individual outputs were saved under each case's analysis/abfe directory.[/dim]")
+        console.print(
+            f"[dim]Analyzed {len(result)} completed TI case(s). Individual outputs were saved under each "
+            "case's analysis directory.[/dim]"
+        )
         return
     if isinstance(result, SingleCaseAnalysisResult):
         title = "Single-Case dG"
@@ -1395,6 +2112,26 @@ def print_analysis_summary(
             )
         console.print(table)
         console.print(f"[dim]TI decoupling: {_decoupling_scheme_detail(decoupling_scheme)}[/dim]")
+        if result.qoff.sampling_runs:
+            sweep_table = Table(title="Bidirectional sweep diagnostics", box=box.SIMPLE)
+            sweep_table.add_column("Direction", style="bold white")
+            sweep_table.add_column("DeltaG (kcal/mol)", style="cyan", justify="right")
+            sweep_table.add_column("Status", style="yellow")
+            for sampling_run in result.qoff.sampling_runs:
+                sweep_table.add_row(
+                    str(sampling_run.get("direction") or "unknown"),
+                    f"{float(sampling_run.get('delta_g_kcal_mol', 0.0)):.6f}",
+                    "APPROXIMATE (forward lambda=0 substituted)"
+                    if sampling_run.get("approximate")
+                    else "complete",
+                )
+            if result.qoff.forward_reverse_difference_kcal_mol is not None:
+                sweep_table.add_row(
+                    "hysteresis |F-R|",
+                    f"{result.qoff.forward_reverse_difference_kcal_mol:.6f}",
+                    "diagnostic",
+                )
+            console.print(sweep_table)
         selected_sites = result.case.metadata.get("selected_sites") or []
         if selected_sites:
             metals = "; ".join(
@@ -1406,6 +2143,8 @@ def print_analysis_summary(
             if len(selected_sites) > 1:
                 console.print("[dim]Multi-site all-at-once result: total dG only, not per-metal decomposition.[/dim]")
         console.print(f"[dim]Saved analysis outputs to {result.output_dir}[/dim]")
+        for warning in result.warnings:
+            console.print(f"[bold yellow]Warning:[/bold yellow] {warning}")
         return
     table = Table(title="RBFE", box=box.SIMPLE_HEAVY)
     table.add_column("Component", style="bold white")

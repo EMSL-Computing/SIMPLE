@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from amber_metallo.config import SlurmConfig, SlurmProfile
+from amber_metallo.ti.config import TIDecouplingMode, TIProtocolConfig, TISamplingMode
 from amber_metallo.ti.protocols import PreparationStage, TIWindow
 
 
@@ -472,11 +473,16 @@ def _window_lines(
     vdw_prmtop: str,
     start_coord: str,
     qoff_coordinate_bridge: QoffCoordinateBridge | None,
+    combined_layout: bool = False,
 ) -> list[str]:
     qoff_windows = [window for window in windows if window.phase == "qoff"]
     vdwoff_windows = [window for window in windows if window.phase == "vdwoff"]
     initial_qoff_windows = qoff_windows
     terminal_qoff_window: TIWindow | None = None
+    prep_has_positional_restraints = any("ntr = 1" in stage.content for stage in (prep_stages or []))
+    endpoint_has_positional_restraints = any("ntr = 1" in stage.content for stage in (endpoint_prep_stages or []))
+    qoff_has_positional_restraints = any("ntr = 1" in window.content for window in qoff_windows)
+    vdwoff_has_positional_restraints = any("ntr = 1" in window.content for window in vdwoff_windows)
     if endpoint_prep_stages and qoff_windows:
         initial_qoff_windows = qoff_windows[:-1]
         terminal_qoff_window = qoff_windows[-1]
@@ -499,6 +505,7 @@ def _window_lines(
                 "",
                 f"echo 'Starting {prep_label}...'",
                 "PREP_COORD=\"$PREP_START_COORD\"",
+                "PREP_REFERENCE_COORD=\"$PREP_START_COORD\"",
                 "",
             ]
         )
@@ -515,11 +522,15 @@ def _window_lines(
                 lines.extend(
                     [
                         f"TRAJ=\"$PREP_OUTPUT_DIR/{stem}.nc\"",
-                        "$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$PREP_PRMTOP\" -c \"$PREP_COORD\" -r \"$RST\" -x \"$TRAJ\"",
+                        "$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$PREP_PRMTOP\" -c \"$PREP_COORD\" -r \"$RST\" -x \"$TRAJ\""
+                        + (' -ref "$PREP_REFERENCE_COORD"' if prep_has_positional_restraints else ""),
                     ]
                 )
             else:
-                lines.append("$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$PREP_PRMTOP\" -c \"$PREP_COORD\" -r \"$RST\"")
+                lines.append(
+                    "$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$PREP_PRMTOP\" -c \"$PREP_COORD\" -r \"$RST\""
+                    + (' -ref "$PREP_REFERENCE_COORD"' if prep_has_positional_restraints else "")
+                )
             lines.extend(
                 [
                     "PREP_COORD=\"$RST\"",
@@ -542,14 +553,22 @@ def _window_lines(
             f"QOFF_PRMTOP=\"{qoff_prmtop}\"",
             f"VDWOFF_PRMTOP=\"{vdw_prmtop}\"",
             f"START_COORD=\"{start_coord}\"",
-            "QOFF_OUTPUT_DIR=\"$LEG_OUTPUT_ROOT/qoff\"",
-            "VDWOFF_OUTPUT_DIR=\"$LEG_OUTPUT_ROOT/vdwoff\"",
+            (
+                "QOFF_OUTPUT_DIR=\"$LEG_OUTPUT_ROOT\""
+                if combined_layout
+                else "QOFF_OUTPUT_DIR=\"$LEG_OUTPUT_ROOT/qoff\""
+            ),
             "mkdir -p \"$QOFF_OUTPUT_DIR\"",
-            "mkdir -p \"$VDWOFF_OUTPUT_DIR\"",
-            "",
-            f"echo 'Starting {qoff_label} TI windows...'",
         ]
     )
+    if vdwoff_windows:
+        lines.extend(
+            [
+                "VDWOFF_OUTPUT_DIR=\"$LEG_OUTPUT_ROOT/vdwoff\"",
+                "mkdir -p \"$VDWOFF_OUTPUT_DIR\"",
+            ]
+        )
+    lines.extend(["", f"echo 'Starting {qoff_label} TI windows...'"])
     if prep_stages:
         lines.append("START_COORD=\"$PREP_COORD\"")
         lines.append("")
@@ -568,6 +587,7 @@ def _window_lines(
                 "",
             ]
         )
+    lines.extend(['QOFF_REFERENCE_COORD="$START_COORD"', ""])
     last_qoff_rst = ""
     for window in initial_qoff_windows:
         stem = Path(window.filename).stem
@@ -578,7 +598,8 @@ def _window_lines(
                 f"OUT=\"$QOFF_OUTPUT_DIR/{stem}.out\"",
                 f"RST=\"{last_qoff_rst}\"",
                 f"TRAJ=\"$QOFF_OUTPUT_DIR/{stem}.nc\"",
-                "$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"$START_COORD\" -r \"$RST\" -x \"$TRAJ\"",
+                "$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"$START_COORD\" -r \"$RST\" -x \"$TRAJ\""
+                + (' -ref "$QOFF_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
                 "START_COORD=\"$RST\"",
                 "",
             ]
@@ -614,6 +635,7 @@ def _window_lines(
                 "  exit 1",
                 "fi",
                 "ENDPOINT_COORD=\"$QOFF_PREP_SOURCE\"",
+                "ENDPOINT_REFERENCE_COORD=\"$QOFF_PREP_SOURCE\"",
                 "",
             ]
         )
@@ -630,11 +652,15 @@ def _window_lines(
                 lines.extend(
                     [
                         f"TRAJ=\"$ENDPOINT_PREP_OUTPUT_DIR/{stem}.nc\"",
-                        "$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$ENDPOINT_PREP_PRMTOP\" -c \"$ENDPOINT_COORD\" -r \"$RST\" -x \"$TRAJ\"",
+                        "$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$ENDPOINT_PREP_PRMTOP\" -c \"$ENDPOINT_COORD\" -r \"$RST\" -x \"$TRAJ\""
+                        + (' -ref "$ENDPOINT_REFERENCE_COORD"' if endpoint_has_positional_restraints else ""),
                     ]
                 )
             else:
-                lines.append("$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$ENDPOINT_PREP_PRMTOP\" -c \"$ENDPOINT_COORD\" -r \"$RST\"")
+                lines.append(
+                    "$PREP_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$ENDPOINT_PREP_PRMTOP\" -c \"$ENDPOINT_COORD\" -r \"$RST\""
+                    + (' -ref "$ENDPOINT_REFERENCE_COORD"' if endpoint_has_positional_restraints else "")
+                )
             lines.extend(
                 [
                     "ENDPOINT_COORD=\"$RST\"",
@@ -667,7 +693,8 @@ def _window_lines(
                     f"OUT=\"$QOFF_OUTPUT_DIR/{stem}.out\"",
                     f"RST=\"{last_qoff_rst}\"",
                     f"TRAJ=\"$QOFF_OUTPUT_DIR/{stem}.nc\"",
-                    f"$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"{terminal_start_coord}\" -r \"$RST\" -x \"$TRAJ\"",
+                    f"$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"{terminal_start_coord}\" -r \"$RST\" -x \"$TRAJ\""
+                    + (' -ref "$QOFF_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
                     "",
                 ]
             )
@@ -732,11 +759,164 @@ def _window_lines(
                     f"OUT=\"$VDWOFF_OUTPUT_DIR/{stem}.out\"",
                     f"RST=\"$VDWOFF_OUTPUT_DIR/{stem}.rst7\"",
                     f"TRAJ=\"$VDWOFF_OUTPUT_DIR/{stem}.nc\"",
-                    "$RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$VDWOFF_PRMTOP\" -c \"$QOFF_ENDPOINT\" -r \"$RST\" -x \"$TRAJ\"",
+                    "$RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$VDWOFF_PRMTOP\" -c \"$QOFF_ENDPOINT\" -r \"$RST\" -x \"$TRAJ\""
+                    + (' -ref "$QOFF_ENDPOINT"' if vdwoff_has_positional_restraints else ""),
                     "",
                 ]
             )
     return lines
+
+
+def _bidirectional_lines(
+    *,
+    prep_label: str,
+    input_root: str,
+    runtime_output_root: str,
+    prep_stages: list[PreparationStage] | None,
+    prep_prmtop: str | None,
+    prep_start_coord: str | None,
+    windows: list[TIWindow],
+    qoff_prmtop: str,
+    start_coord: str,
+) -> list[str]:
+    qoff_windows = [window for window in windows if window.phase == "qoff"]
+    vdwoff_windows = [window for window in windows if window.phase == "vdwoff"]
+    if vdwoff_windows:
+        raise ValueError(
+            "bidirectional sampling currently requires combined_q_vdw GTI. "
+            "Use single_pass for split Q-off/VDW-off TI."
+        )
+    if not qoff_windows:
+        raise ValueError("bidirectional sampling requires at least one TI window")
+    if any(not window.equil_filename for window in qoff_windows):
+        raise ValueError("The recommended sampling protocol is missing per-window equilibration inputs.")
+    prep_has_positional_restraints = any("ntr = 1" in stage.content for stage in (prep_stages or []))
+    qoff_has_positional_restraints = any("ntr = 1" in window.content for window in qoff_windows)
+
+    lines = [
+        "set -euo pipefail",
+        "",
+        f'INPUT_ROOT="{input_root}"',
+        f'LEG_OUTPUT_ROOT="{runtime_output_root}"',
+        f'QOFF_PRMTOP="{qoff_prmtop}"',
+        f'BASE_COORD="{start_coord}"',
+        'mkdir -p "$LEG_OUTPUT_ROOT"',
+        'cd "$INPUT_ROOT"',
+        "",
+    ]
+    if prep_stages:
+        lines.extend(
+            [
+                f'PREP_PRMTOP="{prep_prmtop}"',
+                f'PREP_COORD="{prep_start_coord}"',
+                f'PREP_REFERENCE_COORD="{prep_start_coord}"',
+                'PREP_OUTPUT_DIR="$LEG_OUTPUT_ROOT/prep"',
+                'mkdir -p "$PREP_OUTPUT_DIR"',
+                f"echo 'Starting {prep_label} once before forward/reverse TI...'",
+                "",
+            ]
+        )
+        for stage in prep_stages:
+            stem = Path(stage.filename).stem
+            command = (
+                '$PREP_RUNNER -O -i "$INPUT" -o "$OUT" -p "$PREP_PRMTOP" '
+                '-c "$PREP_COORD" -r "$RST"'
+            )
+            if stage.writes_trajectory:
+                command += ' -x "$TRAJ"'
+            if prep_has_positional_restraints:
+                command += ' -ref "$PREP_REFERENCE_COORD"'
+            lines.extend(
+                [
+                    f'INPUT="$INPUT_ROOT/{stage.filename}"',
+                    f'OUT="$PREP_OUTPUT_DIR/{stem}.out"',
+                    f'RST="$PREP_OUTPUT_DIR/{stem}.rst7"',
+                    *( [f'TRAJ="$PREP_OUTPUT_DIR/{stem}.nc"'] if stage.writes_trajectory else [] ),
+                    command,
+                    'PREP_COORD="$RST"',
+                    "",
+                ]
+            )
+        lines.extend(['BASE_COORD="$PREP_COORD"', ""])
+
+    def append_sweep(*, direction: str, ordered: list[TIWindow], initial_coord: str) -> None:
+        run_root = f"$LEG_OUTPUT_ROOT/{direction}"
+        lines.extend(
+            [
+                f'RUN_ROOT="{run_root}"',
+                'TI_OUTPUT_DIR="$RUN_ROOT"',
+                'EQUIL_OUTPUT_DIR="$RUN_ROOT/equil"',
+                'mkdir -p "$TI_OUTPUT_DIR" "$EQUIL_OUTPUT_DIR"',
+                f"echo '{direction.capitalize()} TI sweep...'",
+                f'SWEEP_COORD="{initial_coord}"',
+                f'SWEEP_REFERENCE_COORD="{initial_coord}"',
+                "",
+            ]
+        )
+        for window in ordered:
+            stem = Path(window.filename).stem
+            lines.extend(
+                [
+                    f'INPUT="$INPUT_ROOT/{window.equil_filename}"',
+                    f'OUT="$EQUIL_OUTPUT_DIR/{stem}_equil.out"',
+                    f'RST="$EQUIL_OUTPUT_DIR/{stem}_equil.rst7"',
+                    f'TRAJ="$EQUIL_OUTPUT_DIR/{stem}_equil.nc"',
+                    '$QOFF_RUNNER -O -i "$INPUT" -o "$OUT" -p "$QOFF_PRMTOP" -c "$SWEEP_COORD" -r "$RST" -x "$TRAJ"'
+                    + (' -ref "$SWEEP_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
+                    'SWEEP_COORD="$RST"',
+                    f'INPUT="$INPUT_ROOT/{window.filename}"',
+                    f'OUT="$TI_OUTPUT_DIR/{stem}.out"',
+                    f'RST="$TI_OUTPUT_DIR/{stem}.rst7"',
+                    f'TRAJ="$TI_OUTPUT_DIR/{stem}.nc"',
+                    '$QOFF_RUNNER -O -i "$INPUT" -o "$OUT" -p "$QOFF_PRMTOP" -c "$SWEEP_COORD" -r "$RST" -x "$TRAJ"'
+                    + (' -ref "$SWEEP_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
+                    'SWEEP_COORD="$RST"',
+                    "",
+                ]
+            )
+    append_sweep(
+        direction="forward",
+        ordered=qoff_windows,
+        initial_coord="$BASE_COORD",
+    )
+    lines.extend(
+        [
+            'FORWARD_ENDPOINT="$SWEEP_COORD"',
+            'if [ ! -f "$FORWARD_ENDPOINT" ]; then',
+            "  echo 'Expected forward endpoint restart was not created; reverse recoupling cannot start.' >&2",
+            "  exit 1",
+            "fi",
+            "",
+        ]
+    )
+    append_sweep(
+        direction="reverse",
+        ordered=list(reversed(qoff_windows)),
+        initial_coord="$FORWARD_ENDPOINT",
+    )
+    return lines
+
+
+def _sampling_window_lines(*, ti_config: TIProtocolConfig | None, **kwargs) -> list[str]:
+    if ti_config is None or ti_config.sampling_mode == TISamplingMode.SINGLE_PASS:
+        return _window_lines(
+            **kwargs,
+            combined_layout=bool(
+                ti_config is not None
+                and ti_config.decoupling_mode == TIDecouplingMode.COMBINED_Q_VDW
+            ),
+        )
+    return _bidirectional_lines(
+        prep_label=kwargs["prep_label"],
+        input_root=kwargs["input_root"],
+        runtime_output_root=kwargs["runtime_output_root"],
+        prep_stages=kwargs["prep_stages"],
+        prep_prmtop=kwargs["prep_prmtop"],
+        prep_start_coord=kwargs["prep_start_coord"],
+        windows=kwargs["windows"],
+        qoff_prmtop=kwargs["qoff_prmtop"],
+        start_coord=kwargs["start_coord"],
+    )
 
 
 def render_leg_slurm_script(
@@ -755,6 +935,7 @@ def render_leg_slurm_script(
     vdw_prmtop: str,
     start_coord: str,
     qoff_coordinate_bridge: QoffCoordinateBridge | None = None,
+    ti_config: TIProtocolConfig | None = None,
 ) -> str:
     runner = _placeholder_runner(slurm_config)
     prep_runner = _placeholder_prep_runner(slurm_config)
@@ -794,7 +975,7 @@ def render_leg_slurm_script(
             "",
         ]
     )
-    return "\n".join(header + _window_lines(
+    return "\n".join(header + _sampling_window_lines(ti_config=ti_config,
         prep_label=prep_label,
         input_root=input_root,
         runtime_output_root=runtime_output_root,
@@ -827,6 +1008,7 @@ def render_tahoma_leg_script(
     vdw_prmtop: str,
     start_coord: str,
     qoff_coordinate_bridge: QoffCoordinateBridge | None = None,
+    ti_config: TIProtocolConfig | None = None,
 ) -> str:
     runner = _placeholder_runner(slurm_config)
     prep_runner = _placeholder_prep_runner(slurm_config)
@@ -899,7 +1081,7 @@ def render_tahoma_leg_script(
             f'QOFF_RUNNER="{qoff_runner}"',
             "",
         ]
-    return "\n".join(header + _window_lines(
+    return "\n".join(header + _sampling_window_lines(ti_config=ti_config,
         prep_label=prep_label,
         input_root=input_root,
         runtime_output_root=runtime_output_root,
@@ -932,6 +1114,7 @@ def write_leg_slurm_scripts(
     vdw_prmtop: str,
     start_coord: str,
     qoff_coordinate_bridge: QoffCoordinateBridge | None = None,
+    ti_config: TIProtocolConfig | None = None,
     output_dir: Path,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -952,6 +1135,7 @@ def write_leg_slurm_scripts(
             vdw_prmtop=vdw_prmtop,
             start_coord=start_coord,
             qoff_coordinate_bridge=qoff_coordinate_bridge,
+            ti_config=ti_config,
         ),
         encoding="utf-8",
     )
@@ -972,6 +1156,7 @@ def write_leg_slurm_scripts(
             vdw_prmtop=vdw_prmtop,
             start_coord=start_coord,
             qoff_coordinate_bridge=qoff_coordinate_bridge,
+            ti_config=ti_config,
         ),
         encoding="utf-8",
     )
