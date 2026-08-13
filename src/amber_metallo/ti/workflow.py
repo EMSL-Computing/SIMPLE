@@ -339,7 +339,25 @@ def water_reference_entry_dir(
     entry_label = _sanitize_water_reference_label(
         f"{metal_element}{formal_charge}_{config.water_reference.water_model}"
     )
-    return water_reference_root(config) / entry_label
+    base_entry = water_reference_root(config) / entry_label
+    manifest_path = base_entry / "water_reference_manifest.json"
+    if manifest_path.exists() and not water_reference_entry_matches(
+        config,
+        entry_dir=base_entry,
+        metal_element=metal_element,
+        formal_charge=formal_charge,
+        inherited_settings=inherited_settings,
+        official_126_frcmods=official_126_frcmods,
+    ):
+        signature_hash = _water_reference_signature_hash(
+            config,
+            metal_element=metal_element,
+            formal_charge=formal_charge,
+            inherited_settings=inherited_settings,
+            official_126_frcmods=official_126_frcmods,
+        )
+        return water_reference_root(config) / f"{entry_label}_{signature_hash}"
+    return base_entry
 
 
 def _water_reference_manifest_path(entry_dir: Path) -> Path:

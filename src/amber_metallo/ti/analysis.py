@@ -13,7 +13,13 @@ import gemmi
 
 from amber_metallo.amber.leap import DEFAULT_TLEAP_METAL_CHARGES
 from amber_metallo.execution import run_command
-from amber_metallo.inspection import SUPPORTED_METALS, classify_residue, load_structure, residue_key
+from amber_metallo.inspection import (
+    SUPPORTED_METALS,
+    classify_residue,
+    load_structure,
+    residue_key,
+    supported_metal_element,
+)
 from amber_metallo.reporting import write_json
 
 
@@ -135,6 +141,7 @@ def _iter_indexed_atoms(source: str | Path | gemmi.Structure) -> list[IndexedAto
         for residue in chain:
             residue_label = residue_key(chain.name, residue)
             classification = classify_residue(residue)
+            metal_element = supported_metal_element(residue) if classification == "metal" else None
             for atom in residue:
                 indexed.append(
                     IndexedAtom(
@@ -144,7 +151,7 @@ def _iter_indexed_atoms(source: str | Path | gemmi.Structure) -> list[IndexedAto
                         residue_name=residue.name.strip(),
                         residue_key=residue_label,
                         atom_name=atom.name.strip(),
-                        element=atom.element.name.upper(),
+                        element=(metal_element or atom.element.name).upper(),
                         classification=classification,
                         position=atom.pos,
                     )

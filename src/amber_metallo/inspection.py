@@ -161,16 +161,33 @@ def residue_key(chain_name: str, residue: gemmi.Residue) -> str:
     return f"{chain_name}:{residue.name.strip()}:{residue.seqid}"
 
 
+def supported_metal_element(residue: gemmi.Residue) -> str | None:
+    """Return the supported metal element represented by a monatomic residue.
+
+    Some Amber ``ambpdb`` outputs label a neodymium atom/residue as ``Nd`` but
+    write ``N`` in the PDB element column.  Gemmi correctly reports that
+    column as nitrogen, so fall back to the monatomic residue name when the
+    explicit element is not one of the metals supported by SIMPLE.
+    """
+    if len(residue) != 1:
+        return None
+    atom_element = residue[0].element.name.title()
+    if atom_element in SUPPORTED_METALS:
+        return atom_element
+    residue_element = residue.name.strip().title()
+    if residue_element in SUPPORTED_METALS:
+        return residue_element
+    return None
+
+
 def classify_residue(residue: gemmi.Residue) -> str:
     name = residue.name.strip().upper()
     if residue.is_water() or name in WATER_NAMES:
         return "water"
     if name in PROTEIN_RESIDUES or name in NUCLEIC_RESIDUES:
         return "standard"
-    if len(residue) == 1:
-        atom = residue[0]
-        if atom.element.name.title() in SUPPORTED_METALS or name.title() in SUPPORTED_METALS:
-            return "metal"
+    if supported_metal_element(residue) is not None:
+        return "metal"
     return "hetero"
 
 
@@ -207,6 +224,7 @@ def inspect_structure(
         )
         if classification == "metal":
             atom = residue[0]
+            element = supported_metal_element(residue) or atom.element.name.title()
             metals.append(
                 MetalSite(
                     site=site_index,
@@ -216,7 +234,7 @@ def inspect_structure(
                     residue_name=record.residue_name,
                     atom_name=atom.name.strip(),
                     atom_serial=atom.serial,
-                    element=atom.element.name.title(),
+                    element=element,
                 )
             )
             site_index += 1

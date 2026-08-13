@@ -210,6 +210,8 @@ Important TI options in the FreeE TOML are:
 
 Combined mode uses a flat layout: inputs are written under `bound/inputs`, a single-pass run writes directly under `output`, and bidirectional results are separated into `output/forward` and `output/reverse`. The `qoff` and `vdwoff` directories are reserved for split mode.
 
+Every generated TI workflow, including a single-metal calculation, also writes aggregate submission assets under `TI_BATCH`. The Tahoma and generic submit-all scripts launch each bound-site job separately but submit a shared water-reference job only once for each unique compatible water-reference directory and protocol signature. For example, ten Eu3+/OPC bound sites share one Eu3+/OPC water-reference simulation rather than writing ten jobs into the same output directory.
+
 A minimal TI TOML section looks like:
 
 ```toml

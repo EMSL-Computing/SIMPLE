@@ -1974,10 +1974,16 @@ def _build_ti_multi_workflow_result(
             case_plans.extend(_ti_case_plan_from_config(config) for config in expanded.configs)
 
     ti_batch_plan: TIBatchPlan | None = None
-    if len(configs) > 1:
+    if configs:
+        if len(selections) > 1:
+            selection_mode = "multi_workflow"
+        elif len(configs) > 1:
+            selection_mode = TIMetalSelectionMode.ONE_BY_ONE.value
+        else:
+            selection_mode = configs[0].metal.selection_mode.value
         ti_batch_plan = TIBatchPlan(
             batch_root=(Path.cwd() / "TI_BATCH").resolve(),
-            selection_mode="multi_workflow" if len(selections) > 1 else TIMetalSelectionMode.ONE_BY_ONE.value,
+            selection_mode=selection_mode,
             cases=case_plans,
         )
     return FreeEnergyWizardBuildResult(
@@ -2304,6 +2310,8 @@ def _write_ti_batch_submission_assets(
     batch_root.mkdir(parents=True, exist_ok=True)
     case_by_output = {str(case.output_dir.resolve()): case for case in batch_plan.cases}
     cases: list[dict[str, Any]] = []
+    water_references: list[dict[str, Any]] = []
+    water_reference_by_dir: dict[str, dict[str, Any]] = {}
     for result in successful_results:
         output_dir = Path(str(result.get("output_dir") or ".")).resolve()
         plan_case = case_by_output.get(str(output_dir))
@@ -2311,17 +2319,75 @@ def _write_ti_batch_submission_assets(
         water_slurm = _relative_script_path(result.get("water_slurm"), batch_root=batch_root)
         bound_tahoma = _relative_script_path(_tahoma_script_for_sbatch(result.get("bound_slurm")), batch_root=batch_root)
         water_tahoma = _relative_script_path(_tahoma_script_for_sbatch(result.get("water_slurm")), batch_root=batch_root)
+        relative_output_dir = _relative_script_path(output_dir, batch_root=batch_root)
+        water_reference_id: str | None = None
+        if water_slurm or water_tahoma:
+            raw_water_dir = result.get("water_reference_dir")
+            if raw_water_dir:
+                resolved_water_dir = Path(str(raw_water_dir)).expanduser().resolve()
+            else:
+                raw_water_script = result.get("water_slurm")
+                if not raw_water_script:
+                    raise ValueError(f"A water-reference submission script is missing for {output_dir}.")
+                resolved_water_dir = Path(str(raw_water_script)).expanduser().resolve().parent.parent
+            water_dir_key = str(resolved_water_dir)
+            raw_water_manifest = result.get("water_reference_manifest")
+            water_manifest = raw_water_manifest if isinstance(raw_water_manifest, dict) else {}
+            signature_hash = str(water_manifest.get("signature_hash") or "").strip() or None
+            existing_reference = water_reference_by_dir.get(water_dir_key)
+            if existing_reference is None:
+                water_reference_id = f"water_ref_{len(water_references) + 1:03d}"
+                existing_reference = {
+                    "id": water_reference_id,
+                    "water_reference_dir": _relative_script_path(resolved_water_dir, batch_root=batch_root),
+                    "signature_hash": signature_hash,
+                    "metal": water_manifest.get("metal"),
+                    "formal_charge": water_manifest.get("formal_charge"),
+                    "water_model": water_manifest.get("water_model"),
+                    "water_sbatch": water_slurm,
+                    "water_tahoma_sbatch": water_tahoma,
+                    "consumers": [],
+                }
+                water_reference_by_dir[water_dir_key] = existing_reference
+                water_references.append(existing_reference)
+            else:
+                water_reference_id = str(existing_reference["id"])
+                existing_signature = existing_reference.get("signature_hash")
+                if existing_signature and signature_hash and existing_signature != signature_hash:
+                    raise ValueError(
+                        "Conflicting water-reference conditions resolve to the same output directory "
+                        f"{resolved_water_dir}: signatures {existing_signature} and {signature_hash}. "
+                        "Use separate water-reference cache directories for distinct conditions."
+                    )
+                for script_key, script_value in (
+                    ("water_sbatch", water_slurm),
+                    ("water_tahoma_sbatch", water_tahoma),
+                ):
+                    existing_script = existing_reference.get(script_key)
+                    if existing_script and script_value and existing_script != script_value:
+                        raise ValueError(
+                            "Conflicting water-reference submission scripts resolve to the same output directory "
+                            f"{resolved_water_dir}: {existing_script} and {script_value}."
+                        )
+            existing_reference["consumers"].append(
+                {
+                    "site": None if plan_case is None else plan_case.site,
+                    "atom_index": None if plan_case is None else plan_case.atom_index,
+                    "output_dir": relative_output_dir,
+                }
+            )
         cases.append(
             {
                 "site": None if plan_case is None else plan_case.site,
                 "element": None if plan_case is None else plan_case.element,
                 "atom_index": None if plan_case is None else plan_case.atom_index,
-                "output_dir": _relative_script_path(output_dir, batch_root=batch_root),
+                "output_dir": relative_output_dir,
                 "selected_metal": result.get("selected_metal"),
                 "bound_sbatch": bound_slurm,
                 "water_sbatch": water_slurm,
                 "bound_tahoma_sbatch": bound_tahoma,
                 "water_tahoma_sbatch": water_tahoma,
+                "water_reference_id": water_reference_id,
             }
         )
     manifest_path = batch_root / "ti_batch_manifest.json"
@@ -2332,6 +2398,7 @@ def _write_ti_batch_submission_assets(
             "selection_mode": batch_plan.selection_mode,
             "batch_root": str(batch_root),
             "cases": cases,
+            "water_references": water_references,
             "failed_cases": failed_cases,
             "submit_all_template": str(batch_root / "submit_all_template.sh"),
             "submit_all_tahoma": str(batch_root / "submit_all_tahoma.sh"),
@@ -2356,21 +2423,34 @@ def _write_ti_batch_submission_assets(
         'JOB_NAME_PREFIX="${JOB_NAME_PREFIX:-gTI}"',
         "",
     ]
+    for index, water_reference in enumerate(water_references, start=1):
+        template_script = water_reference.get("water_sbatch")
+        if template_script:
+            template_lines.append(f"sbatch {template_script}")
+        tahoma_script = water_reference.get("water_tahoma_sbatch")
+        if tahoma_script:
+            metal = str(water_reference.get("metal") or "water").lower()
+            charge = water_reference.get("formal_charge")
+            condition_label = f"{metal}{charge}" if charge is not None else f"water{index}"
+            tahoma_lines.append(
+                'sbatch --account="$ACCOUNT" --time="$TIME" --nodes="$GPU_NODES" '
+                '--gres="$GPU_GRES" -p "$PARTITION" --job-name="${JOB_NAME_PREFIX}_'
+                + condition_label
+                + f'_water" {tahoma_script}'
+            )
     for index, case in enumerate(cases, start=1):
-        for key in ("water_sbatch", "bound_sbatch"):
-            script = case.get(key)
-            if script:
-                template_lines.append(f"sbatch {script}")
-        for key in ("water_tahoma_sbatch", "bound_tahoma_sbatch"):
-            script = case.get(key)
-            if script:
-                job_suffix = f"site{case.get('site') or index}_{'water' if 'water' in key else 'bound'}"
-                tahoma_lines.append(
-                    'sbatch --account="$ACCOUNT" --time="$TIME" --nodes="$GPU_NODES" '
-                    '--gres="$GPU_GRES" -p "$PARTITION" --job-name="${JOB_NAME_PREFIX}_'
-                    + job_suffix
-                    + f'" {script}'
-                )
+        template_script = case.get("bound_sbatch")
+        if template_script:
+            template_lines.append(f"sbatch {template_script}")
+        tahoma_script = case.get("bound_tahoma_sbatch")
+        if tahoma_script:
+            job_suffix = f"site{case.get('site') or index}_bound"
+            tahoma_lines.append(
+                'sbatch --account="$ACCOUNT" --time="$TIME" --nodes="$GPU_NODES" '
+                '--gres="$GPU_GRES" -p "$PARTITION" --job-name="${JOB_NAME_PREFIX}_'
+                + job_suffix
+                + f'" {tahoma_script}'
+            )
     (batch_root / "submit_all_template.sh").write_text("\n".join(template_lines) + "\n", encoding="utf-8")
     (batch_root / "submit_all_tahoma.sh").write_text("\n".join(tahoma_lines) + "\n", encoding="utf-8")
 
