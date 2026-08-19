@@ -47,6 +47,8 @@ tmp_plan-fetch/
 
 # User-requested exclusions
 tests/
+manuscript/
+*.pptx
 
 # IDE/editor metadata
 .vscode/

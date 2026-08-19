@@ -1,8 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import shlex
 
-from amber_metallo.config import SlurmConfig
+from amber_metallo.config import SlurmConfig, validate_slurm_identifier
+from amber_metallo.tool_config import ToolConfig, nwchem_sbatch_setup
+
+
+_SAFE_INPUT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _shell_path(path: Path) -> str:
+    return shlex.quote(str(path.resolve()))
+
+
+def _safe_input_name(value: str) -> str:
+    if Path(value).name != value or not _SAFE_INPUT_NAME_RE.fullmatch(value):
+        raise ValueError("NWChem retry input must be a plain filename without shell metacharacters.")
+    return value
 
 
 def _nwchem_resp_failure_function() -> list[str]:
@@ -30,6 +46,7 @@ def _nwchem_resp_failure_function() -> list[str]:
 
 
 def _generic_header(*, job_name: str) -> list[str]:
+    job_name = validate_slurm_identifier(job_name, field_name="Slurm job name")
     return [
         "#!/bin/bash",
         "#SBATCH --account=[Account]",
@@ -50,19 +67,30 @@ def render_resp_slurm_script(
     slurm_config: SlurmConfig,
     job_name: str,
     retry_input: str | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> str:
+    job_name = validate_slurm_identifier(job_name, field_name="Slurm job name")
+    if retry_input:
+        retry_input = _safe_input_name(retry_input)
     input_dir = job_root / "inputs"
     output_dir = job_root / "output"
-    runner = f"srun -n $SLURM_NTASKS {slurm_config.binary_override or 'nwchem'}"
+    nwchem_setup, configured_binary, mpi_launcher = nwchem_sbatch_setup(tool_config)
+    binary = slurm_config.binary_override or configured_binary
+    if Path(mpi_launcher).name == "srun":
+        runner = f"{mpi_launcher} -n $SLURM_NTASKS {binary}"
+    else:
+        runner = f"{mpi_launcher} -np $SLURM_NTASKS {binary}"
     lines = _generic_header(job_name=job_name)
     lines.extend(
         [
             "",
             "set -euo pipefail",
             "",
-            f'JOB_ROOT="{job_root.resolve()}"',
-            f'INPUT_DIR="{input_dir.resolve()}"',
-            f'OUTPUT_DIR="{output_dir.resolve()}"',
+            f"JOB_ROOT={_shell_path(job_root)}",
+            f"INPUT_DIR={_shell_path(input_dir)}",
+            f"OUTPUT_DIR={_shell_path(output_dir)}",
+            *nwchem_setup,
+            "",
             f'RUNNER="{runner}"',
             "",
             'mkdir -p "$OUTPUT_DIR"',
@@ -104,12 +132,15 @@ def render_resp_slurm_script(
 
 
 def render_tahoma_resp_script(*, job_root: Path, job_name: str, retry_input: str | None = None) -> str:
+    job_name = validate_slurm_identifier(job_name, field_name="Slurm job name")
+    if retry_input:
+        retry_input = _safe_input_name(retry_input)
     input_dir = job_root / "inputs"
     output_dir = job_root / "output"
     run_dir = "/big_scratch/${USER}/simple_resp_${SLURM_JOB_ID}"
     lines = [
         "#!/bin/bash",
-        f"#SBATCH --account=emsl62112",
+        "#SBATCH --account=emsl62112",
         "#SBATCH --time=04:00:00",
         "#SBATCH --nodes=1",
         "#SBATCH --ntasks-per-node=18",
@@ -120,9 +151,9 @@ def render_tahoma_resp_script(*, job_root: Path, job_name: str, retry_input: str
         "",
         "set -euo pipefail",
         "",
-        f'JOB_ROOT="{job_root.resolve()}"',
-        f'INPUT_DIR="{input_dir.resolve()}"',
-        f'OUTPUT_DIR="{output_dir.resolve()}"',
+        f"JOB_ROOT={_shell_path(job_root)}",
+        f"INPUT_DIR={_shell_path(input_dir)}",
+        f"OUTPUT_DIR={_shell_path(output_dir)}",
         f'RUN_DIR="{run_dir}"',
         'PYTHON_BIN="${PYTHON_BIN:-python3}"',
         'export OMP_NUM_THREADS=1',

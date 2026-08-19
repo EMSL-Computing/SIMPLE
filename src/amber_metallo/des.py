@@ -4,12 +4,15 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import shutil
 import shlex
 import subprocess
+
+from platformdirs import user_data_path
 
 from amber_metallo.amber.leap import (
     TLEAP_ADDITIVE_ION_UNIT_NAMES,
@@ -29,6 +32,7 @@ from amber_metallo.c4_assets import (
     opc_duvail_ion_frcmod,
     opc_duvail_polarizability_file,
 )
+from amber_metallo.tool_config import resolve_tool_binary
 from amber_metallo.config import (
     DESC4ParameterSet,
     DESComponent,
@@ -694,10 +698,25 @@ class _ReplicateGridLayout:
 
 
 def default_ref_data_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "REF_DATA"
+    source_checkout = Path(__file__).resolve().parents[2] / "REF_DATA"
+    if source_checkout.exists():
+        return source_checkout
+    packaged = Path(__file__).resolve().parent / "data" / "ref_data"
+    if not packaged.exists():
+        return packaged
+    managed = user_data_path("simple-ree", "PNNL") / "REF_DATA"
+    shutil.copytree(packaged, managed, dirs_exist_ok=True)
+    return managed.resolve()
 
 
 def resolve_ref_data_dir(ref_data_dir: str | Path) -> Path:
+    if str(ref_data_dir) == "REF_DATA":
+        override = os.environ.get("SIMPLE_REF_DATA_DIR", "").strip()
+        if override:
+            override_path = Path(override).expanduser().resolve()
+            if not override_path.exists():
+                raise FileNotFoundError(f"SIMPLE_REF_DATA_DIR does not exist: {override_path}")
+            return override_path
     candidate = Path(ref_data_dir).expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
@@ -2942,7 +2961,7 @@ def build_des_system(
 
     mixture_pdb = output_dir / "des_mixture.pdb"
     if des_config.mixing_mode == DESMixingMode.PACKMOL:
-        packmol_path = shutil.which("packmol")
+        packmol_path = resolve_tool_binary("packmol", path_finder=shutil.which)
         if packmol_path is None:
             raise RuntimeError(
                 "Packmol mixing mode was selected, but `packmol` was not found on PATH. "

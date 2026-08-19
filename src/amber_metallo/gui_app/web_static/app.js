@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   bootstrap: null,
+  apiToken: "",
   stage: null,
   sceneKind: "",
   currentPdb: "",
@@ -367,7 +368,7 @@ function refreshRespChargeHint() {
 async function api(path, payload = {}) {
   const response = await fetch(path, {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: {"Content-Type": "application/json", "X-SIMPLE-Token": state.apiToken},
     body: JSON.stringify(payload),
   });
   const data = await response.json();
@@ -380,7 +381,7 @@ async function api(path, payload = {}) {
 async function postJson(path, payload = {}) {
   const response = await fetch(path, {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: {"Content-Type": "application/json", "X-SIMPLE-Token": state.apiToken},
     body: JSON.stringify(payload),
   });
   let data = {};
@@ -397,7 +398,11 @@ async function uploadFile(inputId) {
   if (!file) throw new Error("Choose a file first.");
   const form = new FormData();
   form.append("file", file);
-  const response = await fetch("/api/upload", {method: "POST", body: form});
+  const response = await fetch("/api/upload", {
+    method: "POST",
+    headers: {"X-SIMPLE-Token": state.apiToken},
+    body: form,
+  });
   const data = await response.json();
   if (!response.ok || data.ok === false) throw new Error(data.error || `Upload failed: ${response.status}`);
   return {path: data.path, name: file.name};
@@ -2573,7 +2578,11 @@ async function uploadLibrarySelection(fileList, useRelativePaths) {
     form.append("files", file, file.name);
     form.append("relative_paths", useRelativePaths ? (file.webkitRelativePath || file.name) : file.name);
   }
-  const response = await fetch("/api/des-library/upload", {method: "POST", body: form});
+  const response = await fetch("/api/des-library/upload", {
+    method: "POST",
+    headers: {"X-SIMPLE-Token": state.apiToken},
+    body: form,
+  });
   const data = await response.json();
   if (!response.ok || data.ok === false) throw new Error(data.error || "Could not open the selected Amber library files.");
   $("library_search_path").value = data.path || "";
@@ -4071,7 +4080,11 @@ async function uploadProteinSiteRespCase(fileList) {
     form.append("files", file, file.name);
     form.append("relative_paths", file.webkitRelativePath || file.name);
   }
-  const response = await fetch("/api/protein-site-resp/upload", {method: "POST", body: form});
+  const response = await fetch("/api/protein-site-resp/upload", {
+    method: "POST",
+    headers: {"X-SIMPLE-Token": state.apiToken},
+    body: form,
+  });
   const data = await response.json();
   if (!response.ok || data.ok === false) throw new Error(data.error || "Could not open the selected RESP case folder.");
   $("protein_site_resp_search_root").value = data.search_root || ".";
@@ -4324,6 +4337,7 @@ async function init() {
   ensureStage();
   installBusyObserver();
   const boot = await fetch("/api/bootstrap").then((r) => r.json());
+  state.apiToken = String(boot.api_token || "");
   state.bootstrap = boot;
   replaceOptions($("workflow_type"), boot.workflow_options.map(([label, value]) => [value, label]), "metalloprotein");
   replaceOptions($("protein_ff"), boot.protein_force_fields, boot.protein_force_fields?.[0] || "ff19SB");

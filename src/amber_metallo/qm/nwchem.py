@@ -937,7 +937,6 @@ def suggest_group_constraints(
     excluded_atom_indices: set[int] | list[int] | tuple[int, ...] | None = None,
 ) -> dict[str, object]:
     adjacency: dict[int, list[int]] = {atom.index: [] for atom in molecule.atoms}
-    atom_lookup = {atom.index: atom for atom in molecule.atoms}
     for bond in molecule.bonds:
         adjacency[bond.first].append(bond.second)
         adjacency[bond.second].append(bond.first)
@@ -2293,8 +2292,33 @@ def select_job_dir(
     if apply_mode == RespApplyMode.NEW_DIRECTORY:
         return _next_resp_job_dir(base_path)
     if apply_mode == RespApplyMode.REBUILD and existing_job_dir is not None:
-        candidate = Path(existing_job_dir).expanduser().resolve()
+        requested_candidate = Path(existing_job_dir).expanduser()
+        if requested_candidate.is_symlink():
+            raise ValueError("Refusing to rebuild a RESP job through a symbolic link.")
+        candidate = requested_candidate.resolve()
+        try:
+            candidate.relative_to(base_path)
+        except ValueError as exc:
+            raise ValueError(f"RESP rebuild target must be inside the RESP jobs directory: {base_path}") from exc
+        protected_paths = {base_path, Path.home().resolve(), Path(candidate.anchor).resolve()}
+        if candidate in protected_paths:
+            raise ValueError(f"Refusing to rebuild protected directory: {candidate}")
         if candidate.exists():
+            manifest_path = candidate / "manifests" / "resp_apply_manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError(
+                    "Refusing to remove a directory that is not a recognized SIMPLE RESP job: "
+                    f"missing {manifest_path}"
+                )
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"RESP job manifest cannot be validated: {manifest_path}") from exc
+            if str(manifest.get("fingerprint") or "") != fingerprint:
+                raise ValueError("RESP rebuild target fingerprint does not match the current molecule.")
+            recorded_job_dir = Path(str(manifest.get("job_dir") or "")).expanduser().resolve()
+            if recorded_job_dir != candidate:
+                raise ValueError("RESP rebuild target does not match the directory recorded in its manifest.")
             shutil.rmtree(candidate)
         return candidate
     if existing_job_dir:

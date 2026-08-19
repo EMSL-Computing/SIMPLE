@@ -3,11 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import random
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal
+
+from platformdirs import user_data_path
 
 from amber_metallo.reporting import console, write_json
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
@@ -374,12 +377,11 @@ def _sampling_selection_detail(selection: str) -> str:
     return "Forward + Reverse (optional convergence diagnostic)"
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
 def analysis_library_root() -> Path:
-    return repo_root() / "analysis_library"
+    override = os.environ.get("SIMPLE_ANALYSIS_LIBRARY_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return (user_data_path("simple-ree", "PNNL") / "analysis_library").resolve()
 
 
 def water_ref_library_path() -> Path:
@@ -1409,7 +1411,7 @@ def _result_from_library_case(
     qoff = aggregate.get("qoff") or {}
     vdwoff = aggregate.get("vdwoff") or {}
     total = aggregate.get("total") or {}
-    output_dir = repo_root() / "analysis_library"
+    output_dir = analysis_library_root()
     qoff_analysis = PhaseAnalysis(
         phase="qoff",
         delta_g_kcal_mol=float(qoff.get("delta_g_kcal_mol", 0.0)),

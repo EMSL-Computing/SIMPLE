@@ -950,7 +950,6 @@ def run_workflow(
         if site_resp_enabled:
             assert site_system_config is not None
             assert prepared_pdb is not None
-            system_pdb = stages["system"] / "system.pdb"
             system_prmtop = stages["system"] / "system.prmtop"
             system_inpcrd = stages["system"] / "system.inpcrd"
             reference_pdb = stages["system"] / "system.unsolvated.pdb"

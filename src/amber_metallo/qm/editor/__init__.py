@@ -1596,7 +1596,6 @@ def launch_resp_editor(
             QDialog,
             QDoubleSpinBox,
             QFormLayout,
-            QGridLayout,
             QGroupBox,
             QHBoxLayout,
             QLabel,

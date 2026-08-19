@@ -10,6 +10,7 @@ from amber_metallo.amber.leap import TLEAP_ION_LIBRARY_LABELS
 from amber_metallo.execution import run_command
 from amber_metallo.reporting import write_json
 from amber_metallo.ti.config import TIImplementationMode
+from amber_metallo.tool_config import resolve_tool_binary
 
 
 _PRMTOP_FLAG_PATTERN = re.compile(r"^%FLAG\s+(?P<name>\S+)\s*$")
@@ -1505,7 +1506,7 @@ def prepare_decharged_topology(
             output_prmtop.write_text("TI dry-run decharged topology placeholder\n", encoding="utf-8")
         decharge_metadata["decharge_method"] = "dry_run_copy"
     else:
-        binary = shutil.which("parmed")
+        binary = resolve_tool_binary("parmed", path_finder=shutil.which)
         if binary is None:
             raise RuntimeError("ParmEd (`parmed`) was not found on PATH, so the decharged topology could not be built.")
         run_command(

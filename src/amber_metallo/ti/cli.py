@@ -45,6 +45,7 @@ from amber_metallo.ti.config import (
     TIChargeCompensationMode,
     TIDecouplingMode,
     TIImplementationMode,
+    TIProductionEnsemble,
     TIProtocolConfig,
     TISamplingMode,
     TIWorkflowConfig,
@@ -372,6 +373,36 @@ def _prompt_ti_sampling_mode(decoupling_mode: TIDecouplingMode) -> TISamplingMod
             border_style="cyan",
         )
     return selection
+
+
+def _prompt_ti_production_ensemble() -> TIProductionEnsemble:
+    choices = [
+        WizardChoice(
+            TIProductionEnsemble.NVT.value,
+            "NVT (TEMP default)",
+            "Run TI windows at fixed volume (ntb=1, ntp=0). Pre-TI preparation remains unchanged.",
+        ),
+        WizardChoice(
+            TIProductionEnsemble.NPT.value,
+            "NPT (legacy behavior)",
+            "Run TI windows at constant pressure (ntb=2, ntp=1) using the inherited pressure settings.",
+        ),
+    ]
+    print_notice(
+        "TEMPORARY TI Ensemble Test",
+        "This temporary choice is for comparing NVT against the existing NPT TI behavior. "
+        "[bold cyan]NVT is the default[/bold cyan]. It changes only the TI windows; preparation and generated "
+        "SBATCH/output structure remain the same.",
+        border_style="yellow",
+    )
+    _display_choice_table("TEMPORARY: TI production ensemble", choices)
+    return TIProductionEnsemble(
+        _prompt_choice(
+            "[TEMPORARY] Choose the TI production ensemble",
+            choices,
+            default_key=TIProductionEnsemble.NVT.value,
+        )
+    )
 
 
 def _prompt_ti_charge_compensation_mode() -> TIChargeCompensationMode:

@@ -2,12 +2,36 @@
 
 This tutorial describes the main ways to use SIMPLE for metal-containing simulation setup and analysis. SIMPLE can be used through the browser GUI for visual, system-by-system preparation, or through the command line for reproducible and batch workflows.
 
+## 0. Configure scientific software
+
+For a new Conda installation, run the interactive installer from the repository root:
+
+```bash
+python install_simple.py
+conda activate simple
+```
+
+AmberTools 26 is the recommended default. AmberTools alone supports SIMPLE system setup, parameter and input preparation, most analyses, and both GUI and CLI operation. It does not supply licensed `pmemd`, `pmemd.MPI`, or `pmemd.cuda`; therefore generic production MD and TI/free-energy simulation execution requires a separately licensed AMBER installation registered in the per-user `tools.toml` file.
+
+NWChem is optional unless a selected RESP/QM path needs it. Choose either the complete Conda NWChem/OpenMPI option or an existing NWChem executable together with the MPI launcher against which it was built. Do not mix the two MPI stacks.
+
+Review or change the software configuration later with:
+
+```bash
+simple doctor
+simple configure
+```
+
+On Linux the default file is `~/.config/simple/tools.toml`. Generic `sbatch` files snapshot the configured AMBER or NWChem/MPI paths when they are generated. If the TOML path changes, regenerate the generic script.
+
+Tahoma users should install AmberTools with Conda for preparation and analysis. Tahoma-specific MD, TI, RESP, and MM-PBSA `sbatch` files retain their existing Tahoma setup and do not require the local licensed-AMBER path in `tools.toml`.
+
 ## 1. Launching the Web GUI
 
 Start the browser interface from the repository root:
 
 ```bash
-python GUI.py --web
+simple-gui
 ```
 
 On a local workstation, this command starts the GUI server and opens the default web browser automatically. If the browser does not open, copy the printed local URL into a browser manually.
@@ -15,7 +39,7 @@ On a local workstation, this command starts the GUI server and opens the default
 When running on an HPC login node or other remote machine, disable automatic browser launch and choose a forwarded port:
 
 ```bash
-python GUI.py --web --web-port 8000 --no-browser
+simple-gui --web-port 8000 --no-browser
 ```
 
 Then open the forwarded address in your local browser. A typical SSH tunnel is:
@@ -456,7 +480,7 @@ A library bundle should contain:
 
 The library file defines the residue name, atoms, atom names, charges, and connectivity. The `frcmod` file supplies the missing bonded and nonbonded parameters needed by Amber. SIMPLE assumes these files are already chemically reviewed and Amber-ready; Library mode does not run RESP, GAFF, or quantum chemistry parameterization.
 
-When a bundle is registered, SIMPLE copies the files into the managed REF_DATA area, records the component in `custom_des_components.json`, and makes that component available in later DES builds. User-added components are stored under `REF_DATA/Custom_DES/<component_key>/`. Built-in DES components are protected, while user-added components can be edited, overwritten, or removed.
+When a bundle is registered, SIMPLE copies the files into its managed REF_DATA area, records the component in `custom_des_components.json`, and makes that component available in later DES builds. In an installed package this managed area is under the operating system's per-user application-data directory; `SIMPLE_REF_DATA_DIR` can override it. User-added components are stored under `REF_DATA/Custom_DES/<component_key>/`. Built-in DES components are protected, while user-added components can be edited, overwritten, or removed.
 
 The command-line route is:
 

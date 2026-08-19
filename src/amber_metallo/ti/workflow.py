@@ -380,7 +380,7 @@ def _water_reference_signature_hash(
         official_126_frcmods=official_126_frcmods,
     )
     encoded = json.dumps(signature, sort_keys=True).encode("utf-8")
-    return hashlib.sha1(encoded).hexdigest()[:12]
+    return hashlib.sha1(encoded, usedforsecurity=False).hexdigest()[:12]
 
 
 def water_reference_entry_matches(
@@ -558,7 +558,7 @@ def _multi_water_reference_label(config: TIWorkflowConfig, selected_sites: list[
         f"{selected.element}{formal_charges_by_site[selected.site]}_site{selected.site}"
         for selected in selected_sites
     )
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
     return _sanitize_water_reference_label(f"multi_{raw}_{config.water_reference.water_model}_{digest}")
 
 
@@ -608,7 +608,10 @@ def _multi_water_reference_signature_hash(
         inherited_settings=inherited_settings,
         official_126_frcmods=official_126_frcmods,
     )
-    return hashlib.sha1(json.dumps(signature, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha1(
+        json.dumps(signature, sort_keys=True).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
 
 
 def _prepare_multi_water_reference(

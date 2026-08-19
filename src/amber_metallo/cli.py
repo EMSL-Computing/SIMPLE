@@ -119,6 +119,18 @@ from amber_metallo.protein_site_resp import (
 )
 from amber_metallo.reporting import console, emit_key_value_table, print_workflow_summary
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
+from amber_metallo.tool_config import (
+    AmberSettings,
+    AmberToolsSettings,
+    NWChemSettings,
+    ToolConfig,
+    default_tool_config_path,
+    discover_ambertools_home,
+    discover_binary,
+    load_tool_config,
+    save_tool_config,
+    tool_config_summary,
+)
 from amber_metallo.qm.editor import launch_resp_editor
 from amber_metallo.qm.nwchem import (
     build_default_session_state,
@@ -5816,6 +5828,141 @@ def build_wizard_config(write_config: str | None) -> WorkflowConfig:
     return build_wizard_configs(write_config).configs[0]
 
 
+def _prompt_tool_mode(label: str, choices: tuple[str, ...], default: str) -> str:
+    options = "/".join(choices)
+    while True:
+        value = typer.prompt(f"{label} [{options}]", default=default).strip().lower()
+        if value in choices:
+            return value
+        console.print(f"[red]Choose one of: {', '.join(choices)}.[/red]")
+
+
+def _prompt_required_value(label: str, default: str = "") -> str:
+    while True:
+        value = typer.prompt(label, default=default).strip()
+        if value:
+            return value
+        console.print(f"[red]{label} is required for this selection.[/red]")
+
+
+@app.command()
+def configure(
+    config_path: str | None = typer.Option(None, "--config", help="Override the per-user tools.toml path"),
+) -> None:
+    """Configure AmberTools, licensed AMBER, NWChem, and other executables."""
+    target = Path(config_path).expanduser() if config_path else default_tool_config_path()
+    current = load_tool_config(target)
+    console.print(
+        Panel.fit(
+            "AmberTools supports system setup, analysis, and the GUI. "
+            "Licensed AMBER must be configured for production MD and TI/free-energy simulation execution.\n\n"
+            "Tahoma users should use Conda AmberTools for local preparation. The generated Tahoma sbatch files "
+            "keep their site-specific AMBER setup and do not use the local licensed-AMBER path below.",
+            title="SIMPLE software configuration",
+            border_style="cyan",
+        )
+    )
+
+    ambertools_default = current.ambertools.mode if current.ambertools.mode != "disabled" else "conda"
+    ambertools_mode = _prompt_tool_mode(
+        "AmberTools source",
+        ("conda", "external", "disabled"),
+        ambertools_default,
+    )
+    ambertools_home = current.ambertools.home
+    if ambertools_mode == "conda":
+        ambertools_home = discover_ambertools_home()
+    elif ambertools_mode == "external":
+        ambertools_home = _prompt_required_value(
+            "AmberTools home directory",
+            default=ambertools_home or discover_ambertools_home(),
+        )
+    else:
+        ambertools_home = ""
+
+    amber_mode = _prompt_tool_mode(
+        "Licensed AMBER source",
+        ("external", "module", "disabled"),
+        current.amber.mode,
+    )
+    amber_home = current.amber.home
+    amber_module = current.amber.module_name
+    setup_script = current.amber.setup_script
+    if amber_mode == "external":
+        amber_home = _prompt_required_value(
+            "Licensed AMBER home directory (AMBERHOME)",
+            default=amber_home or "",
+        )
+        setup_default = setup_script or (str(Path(amber_home).expanduser() / "amber.sh") if amber_home else "")
+        setup_script = _prompt_required_value("AMBER activation script", default=setup_default)
+        amber_module = ""
+    elif amber_mode == "module":
+        amber_module = _prompt_required_value("AMBER module name", default=amber_module or "amber")
+        amber_home = ""
+        setup_script = ""
+    else:
+        amber_home = ""
+        amber_module = ""
+        setup_script = ""
+        console.print(
+            "[bold red]Licensed AMBER is not configured. Generic production MD and TI/free-energy sbatch "
+            "files will stop with a configuration error.[/bold red]"
+        )
+
+    nwchem_mode = _prompt_tool_mode(
+        "NWChem source",
+        ("conda", "external", "module", "disabled"),
+        current.nwchem.mode,
+    )
+    nwchem_binary = current.nwchem.binary
+    mpi_launcher = current.nwchem.mpi_launcher
+    nwchem_module = current.nwchem.module_name
+    if nwchem_mode == "conda":
+        nwchem_binary = discover_binary("nwchem")
+        mpi_launcher = discover_binary("mpirun") or discover_binary("mpiexec")
+        nwchem_module = ""
+    elif nwchem_mode == "external":
+        nwchem_binary = _prompt_required_value("Absolute NWChem executable path", default=nwchem_binary or "")
+        mpi_launcher = _prompt_required_value("Matching MPI launcher path", default=mpi_launcher or "")
+        nwchem_module = ""
+    elif nwchem_mode == "module":
+        nwchem_module = _prompt_required_value("NWChem module name", default=nwchem_module or "nwchem")
+        nwchem_binary = "nwchem"
+        mpi_launcher = ""
+    else:
+        nwchem_binary = ""
+        mpi_launcher = ""
+        nwchem_module = ""
+
+    configured = ToolConfig(
+        ambertools=AmberToolsSettings(mode=ambertools_mode, home=ambertools_home),
+        amber=AmberSettings(
+            mode=amber_mode,
+            home=amber_home,
+            activation=current.amber.activation,
+            setup_script=setup_script,
+            module_name=amber_module,
+            serial=current.amber.serial,
+            mpi=current.amber.mpi,
+            gpu=current.amber.gpu,
+            gpu_mpi=current.amber.gpu_mpi,
+        ),
+        nwchem=NWChemSettings(
+            mode=nwchem_mode,
+            binary=nwchem_binary,
+            mpi_launcher=mpi_launcher,
+            module_name=nwchem_module,
+        ),
+        executables=current.executables,
+    )
+    saved = save_tool_config(configured, target)
+    console.print(f"[bold green]Saved software configuration:[/bold green] {saved}")
+    console.print(
+        "[cyan]Paths may be edited later in this TOML file. Editing a mode to 'conda' does not install a "
+        "package; rerun install_simple.py or install the selected package in the SIMPLE environment.[/cyan]"
+    )
+
+
 @app.command()
 def doctor() -> None:
     """Report AMBERHOME, binaries, and available force-field assets."""
@@ -5840,6 +5987,8 @@ def doctor() -> None:
     for item in summary["leaprc_files"]:
         leap_table.add_row(item)
     console.print(leap_table)
+
+    emit_key_value_table("Configured software", list(tool_config_summary().items()))
 
 
 @app.command()

@@ -6,6 +6,7 @@ from pathlib import Path
 from amber_metallo.config import SlurmConfig, SlurmProfile
 from amber_metallo.ti.config import TIDecouplingMode, TIProtocolConfig, TISamplingMode
 from amber_metallo.ti.protocols import PreparationStage, TIWindow
+from amber_metallo.tool_config import ToolConfig, amber_sbatch_setup
 
 
 @dataclass(slots=True)
@@ -32,25 +33,33 @@ def _runner(config: SlurmConfig) -> str:
     return f"srun -n {config.ntasks} {binary}"
 
 
-def _placeholder_runner(config: SlurmConfig) -> str:
+def _placeholder_runner(config: SlurmConfig, amber_binaries: dict[str, str] | None = None) -> str:
+    amber_binaries = amber_binaries or {}
     if config.profile == SlurmProfile.GPU:
         if config.gpus > 1:
-            binary = config.binary_override or "pmemd.cuda.MPI"
+            binary = config.binary_override or amber_binaries.get("gpu_mpi") or "pmemd.cuda.MPI"
             return f"srun -n ${{SLURM_GPUS_ON_NODE:-{config.gpus}}} {binary}"
-        return config.binary_override or "pmemd.cuda"
-    binary = config.binary_override or "pmemd.MPI"
+        return config.binary_override or amber_binaries.get("gpu") or "pmemd.cuda"
+    binary = config.binary_override or amber_binaries.get("mpi") or "pmemd.MPI"
     return f"srun -n ${{SLURM_NTASKS:?Submit this script with sbatch so Slurm sets SLURM_NTASKS.}} {binary}"
 
 
-def _placeholder_prep_runner(config: SlurmConfig) -> str:
+def _placeholder_prep_runner(config: SlurmConfig, amber_binaries: dict[str, str] | None = None) -> str:
+    amber_binaries = amber_binaries or {}
     if config.profile == SlurmProfile.GPU:
-        return "srun -n ${SLURM_NTASKS:-1} pmemd.MPI"
+        return f"srun -n ${{SLURM_NTASKS:-1}} {amber_binaries.get('mpi') or 'pmemd.MPI'}"
     return "$RUNNER"
 
 
-def _placeholder_qoff_runner(config: SlurmConfig, *, disjoint_dual_topology: bool) -> str:
+def _placeholder_qoff_runner(
+    config: SlurmConfig,
+    *,
+    disjoint_dual_topology: bool,
+    amber_binaries: dict[str, str] | None = None,
+) -> str:
+    amber_binaries = amber_binaries or {}
     if config.profile == SlurmProfile.GPU and disjoint_dual_topology:
-        return "srun -n ${SLURM_NTASKS:-1} pmemd.MPI"
+        return f"srun -n ${{SLURM_NTASKS:-1}} {amber_binaries.get('mpi') or 'pmemd.MPI'}"
     return "$RUNNER"
 
 
@@ -936,10 +945,21 @@ def render_leg_slurm_script(
     start_coord: str,
     qoff_coordinate_bridge: QoffCoordinateBridge | None = None,
     ti_config: TIProtocolConfig | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> str:
-    runner = _placeholder_runner(slurm_config)
-    prep_runner = _placeholder_prep_runner(slurm_config)
-    qoff_runner = _placeholder_qoff_runner(slurm_config, disjoint_dual_topology=qoff_coordinate_bridge is not None)
+    primary_kind = "mpi"
+    required_kinds = ["mpi"]
+    if slurm_config.profile == SlurmProfile.GPU:
+        primary_kind = "gpu_mpi" if slurm_config.gpus > 1 else "gpu"
+        required_kinds.insert(0, primary_kind)
+    amber_setup, amber_binaries = amber_sbatch_setup(tool_config, required_kinds=required_kinds)
+    runner = _placeholder_runner(slurm_config, amber_binaries)
+    prep_runner = _placeholder_prep_runner(slurm_config, amber_binaries)
+    qoff_runner = _placeholder_qoff_runner(
+        slurm_config,
+        disjoint_dual_topology=qoff_coordinate_bridge is not None,
+        amber_binaries=amber_binaries,
+    )
     prep_label = _prep_label(leg_name)
     header = [
         "#!/bin/bash",
@@ -968,6 +988,8 @@ def render_leg_slurm_script(
             "",
             "# Fill in the SBATCH placeholders above before submission.",
             _workflow_description(prep_label=prep_label, prep_stages=prep_stages, windows=windows),
+            "",
+            *amber_setup,
             "",
             f'RUNNER="{runner}"',
             f'PREP_RUNNER="{prep_runner}"',

@@ -5,7 +5,13 @@ from pathlib import Path
 
 from amber_metallo.reporting import write_json
 from amber_metallo.ti.analysis import InheritedMDSettings
-from amber_metallo.ti.config import TIDecouplingMode, TIImplementationMode, TIProtocolConfig, TISamplingMode
+from amber_metallo.ti.config import (
+    TIDecouplingMode,
+    TIImplementationMode,
+    TIProductionEnsemble,
+    TIProtocolConfig,
+    TISamplingMode,
+)
 
 
 @dataclass(slots=True)
@@ -68,6 +74,7 @@ def _uses_single_topology_gti_decoupling(config: TIProtocolConfig) -> bool:
 def _cntrl_lines(
     *,
     settings: InheritedMDSettings,
+    production_ensemble: TIProductionEnsemble,
     nstlim: int,
     clambda: float,
     charge_mask: str | None,
@@ -96,6 +103,12 @@ def _cntrl_lines(
         resolved_dt_ps = min(resolved_dt_ps, _SOFTCORE_MAX_DT_PS)
     resolved_ntc = ntc_override if ntc_override is not None else (1 if softcore_enabled else settings.ntc)
     resolved_ntf = ntf_override if ntf_override is not None else (1 if softcore_enabled else settings.ntf)
+    if production_ensemble == TIProductionEnsemble.NVT:
+        resolved_ntb = 1
+        resolved_ntp = 0
+    else:
+        resolved_ntb = 2
+        resolved_ntp = 1
     lines = [
         "&cntrl",
         "  imin = 0,",
@@ -105,9 +118,9 @@ def _cntrl_lines(
         f"  dt = {resolved_dt_ps:.6f},",
         f"  tempi = {(settings.tempi_k or settings.temperature_k):.3f},",
         f"  temp0 = {settings.temperature_k:.3f},",
-        f"  ntb = {settings.ntb},",
-        f"  ntp = {settings.ntp},",
-        f"  pres0 = {settings.pressure_bar:.3f},",
+        f"  ntb = {resolved_ntb},",
+        f"  ntp = {resolved_ntp},",
+        *([f"  pres0 = {settings.pressure_bar:.3f},"] if resolved_ntp > 0 else []),
         f"  cut = {settings.cut_angstrom:.3f},",
         f"  ntc = {resolved_ntc},",
         f"  ntf = {resolved_ntf},",
@@ -119,7 +132,7 @@ def _cntrl_lines(
         f"  ioutfm = {settings.ioutfm},",
         "  ntxo = 1,",
         f"  iwrap = {settings.iwrap},",
-        f"  icfe = 1,",
+        "  icfe = 1,",
         f"  clambda = {clambda:.3f},",
         f"  logdvdl = {1 if logdvdl else 0},",
         f"  ifsc = {1 if softcore_enabled else 0},",
@@ -145,9 +158,9 @@ def _cntrl_lines(
         lines.append(f"  scmask2 = '{scmask2 or ''}',")
         lines.append(f"  scalpha = {scalpha:.3f},")
         lines.append(f"  scbeta = {scbeta:.3f},")
-    if settings.barostat is not None:
+    if settings.barostat is not None and resolved_ntp > 0:
         lines.append(f"  barostat = {settings.barostat},")
-    if settings.taup is not None:
+    if settings.taup is not None and resolved_ntp > 0:
         lines.append(f"  taup = {settings.taup:.3f},")
     lines.append("/")
     return lines
@@ -560,6 +573,7 @@ def _render_window(
     *,
     title: str,
     settings: InheritedMDSettings,
+    production_ensemble: TIProductionEnsemble,
     production_time_ns: float,
     clambda: float,
     charge_mask: str | None,
@@ -587,6 +601,7 @@ def _render_window(
         title,
         *_cntrl_lines(
             settings=settings,
+            production_ensemble=production_ensemble,
             nstlim=_ns_to_nstlim(production_time_ns, resolved_dt_ps),
             clambda=clambda,
             charge_mask=charge_mask,
@@ -669,6 +684,7 @@ def generate_ti_inputs(
         equil_name = filename.replace(".in", "_equil.in")
         common = dict(
             settings=inherited_settings,
+            production_ensemble=config.production_ensemble,
             production_time_ns=config.window_equilibration_ns,
             clambda=clambda,
             charge_mask=charge_mask,
@@ -719,6 +735,7 @@ def generate_ti_inputs(
         content = _render_window(
             title=title,
             settings=inherited_settings,
+            production_ensemble=config.production_ensemble,
             production_time_ns=config.production_time_ns,
             clambda=clambda,
             charge_mask=None if use_single_topology_gti_decoupling else (qoff_charge_mask or atom_mask),
@@ -775,6 +792,7 @@ def generate_ti_inputs(
         content = _render_window(
             title=title,
             settings=inherited_settings,
+            production_ensemble=config.production_ensemble,
             production_time_ns=config.production_time_ns,
             clambda=clambda,
             charge_mask=None,
@@ -841,6 +859,7 @@ def _ti_manifest_payload(config: TIProtocolConfig, windows: list[TIWindow]) -> d
     ]
     return {
         "output_layout": "combined_flat" if combined_layout else "split_phase_directories",
+        "production_ensemble": config.production_ensemble.value,
         "sampling_protocol": {
             "mode": config.sampling_mode.value,
             "replicas": 1,

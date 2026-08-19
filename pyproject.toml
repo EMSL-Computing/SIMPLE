@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "SIMPLE molecular-simulation workflow automation for rare earth element systems."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
-license = { text = "Battelle Memorial Institute license; see README.md" }
+license = "BSD-2-Clause"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
   { name = "Kim H." }
 ]
@@ -18,14 +19,14 @@ dependencies = [
   "jinja2>=3.1.6",
   "matplotlib>=3.8",
   "MDAnalysis>=2.8",
-  "mpi4py>=4.0",
   "networkx>=3.0",
-  "numpy>=2.0",
-  "python-multipart>=0.0.9",
+  "numpy>=1.26,<2",
+  "platformdirs>=4.0",
+  "python-multipart>=0.0.18",
   "PySide6>=6.7",
   "propka>=3.5",
   "pydantic>=2.12",
-  "requests>=2.32",
+  "requests>=2.32.4",
   "rich>=14.3",
   "tomlkit>=0.14",
   "typer>=0.24",
@@ -33,12 +34,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mpi = [
+  "mpi4py>=4.0",
+]
 dev = [
   "pytest>=9.0",
 ]
 
 [project.scripts]
 simple = "amber_metallo.cli:app"
+simple-gui = "GUI:main"
+simple-free-energy = "FreeE:main"
+simple-analyze = "analyses:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/amber_metallo"]
@@ -48,6 +55,31 @@ include = [
   "src/amber_metallo/gui_app/web_static/*",
   "src/amber_metallo/data/opc_duvail/*",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+"GUI.py" = "GUI.py"
+"FreeE.py" = "FreeE.py"
+"analyses.py" = "analyses.py"
+"REF_DATA/N8888/N8888_h.pdb" = "amber_metallo/data/ref_data/N8888/N8888_h.pdb"
+"REF_DATA/N8888/N88_h.frcmod" = "amber_metallo/data/ref_data/N8888/N88_h.frcmod"
+"REF_DATA/N8888/N88_h_ptmpsi.lib" = "amber_metallo/data/ref_data/N8888/N88_h_ptmpsi.lib"
+"REF_DATA/HAH/HAH_h.pdb" = "amber_metallo/data/ref_data/HAH/HAH_h.pdb"
+"REF_DATA/HAH/HAH_h.frcmod" = "amber_metallo/data/ref_data/HAH/HAH_h.frcmod"
+"REF_DATA/HAH/HAH_h_ptmpsi.lib" = "amber_metallo/data/ref_data/HAH/HAH_h_ptmpsi.lib"
+"REF_DATA/Choline/CH1_h.pdb" = "amber_metallo/data/ref_data/Choline/CH1_h.pdb"
+"REF_DATA/Choline/CH1_h.frcmod" = "amber_metallo/data/ref_data/Choline/CH1_h.frcmod"
+"REF_DATA/Choline/CH1_h_ptmpsi.lib" = "amber_metallo/data/ref_data/Choline/CH1_h_ptmpsi.lib"
+"REF_DATA/Ethylene-glycol/EG1_h.pdb" = "amber_metallo/data/ref_data/Ethylene-glycol/EG1_h.pdb"
+"REF_DATA/Ethylene-glycol/EG1_h.frcmod" = "amber_metallo/data/ref_data/Ethylene-glycol/EG1_h.frcmod"
+"REF_DATA/Ethylene-glycol/EG1_h_ptmpsi.lib" = "amber_metallo/data/ref_data/Ethylene-glycol/EG1_h_ptmpsi.lib"
+"REF_DATA/Acetone/ACN_h.frcmod" = "amber_metallo/data/ref_data/Acetone/ACN_h.frcmod"
+"REF_DATA/Acetone/ACN_h_ptmpsi.lib" = "amber_metallo/data/ref_data/Acetone/ACN_h_ptmpsi.lib"
+"REF_DATA/Ethanol/EtOH_h.frcmod" = "amber_metallo/data/ref_data/Ethanol/EtOH_h.frcmod"
+"REF_DATA/Ethanol/EtOH_h_ptmpsi.lib" = "amber_metallo/data/ref_data/Ethanol/EtOH_h_ptmpsi.lib"
+"REF_DATA/Methanol/MeOH_h.frcmod" = "amber_metallo/data/ref_data/Methanol/MeOH_h.frcmod"
+"REF_DATA/Methanol/MeOH_h_ptmpsi.lib" = "amber_metallo/data/ref_data/Methanol/MeOH_h_ptmpsi.lib"
+"REF_DATA/N8888_Br_Hexanoic_Acid/lj_1264_pol_augmented.dat" = "amber_metallo/data/ref_data/N8888_Br_Hexanoic_Acid/lj_1264_pol_augmented.dat"
+"REF_DATA/Choline_Cl_Ethylene_glycol/lj_1264_pol_augmented.dat" = "amber_metallo/data/ref_data/Choline_Cl_Ethylene_glycol/lj_1264_pol_augmented.dat"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

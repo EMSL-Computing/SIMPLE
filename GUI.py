@@ -1,5 +1,5 @@
-from __future__ import annotations
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import sys
@@ -17,18 +17,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--web",
         action="store_true",
-        help="Launch the local browser-based GUI at 127.0.0.1.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--web-port",
         type=int,
         default=0,
-        help="Port for --web mode. Default 0 chooses a free local port.",
+        help="Local GUI port. Default 0 chooses a free local port.",
     )
     parser.add_argument(
         "--no-browser",
         action="store_true",
-        help="Start --web mode without opening the default browser automatically.",
+        help="Start without opening the default browser automatically.",
     )
     return parser.parse_args(argv)
 

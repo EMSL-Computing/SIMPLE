@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
+import re
 from typing import Any
 
 import tomllib
@@ -549,6 +550,23 @@ class MDConfig(BaseModel):
         return self
 
 
+_SLURM_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SLURM_WALLTIME_RE = re.compile(r"^(?:[0-9]+-)?[0-9]{1,3}:[0-5][0-9]:[0-5][0-9]$")
+_SLURM_EXECUTABLE_RE = re.compile(r"^[A-Za-z0-9_./:+-]+$")
+
+
+def validate_slurm_identifier(value: str, *, field_name: str = "Slurm value") -> str:
+    """Return a value that is safe to interpolate into an ``#SBATCH`` line."""
+
+    normalized = str(value).strip()
+    if not normalized or not _SLURM_IDENTIFIER_RE.fullmatch(normalized):
+        raise ValueError(
+            f"{field_name} may contain only letters, digits, '.', '_' and '-'; "
+            "whitespace, newlines, and shell metacharacters are not allowed."
+        )
+    return normalized
+
+
 class SlurmConfig(BaseModel):
     profile: SlurmProfile = SlurmProfile.CPU
     partition: str | None = None
@@ -559,6 +577,39 @@ class SlurmConfig(BaseModel):
     walltime: str = "24:00:00"
     binary_override: str | None = None
     job_name: str = "simple"
+
+    @field_validator("partition", "account", mode="before")
+    @classmethod
+    def validate_optional_identifiers(cls, value: object, info: Any) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        return validate_slurm_identifier(str(value), field_name=f"slurm.{info.field_name}")
+
+    @field_validator("job_name", mode="before")
+    @classmethod
+    def validate_job_name(cls, value: object) -> str:
+        return validate_slurm_identifier(str(value or "simple"), field_name="slurm.job_name")
+
+    @field_validator("walltime", mode="before")
+    @classmethod
+    def validate_walltime(cls, value: object) -> str:
+        normalized = str(value).strip()
+        if not _SLURM_WALLTIME_RE.fullmatch(normalized):
+            raise ValueError("slurm.walltime must use HH:MM:SS or D-HH:MM:SS format.")
+        return normalized
+
+    @field_validator("binary_override", mode="before")
+    @classmethod
+    def validate_binary_override(cls, value: object) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        normalized = str(value).strip()
+        if not _SLURM_EXECUTABLE_RE.fullmatch(normalized):
+            raise ValueError(
+                "slurm.binary_override must be a single executable name or POSIX path without "
+                "whitespace, newlines, variable expansion, or shell metacharacters."
+            )
+        return normalized
 
 
 class ProteinSiteRespClusterConfig(BaseModel):

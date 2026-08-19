@@ -12,6 +12,7 @@ from amber_metallo.environment import detect_amber_environment
 from amber_metallo.inspection import load_structure, residue_key
 from amber_metallo.reporting import console, print_notice, write_json
 from amber_metallo.ti.analysis import default_formal_charge, detect_bound_metal_sites, parse_cntrl_settings, select_site
+from amber_metallo.tool_config import ToolConfig, ambertools_sbatch_setup
 
 from amber_metallo.free_energy.config import (
     FreeEnergyWorkflowConfig,
@@ -2170,7 +2171,12 @@ def _render_mmpbsa_slurm_script(
     ligand_prmtop: Path,
     summary_helper_path: Path,
     decomp_solver_assets: dict[str, dict[str, Path]],
+    tool_config: ToolConfig | None = None,
 ) -> str:
+    ambertools_setup = ambertools_sbatch_setup(
+        tool_config,
+        required_binaries=("cpptraj", "MMPBSA.py"),
+    )
     lines = [
         "#!/bin/bash",
         "#SBATCH --account=[Account]",
@@ -2185,6 +2191,8 @@ def _render_mmpbsa_slurm_script(
         "# This job prepares dry topologies and helper trajectories, then launches Amber MMPBSA.py.",
         "",
         "set -euo pipefail",
+        "",
+        *ambertools_setup,
         "",
         f"WORK_ROOT=\"{work_root.resolve()}\"",
         f"PREP_DIR=\"{prep_dir.resolve()}\"",

@@ -60,6 +60,7 @@ from amber_metallo.ti.cli import (
     _prompt_ti_decoupling_mode,
     _prompt_ti_execution_profile,
     _prompt_ti_implementation_mode,
+    _prompt_ti_production_ensemble,
     _prompt_ti_sampling_mode,
     _resolve_water_reference_settings,
     _resolve_water_reference_source_choice,
@@ -68,12 +69,10 @@ from amber_metallo.ti.config import (
     ComplexInputConfig,
     MetalSelectionConfig,
     SnapshotConfig,
-    TIChargeCompensationMode,
     TIDecouplingMode,
     TIMetalSelectionMode,
     TIImplementationMode,
     TIProtocolConfig,
-    TISamplingMode,
     WaterReferenceConfig,
 )
 
@@ -1589,7 +1588,6 @@ def _build_single_free_energy_wizard_config(
             selected_sites = [selected]
 
     selected_assessments = [next(item for item in assessments if item.site == item_site.site) for item_site in selected_sites]
-    selected_assessment = selected_assessments[0]
     allow_unstable = False
     unstable_assessments = [item for item in selected_assessments if not item.stable]
     if unstable_assessments:
@@ -1646,6 +1644,7 @@ def _build_single_free_energy_wizard_config(
                 )
         if shared_ti_settings is None:
             snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
+            ti_production_ensemble = _prompt_ti_production_ensemble()
             ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
             ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
         else:
@@ -1655,10 +1654,11 @@ def _build_single_free_energy_wizard_config(
             else:
                 console.print(f"[dim]Batch snapshot setting reused: {snapshot_mode.value}.[/dim]")
             ti_sampling_mode = shared_ti_settings.ti.sampling_mode
+            ti_production_ensemble = shared_ti_settings.ti.production_ensemble
             ti_charge_compensation_mode = shared_ti_settings.ti.charge_compensation_mode
             console.print(
-                f"[dim]Batch TI sampling/charge settings reused: {ti_sampling_mode.value}, "
-                f"{ti_charge_compensation_mode.value}.[/dim]"
+                f"[dim]Batch TI ensemble/sampling/charge settings reused: {ti_production_ensemble.value}, "
+                f"{ti_sampling_mode.value}, {ti_charge_compensation_mode.value}.[/dim]"
             )
         if in_place_ti:
             formal_charge = _infer_charge_from_selected_site(selected) or default_formal_charge(selected.element)
@@ -1747,6 +1747,7 @@ def _build_single_free_energy_wizard_config(
             ti=TIProtocolConfig(
                 implementation_mode=ti_implementation_mode,
                 decoupling_mode=ti_decoupling_mode,
+                production_ensemble=ti_production_ensemble,
                 sampling_mode=ti_sampling_mode,
                 charge_compensation_mode=ti_charge_compensation_mode,
             ),

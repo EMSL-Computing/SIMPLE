@@ -60,6 +60,11 @@ class TISamplingMode(StrEnum):
     BIDIRECTIONAL = "bidirectional"
 
 
+class TIProductionEnsemble(StrEnum):
+    NVT = "nvt"
+    NPT = "npt"
+
+
 class TIChargeCompensationMode(StrEnum):
     CO_ALCHEMICAL_COUNTERIONS = "co_alchemical_counterions"
     NONE = "none"
@@ -126,6 +131,7 @@ class MetalSelectionConfig(BaseModel):
 class TIProtocolConfig(BaseModel):
     implementation_mode: TIImplementationMode = TIImplementationMode.AMBER_12_6_WORKAROUND
     decoupling_mode: TIDecouplingMode = TIDecouplingMode.SPLIT_Q_VDW
+    production_ensemble: TIProductionEnsemble = TIProductionEnsemble.NVT
     production_time_ns: float = Field(default=1.0, gt=0.0)
     sampling_mode: TISamplingMode = TISamplingMode.SINGLE_PASS
     window_equilibration_ns: float = Field(default=0.2, ge=0.0)

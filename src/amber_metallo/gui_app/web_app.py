@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -11,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -67,10 +70,11 @@ from amber_metallo.des import (
     overwrite_des_library_component,
     recommended_ratio_for_components,
     register_custom_des_component,
+    resolve_ref_data_dir,
     unregister_custom_des_component,
 )
 from amber_metallo.environment import detect_amber_environment, environment_summary
-from amber_metallo.inspection import SUPPORTED_METALS, fetch_pdb_structure, inspect_structure, load_structure, looks_like_pdb_id
+from amber_metallo.inspection import fetch_pdb_structure, inspect_structure, load_structure, looks_like_pdb_id
 from amber_metallo.ligand_param import prepare_canonical_small_molecule_mol2
 from amber_metallo.prep import prepare_structure
 from amber_metallo.protonation import predict_protonation_prediction
@@ -89,7 +93,6 @@ from amber_metallo.qm.nwchem import (
     QM_GEOMETRY_MODE_OPTIONS,
     QM_GRID_OPTIONS,
     build_default_session_state,
-    find_resp_job_candidates,
     find_resp_source_candidates,
     load_molecule,
     load_resp_job_candidate,
@@ -117,13 +120,15 @@ from .preview import (
 )
 
 try:
-    from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+    from fastapi import Body, FastAPI, File, Form, Request, UploadFile
     from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
     from fastapi.staticfiles import StaticFiles
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
     import uvicorn
 except ModuleNotFoundError:  # pragma: no cover - launcher reports this path
-    Body = FastAPI = File = Form = HTTPException = UploadFile = None  # type: ignore[assignment]
+    Body = FastAPI = File = Form = Request = UploadFile = None  # type: ignore[assignment]
     FileResponse = JSONResponse = PlainTextResponse = StaticFiles = None  # type: ignore[assignment]
+    TrustedHostMiddleware = None  # type: ignore[assignment]
     uvicorn = None  # type: ignore[assignment]
 
 
@@ -161,6 +166,10 @@ DEFAULT_WATER_MODELS = ["opc", "spce", "tip3p", "opc3", "tip4pew", "tip5p"]
 DEFAULT_PROTEIN_FFS = ["ff19SB", "ff14SB", "ff99SB", "ff99SBildn"]
 DEFAULT_LIGAND_FFS = ["gaff2", "gaff"]
 SMALL_MOLECULE_SUFFIXES = {".pdb", ".mol2", ".sdf", ".sd", ".smi", ".smiles", ".txt"}
+GENERAL_UPLOAD_SUFFIXES = SMALL_MOLECULE_SUFFIXES | {".cif", ".mmcif", ".pqr"}
+MAX_UPLOAD_FILES = 512
+MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
+MAX_UPLOAD_TOTAL_BYTES = 500 * 1024 * 1024
 SITE_RESP_BROWSER_SUFFIXES = {
     ".json",
     ".grid",
@@ -271,6 +280,7 @@ class WebGuiState:
     repo_root: Path
     launch_cwd: Path
     session_root: Path
+    api_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     last_config: WorkflowConfig | None = None
     last_toml: str = ""
     last_config_path: Path | None = None
@@ -312,7 +322,53 @@ def _output_dir_from_payload(payload: dict[str, Any], state: WebGuiState) -> Pat
     root = Path(root_text).expanduser()
     if not root.is_absolute():
         root = state.launch_cwd / root
-    return (root / _safe_name(str(payload.get("job_name") or "simple_gui"))).resolve()
+    resolved_root = root.resolve()
+    if not _path_is_under(resolved_root, state.launch_cwd):
+        raise ValueError(f"GUI output_root must remain inside the launch directory: {state.launch_cwd}")
+    return (resolved_root / _safe_name(str(payload.get("job_name") or "simple_gui"))).resolve()
+
+
+async def _write_upload_limited(
+    upload: Any,
+    target: Path,
+    *,
+    total_bytes: int = 0,
+) -> int:
+    """Stream one upload to disk while enforcing per-file and request limits."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        with target.open("wb") as stream:
+            while chunk := await upload.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_UPLOAD_FILE_BYTES:
+                    raise ValueError(f"Upload exceeds the {MAX_UPLOAD_FILE_BYTES // (1024 * 1024)} MiB per-file limit.")
+                if total_bytes + written > MAX_UPLOAD_TOTAL_BYTES:
+                    raise ValueError(f"Uploads exceed the {MAX_UPLOAD_TOTAL_BYTES // (1024 * 1024)} MiB request limit.")
+                stream.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return written
+
+
+def _api_error(exc: Exception, state: WebGuiState, *, public_message: str | None = None) -> Any:
+    """Return a useful API error without exposing local absolute paths."""
+
+    print(f"SIMPLE Web GUI request failed: {exc}", file=sys.stderr)
+    message = str(public_message if public_message is not None else exc) or exc.__class__.__name__
+    replacements = {
+        str(state.session_root): "<session directory>",
+        str(state.launch_cwd): "<launch directory>",
+        str(state.repo_root): "<application directory>",
+        str(Path.home().resolve()): "<home directory>",
+    }
+    for private_path, label in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        message = message.replace(private_path, label)
+        message = message.replace(private_path.replace("\\", "/"), label)
+    message = re.sub(r"(?i)\b[A-Z]:[\\/][^\r\n,;]+", "<local path>", message)
+    return JSONResponse({"ok": False, "error": message}, status_code=400)  # type: ignore[operator]
 
 
 def _path_is_under(path: Path, root: Path) -> bool:
@@ -1064,10 +1120,7 @@ def _candidate_payload(candidate: Any) -> dict[str, Any]:
 
 
 def _des_library_ref_data_dir(state: WebGuiState) -> Path:
-    candidate = state.repo_root / "REF_DATA"
-    if not candidate.exists():
-        raise FileNotFoundError(f"DES REF_DATA directory was not found: {candidate}")
-    return candidate.resolve()
+    return resolve_ref_data_dir("REF_DATA")
 
 
 def _des_library_candidate_payload(candidate: Any) -> dict[str, Any]:
@@ -1352,6 +1405,7 @@ def _bootstrap_payload(state: WebGuiState) -> dict[str, Any]:
         for index, (components, ratio) in enumerate(DES_RECOMMENDED_SETS)
     ]
     return {
+        "api_token": state.api_token,
         "workflow_options": WORKFLOW_OPTIONS,
         "repo_root": str(state.repo_root),
         "launch_cwd": str(state.launch_cwd),
@@ -1428,7 +1482,40 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
         launch_cwd=(launch_cwd or Path.cwd()).resolve(),
         session_root=Path(tempfile.mkdtemp(prefix="simple_gui_")).resolve(),
     )
-    app = FastAPI(title="SIMPLE Web GUI")  # type: ignore[operator]
+    @asynccontextmanager
+    async def lifespan(_app: Any):
+        try:
+            yield
+        finally:
+            shutil.rmtree(state.session_root, ignore_errors=True)
+
+    app = FastAPI(  # type: ignore[operator]
+        title="SIMPLE Web GUI",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+    app.add_middleware(  # type: ignore[union-attr]
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "[::1]"],
+    )
+
+    @app.middleware("http")
+    async def protect_local_api(request: Request, call_next: Any):  # type: ignore[misc]
+        if request.url.path.startswith("/api/") and request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            origin = str(request.headers.get("origin") or "").rstrip("/").lower()
+            expected_origin = f"{request.url.scheme}://{request.headers.get('host', '')}".rstrip("/").lower()
+            if origin and origin != expected_origin:
+                return JSONResponse({"ok": False, "error": "Cross-origin API requests are not allowed."}, status_code=403)
+            supplied_token = str(request.headers.get("x-simple-token") or "")
+            if not supplied_token or not secrets.compare_digest(supplied_token, state.api_token):
+                return JSONResponse({"ok": False, "error": "Missing or invalid local GUI session token."}, status_code=403)
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
     static_dir = Path(__file__).resolve().parent / "web_static"
     vendor_dir = Path(__file__).resolve().parents[1] / "qm" / "editor" / "assets"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")  # type: ignore[operator]
@@ -1447,14 +1534,14 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
         try:
             return {"ok": True, "components": _des_library_component_payloads(state)}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des-library/scan")
     def des_library_scan(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             return scan_des_library_directory(state, payload.get("path"))
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des-library/upload")
     async def des_library_upload(
@@ -1464,14 +1551,16 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
         try:
             if len(files) != len(relative_paths):
                 raise ValueError("The browser did not provide a path for every selected file.")
+            if len(files) > MAX_UPLOAD_FILES:
+                raise ValueError(f"Select no more than {MAX_UPLOAD_FILES} files at once.")
             upload_root = state.session_root / "des_library_uploads" / str(time.time_ns())
             staged: list[Path] = []
+            total_bytes = 0
             for file, relative_path in zip(files, relative_paths, strict=True):
                 target = _des_library_upload_target(upload_root, relative_path, file.filename)
                 if target in staged:
                     raise ValueError(f"Two selected files resolve to the same upload path: {target.name}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(await file.read())
+                total_bytes += await _write_upload_limited(file, target, total_bytes=total_bytes)
                 staged.append(target)
             if not staged:
                 raise ValueError("Select at least one Amber .lib/.off or .frcmod file.")
@@ -1480,43 +1569,48 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             result["uploaded_files"] = [str(path) for path in staged]
             return result
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des-library/file")
     def des_library_file(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             return read_des_library_file(state, payload.get("path"))
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des-library/file/save")
     def des_library_file_save(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             return save_des_library_file(state, payload.get("path"), payload.get("content"))
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des-library/register")
     def des_library_register(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             return register_des_library_candidate(state, payload)
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des-library/remove")
     def des_library_remove(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             return remove_des_library_component(state, payload.get("component_key"))
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/upload")
     async def upload(file: UploadFile = File(...)):  # type: ignore[misc]
-        target = state.session_root / "uploads" / Path(file.filename or "upload.dat").name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(await file.read())
-        state.uploads.append(target)
-        return {"ok": True, "path": str(target.resolve())}
+        try:
+            target = state.session_root / "uploads" / Path(file.filename or "upload.dat").name
+            if target.suffix.lower() not in GENERAL_UPLOAD_SUFFIXES:
+                allowed = ", ".join(sorted(GENERAL_UPLOAD_SUFFIXES))
+                raise ValueError(f"Unsupported molecular file type. Allowed: {allowed}")
+            await _write_upload_limited(file, target)
+            state.uploads.append(target)
+            return {"ok": True, "path": str(target.resolve())}
+        except Exception as exc:
+            return _api_error(exc, state)
 
     @app.post("/api/metallophore/load")
     def metallophore_load(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1548,7 +1642,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             }
         except Exception as exc:
             data = dict(payload.get("metallophore") or payload)
-            return JSONResponse({"ok": False, "error": _friendly_small_molecule_error(exc, data)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state, public_message=_friendly_small_molecule_error(exc, data))
 
     @app.post("/api/metallophore/groups")
     def metallophore_groups(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1572,7 +1666,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             return {"ok": True, "group_constraints": group_constraints}
         except Exception as exc:
             data = dict(payload.get("metallophore") or payload)
-            return JSONResponse({"ok": False, "error": _friendly_small_molecule_error(exc, data)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state, public_message=_friendly_small_molecule_error(exc, data))
 
     @app.post("/api/metallophore/quick-minimize")
     def metallophore_quick_minimize(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1640,7 +1734,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             }
         except Exception as exc:
             data = dict(payload.get("metallophore") or payload)
-            return JSONResponse({"ok": False, "error": _friendly_small_molecule_error(exc, data)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state, public_message=_friendly_small_molecule_error(exc, data))
 
     @app.post("/api/metallophore/add-metal")
     def metallophore_add_metal(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1710,7 +1804,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             }
         except Exception as exc:
             data = dict(payload.get("metallophore") or payload)
-            return JSONResponse({"ok": False, "error": _friendly_small_molecule_error(exc, data)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state, public_message=_friendly_small_molecule_error(exc, data))
 
     @app.post("/api/metallophore/export-pdb")
     def metallophore_export_pdb(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1740,7 +1834,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             return {"ok": True, "path": str(target.resolve()), "pdb": pdb_text}
         except Exception as exc:
             data = dict(payload.get("metallophore") or payload)
-            return JSONResponse({"ok": False, "error": _friendly_small_molecule_error(exc, data)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state, public_message=_friendly_small_molecule_error(exc, data))
 
     @app.post("/api/resp/candidates")
     def resp_candidates(payload: dict[str, Any] = Body(default={})):  # type: ignore[misc]
@@ -1820,7 +1914,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             )
             return {"ok": True, "assets": assets}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/protein/metal-donor-candidates")
     def protein_metal_donor_candidates(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1859,7 +1953,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 "donor_candidates": candidates,
             }
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/protein/load")
     def protein_load(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1915,7 +2009,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             }
             return {"ok": True, **response}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/protein/propka")
     def protein_propka(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1945,7 +2039,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             ]
             return {"ok": True, "warnings": prediction.warnings, "candidates": candidates}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/des/preview")
     def des_preview(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1953,7 +2047,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             cfg = build_workflow_config({**payload, "workflow_type": "deep_eutectic"}, state)
             return {"ok": True, **des_heavy_atom_preview(cfg.des, cfg.system.salt)}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/toml")
     def toml(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -1964,23 +2058,29 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             state.last_toml = text
             return {"ok": True, "toml": text}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/toml/save")
     def save_toml(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             config = build_workflow_config(payload, state, stage_gui_inputs=True)
+            allowed_dir = _output_dir_from_payload(payload, state)
             requested = str(payload.get("save_path") or "").strip()
-            target = Path(requested).expanduser() if requested else _output_dir_from_payload(payload, state) / f"{_safe_name(str(payload.get('job_name') or 'simple_gui'))}.toml"
+            target = Path(requested).expanduser() if requested else allowed_dir / f"{_safe_name(str(payload.get('job_name') or 'simple_gui'))}.toml"
             if not target.is_absolute():
-                target = state.launch_cwd / target
+                target = allowed_dir / target
+            target = target.resolve()
+            if target.suffix.lower() != ".toml":
+                raise ValueError("Saved configurations must use the .toml extension.")
+            if not _path_is_under(target, allowed_dir):
+                raise ValueError(f"The configuration must be saved inside its GUI output directory: {allowed_dir}")
             save_config(config, target)
             state.last_config = config
             state.last_toml = dump_config(config)
             state.last_config_path = target.resolve()
             return {"ok": True, "path": str(target.resolve()), "toml": state.last_toml}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.get("/api/toml/download", response_class=PlainTextResponse)
     def download_toml():  # type: ignore[misc]
@@ -2008,14 +2108,14 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 "protein_site_resp": result.get("protein_site_resp") if isinstance(result, dict) else None,
             }
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/protein-site-resp/candidates")
     def protein_site_resp_candidates(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
         try:
             return scan_protein_site_resp_directory(state, payload.get("search_root"))
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/protein-site-resp/upload")
     async def protein_site_resp_upload(
@@ -2025,16 +2125,16 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
         try:
             if len(files) != len(relative_paths):
                 raise ValueError("The browser did not provide a path for every selected RESP file.")
+            if len(files) > MAX_UPLOAD_FILES:
+                raise ValueError(f"Select no more than {MAX_UPLOAD_FILES} files at once.")
             upload_root = state.session_root / "protein_site_resp_uploads" / str(time.time_ns())
             staged: list[Path] = []
+            total_bytes = 0
             for file, relative_path in zip(files, relative_paths, strict=True):
                 target = _site_resp_upload_target(upload_root, relative_path, file.filename)
                 if target in staged:
                     raise ValueError(f"Two selected files resolve to the same upload path: {target.name}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("wb") as stream:
-                    while chunk := await file.read(1024 * 1024):
-                        stream.write(chunk)
+                total_bytes += await _write_upload_limited(file, target, total_bytes=total_bytes)
                 staged.append(target)
             if not staged:
                 raise ValueError("Select a case folder containing protein-site RESP results.")
@@ -2043,7 +2143,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             result["uploaded_files"] = [str(path) for path in staged]
             return result
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/slurm/preview")
     def slurm_preview(payload: dict[str, Any] = Body(...)):  # type: ignore[misc]
@@ -2060,7 +2160,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             )
             return {"ok": True, "script": render_slurm_script(stages=stages, slurm_config=config.slurm)}
         except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)  # type: ignore[operator]
+            return _api_error(exc, state)
 
     @app.post("/api/quit")
     def quit_app():  # type: ignore[misc]
@@ -2205,6 +2305,13 @@ def run_web_gui(
     open_browser: bool = True,
 ) -> int:
     _require_web_dependencies()
+    normalized_host = str(host).strip().lower()
+    try:
+        loopback_host = normalized_host == "localhost" or ipaddress.ip_address(normalized_host).is_loopback
+    except ValueError:
+        loopback_host = False
+    if not loopback_host:
+        raise ValueError("The SIMPLE Web GUI may only bind to localhost or a loopback IP address.")
     selected_port = int(port or _find_free_port(host))
     url = f"http://{host}:{selected_port}/"
     if open_browser:

@@ -21,6 +21,7 @@ from amber_metallo.inspection import (
     supported_metal_element,
 )
 from amber_metallo.reporting import write_json
+from amber_metallo.tool_config import resolve_tool_binary
 
 
 SUPPORTED_DONOR_ELEMENTS = {"N", "O", "S"}
@@ -434,8 +435,7 @@ def render_cluster_cpptraj_script(
 
 
 def _cpptraj_binary() -> str | None:
-    found = shutil.which("cpptraj")
-    return found
+    return resolve_tool_binary("cpptraj", path_finder=shutil.which)
 
 
 def write_placeholder_restart(path: str | Path) -> Path:
@@ -620,7 +620,7 @@ def generate_reference_pdb_from_amber_restart(
 ) -> Path:
     target = Path(output_path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    ambpdb = shutil.which("ambpdb")
+    ambpdb = resolve_tool_binary("ambpdb", path_finder=shutil.which)
     if ambpdb is not None:
         log_path = target.with_suffix(".ambpdb.log")
         command_variants = [

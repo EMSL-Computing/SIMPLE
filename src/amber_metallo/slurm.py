@@ -4,6 +4,7 @@ from pathlib import Path
 
 from amber_metallo.config import SlurmConfig, SlurmProfile
 from amber_metallo.md_protocols import MDStage
+from amber_metallo.tool_config import ToolConfig, amber_sbatch_setup
 
 
 def _runner(config: SlurmConfig) -> str:
@@ -16,13 +17,20 @@ def _runner(config: SlurmConfig) -> str:
     return f"srun -n {config.ntasks} {binary}"
 
 
-def _placeholder_runner(config: SlurmConfig) -> str:
+def _amber_binary_kind(config: SlurmConfig) -> str:
+    if config.profile == SlurmProfile.GPU:
+        return "gpu_mpi" if config.gpus > 1 else "gpu"
+    return "mpi"
+
+
+def _placeholder_runner(config: SlurmConfig, amber_binaries: dict[str, str] | None = None) -> str:
+    amber_binaries = amber_binaries or {}
     if config.profile == SlurmProfile.GPU:
         if config.gpus > 1:
-            binary = config.binary_override or "pmemd.cuda.MPI"
+            binary = config.binary_override or amber_binaries.get("gpu_mpi") or "pmemd.cuda.MPI"
             return f"srun -n ${{SLURM_GPUS_ON_NODE:-{config.gpus}}} {binary}"
-        return config.binary_override or "pmemd.cuda"
-    binary = config.binary_override or "pmemd.MPI"
+        return config.binary_override or amber_binaries.get("gpu") or "pmemd.cuda"
+    binary = config.binary_override or amber_binaries.get("mpi") or "pmemd.MPI"
     return f"srun -n ${{SLURM_NTASKS:?Submit this script with sbatch so Slurm sets SLURM_NTASKS.}} {binary}"
 
 
@@ -68,8 +76,17 @@ def _stage_execution_lines(*, stages: list[MDStage]) -> list[str]:
     return lines
 
 
-def render_slurm_script(*, stages: list[MDStage], slurm_config: SlurmConfig) -> str:
-    runner = _placeholder_runner(slurm_config)
+def render_slurm_script(
+    *,
+    stages: list[MDStage],
+    slurm_config: SlurmConfig,
+    tool_config: ToolConfig | None = None,
+) -> str:
+    amber_setup, amber_binaries = amber_sbatch_setup(
+        tool_config,
+        required_kinds=[_amber_binary_kind(slurm_config)],
+    )
+    runner = _placeholder_runner(slurm_config, amber_binaries)
     header = [
         "#!/bin/bash",
         "#SBATCH --account=[Account]",
@@ -100,6 +117,8 @@ def render_slurm_script(*, stages: list[MDStage], slurm_config: SlurmConfig) -> 
         "",
         "# Fill in the SBATCH placeholders above before submission.",
         "# The interactive wizard stores resource defaults in TOML, but this script is left editable on purpose.",
+        "",
+        *amber_setup,
         "",
         f'RUNNER="{runner}"',
         "",

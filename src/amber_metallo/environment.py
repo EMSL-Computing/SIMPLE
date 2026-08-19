@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from amber_metallo.c4_assets import opc_duvail_assets_available, opc_duvail_ion_frcmod
+from amber_metallo.tool_config import ToolConfig, load_tool_config
 
 @dataclass(slots=True)
 class BinaryStatus:
@@ -32,8 +33,8 @@ class AmberEnvironment:
         for force_field in ordered:
             candidates = {
                 f"leaprc.protein.{force_field}",
-                f"oldff/leaprc.ff99SB",
-                f"oldff/leaprc.ff99SBildn",
+                "oldff/leaprc.ff99SB",
+                "oldff/leaprc.ff99SBildn",
             }
             if any(candidate in self.leaprc_files for candidate in candidates):
                 available.append(force_field)
@@ -156,38 +157,116 @@ def infer_amberhome_from_binary(binary: Path | None) -> Path | None:
     return None
 
 
-def detect_amber_environment() -> AmberEnvironment:
-    binaries = {}
+def _configured_home_binary(home: str, name: str) -> Path | None:
+    if not home:
+        return None
+    candidate = Path(home).expanduser() / "bin" / name
+    return candidate if candidate.exists() else None
+
+
+def _path_binary(name: str) -> Path | None:
+    raw_path = shutil.which(name)
+    return Path(raw_path) if raw_path else None
+
+
+def detect_amber_environment(tool_config: ToolConfig | None = None) -> AmberEnvironment:
+    configured = tool_config or load_tool_config()
+    config_path = configured.source_path
+    has_explicit_config = tool_config is not None or bool(config_path and config_path.is_file())
+    binaries: dict[str, BinaryStatus] = {}
     binary_names = (
         "tleap",
         "antechamber",
         "parmchk2",
         "parmed",
         "cpptraj",
+        "pmemd",
         "pmemd.MPI",
         "pmemd.cuda",
+        "pmemd.cuda.MPI",
         "sander.MPI",
         "MMPBSA.py",
         "MMPBSA.py.MPI",
         "packmol",
+        "nwchem",
+        "mpirun",
+        "mpiexec",
     )
+
+    ambertools_names = {
+        "tleap",
+        "antechamber",
+        "parmchk2",
+        "parmed",
+        "cpptraj",
+        "sander.MPI",
+        "MMPBSA.py",
+        "MMPBSA.py.MPI",
+        "packmol",
+    }
+    amber_names = {"pmemd", "pmemd.MPI", "pmemd.cuda", "pmemd.cuda.MPI"}
+
     for name in binary_names:
-        raw_path = shutil.which(name)
-        binaries[name] = BinaryStatus(name=name, path=Path(raw_path) if raw_path else None)
+        path: Path | None = None
+        if name in ambertools_names and has_explicit_config:
+            if configured.ambertools.mode in {"conda", "external"}:
+                path = _configured_home_binary(configured.ambertools.home, name)
+                if path is None and configured.ambertools.mode == "conda":
+                    path = _path_binary(name)
+        elif name in amber_names and has_explicit_config:
+            if configured.amber.mode == "external":
+                path = _configured_home_binary(configured.amber.home, name)
+            elif configured.amber.mode == "module":
+                path = _path_binary(name)
+        elif name == "nwchem" and has_explicit_config:
+            if configured.nwchem.mode in {"conda", "external"} and configured.nwchem.binary:
+                candidate = Path(configured.nwchem.binary).expanduser()
+                path = candidate if candidate.exists() else None
+            elif configured.nwchem.mode == "module":
+                path = _path_binary(name)
+        elif name in {"mpirun", "mpiexec"} and has_explicit_config:
+            if configured.nwchem.mode in {"conda", "external"} and configured.nwchem.mpi_launcher:
+                candidate = Path(configured.nwchem.mpi_launcher).expanduser()
+                if candidate.name == name and candidate.exists():
+                    path = candidate
+            elif configured.nwchem.mode == "module":
+                path = _path_binary(name)
+        else:
+            path = _path_binary(name)
+        binaries[name] = BinaryStatus(name=name, path=path)
+
+    for name, raw_path in configured.executables.items():
+        candidate = Path(raw_path).expanduser() if raw_path else None
+        binaries[name] = BinaryStatus(
+            name=name,
+            path=candidate if candidate is not None and candidate.exists() else None,
+        )
 
     amberhome = None
-    env_value = os.environ.get("AMBERHOME")
-    if env_value:
-        candidate = Path(env_value).expanduser()
+    configured_home = ""
+    if has_explicit_config and configured.ambertools.mode in {"conda", "external"}:
+        configured_home = configured.ambertools.home
+    elif has_explicit_config and configured.amber.mode == "external":
+        configured_home = configured.amber.home
+    if configured_home:
+        candidate = Path(configured_home).expanduser()
         if (candidate / "dat" / "leap" / "cmd").exists():
             amberhome = candidate
 
-    if amberhome is None:
+    if amberhome is None and not has_explicit_config:
+        env_value = os.environ.get("AMBERHOME")
+        if env_value:
+            candidate = Path(env_value).expanduser()
+            if (candidate / "dat" / "leap" / "cmd").exists():
+                amberhome = candidate
+
+    if amberhome is None and not has_explicit_config:
         amberhome = infer_amberhome_from_binary(binaries["tleap"].path)
 
     if amberhome is not None:
         bin_dir = amberhome / "bin"
-        for name, status in binaries.items():
+        for name in ambertools_names:
+            status = binaries[name]
             if status.path is not None:
                 continue
             candidate = bin_dir / name

@@ -25,6 +25,7 @@ from amber_metallo.des import (
 from amber_metallo.inspection import SUPPORTED_METALS, classify_residue, inspect_structure, load_structure, residue_key
 from amber_metallo.ligand_param import prepare_canonical_small_molecule_mol2
 from amber_metallo.qm.nwchem import MoleculeAtom, MoleculeBond, MoleculeData, load_molecule, render_preview_mol2, suggest_group_constraints
+from amber_metallo.tool_config import resolve_tool_binary
 
 
 VMD_CPK_COLORS = {
@@ -668,7 +669,7 @@ def quick_minimize_with_openbabel(
     minimized_path = output_dir / f"{residue_name}_quick_minimized.mol2"
     seed_path.write_text(render_preview_mol2(coordinated, residue_name=residue_name), encoding="utf-8")
 
-    obabel = shutil.which("obabel") or shutil.which("babel")
+    obabel = resolve_tool_binary("openbabel", "obabel", "babel", path_finder=shutil.which)
     if obabel is None:
         warnings.append(
             "Open Babel was not found; preview used donor-centered metal placement with temporary metal-donor bonds."

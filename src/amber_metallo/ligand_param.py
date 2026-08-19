@@ -31,6 +31,7 @@ from amber_metallo.qm.nwchem import (
 )
 from amber_metallo.inspection import SUPPORTED_METALS
 from amber_metallo.reporting import print_notice, write_json
+from amber_metallo.tool_config import resolve_tool_binary
 
 
 @dataclass(slots=True)
@@ -379,7 +380,7 @@ def _prepare_parameterization_input(source_file: str | Path, *, output_dir: Path
 
 
 def _openbabel_binary() -> str | None:
-    return shutil.which("obabel") or shutil.which("babel")
+    return resolve_tool_binary("openbabel", "obabel", "babel", path_finder=shutil.which)
 
 
 def _prepare_typing_input(
