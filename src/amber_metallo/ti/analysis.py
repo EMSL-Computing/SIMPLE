@@ -405,7 +405,7 @@ def render_last_snapshot_cpptraj_script(
         f"trajin {Path(trajectory_path).as_posix()} lastframe\n"
         "autoimage\n"
         f"trajout {Path(output_pdb).as_posix()} pdb nobox\n"
-        f"trajout {Path(output_rst7).as_posix()} restart\n"
+        f"trajout {Path(output_rst7).as_posix()} restart novelocity\n"
         "run\n"
     )
 

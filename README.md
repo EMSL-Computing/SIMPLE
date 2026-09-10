@@ -323,6 +323,12 @@ simple-analyze --trajectory
 
 These launchers cover TI and MM-PBSA preparation, saved-result summaries, and common trajectory analyses. Detailed procedures will be documented in the tutorial.
 
+In the FreeE TI wizard, **Snapshot at a specified time (ns)** shows the actual saved trajectory time range. Enter `40` or `40 ns` to extract the nearest saved frame; SIMPLE reports both the requested time and the selected frame's time. Times use the trajectory's stored simulation clock, including any offset from earlier MD stages. If timestamps are absent, SIMPLE requires the original production mdin's explicit `dt` and `ntwx` and labels the resulting times as estimates relative to that MD stage. This fallback is for original trajectories, not files that were subsequently strided or concatenated. Requests outside the saved range are rejected.
+
+Saved TI/FreeE configurations can use `[snapshot]` with `mode = "time"` and `time_ns = 40.0`. The chosen frame and time are recorded in `snapshot/time_snapshot_manifest.json`; a final production restart never overrides a time-selected frame. Last-frame and cluster selection remain available, with last-frame selection as the default.
+
+For combined softcore TI starting from coordinates without velocities, the first lambda equilibration assigns new velocities (`ntx=1, irest=0`). Production and subsequent windows continue from the preceding restart (`ntx=5, irest=1`). Verified velocity restarts and runs with a required preparation stage retain restart settings. NetCDF restart velocities are inspected as well as formatted restart velocities. Regenerate TI inputs and sbatch scripts after updating SIMPLE; already-generated files are not rewritten by a code update.
+
 Reusable TI analysis-library results are stored in the operating system's per-user application-data directory, not in the source checkout. Set `SIMPLE_ANALYSIS_LIBRARY_DIR` to use a reviewed shared or campaign-specific location.
 
 ## Documentation

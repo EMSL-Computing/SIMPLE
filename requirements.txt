@@ -12,6 +12,7 @@ propka>=3.5
 pydantic>=2.12
 requests>=2.32.4
 rich>=14.3
+scipy>=1.10
 tomlkit>=0.14
 typer>=0.24
 uvicorn>=0.32

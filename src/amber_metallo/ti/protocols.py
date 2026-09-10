@@ -23,6 +23,7 @@ class TIWindow:
     start_source: str
     content: str
     equil_filename: str | None = None
+    restart_equil_filename: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -648,6 +649,11 @@ def generate_ti_inputs(
     positional_restraint_mask: str | None = None,
     qoff_positional_restraint_mask: str | None = None,
 ) -> list[TIWindow]:
+    if qoff_start_source == "snapshot" and config.window_equilibration_ns <= 0:
+        raise ValueError(
+            "A coordinate snapshot requires a positive window_equilibration_ns "
+            "to initialize velocities before TI production."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     windows: list[TIWindow] = []
 
@@ -657,8 +663,6 @@ def generate_ti_inputs(
     qoff_dir.mkdir(parents=True, exist_ok=True)
     if not combined_layout:
         vdwoff_dir.mkdir(parents=True, exist_ok=True)
-
-    bidirectional_sampling = config.sampling_mode == TISamplingMode.BIDIRECTIONAL
 
     def write_equilibration_inputs(
         *,
@@ -673,12 +677,11 @@ def generate_ti_inputs(
         scmask2: str | None,
         restraint_path: str | None,
         dt_ps_override: float | None,
+        start_source: str = "restart",
         ntc_override: int | None = None,
         ntf_override: int | None = None,
         positional_mask: str | None = None,
-    ) -> str | None:
-        if not bidirectional_sampling:
-            return None
+    ) -> str:
         equil_dir = output_dir / "equil_inputs" if combined_layout else output_dir / phase / "equil_inputs"
         equil_dir.mkdir(parents=True, exist_ok=True)
         equil_name = filename.replace(".in", "_equil.in")
@@ -705,7 +708,7 @@ def generate_ti_inputs(
         )
         equil_content = _render_window(
             title=f"{title} - equilibration (excluded from analysis)",
-            start_source="restart",
+            start_source=start_source,
             **common,
         )
         (equil_dir / equil_name).write_text(equil_content, encoding="utf-8")
@@ -744,7 +747,7 @@ def generate_ti_inputs(
             scmask1=atom_mask if use_single_topology_gti_decoupling else None,
             scmask2="" if use_single_topology_gti_decoupling else None,
             restraint_file=resolved_qoff_restraint_file,
-            start_source="restart" if bidirectional_sampling else window_start_source,
+            start_source="restart",
             scalpha=config.scalpha,
             scbeta=config.scbeta,
             dt_ps_override=config.qoff_dt_ps,
@@ -765,7 +768,19 @@ def generate_ti_inputs(
             restraint_path=resolved_qoff_restraint_file,
             dt_ps_override=config.qoff_dt_ps,
             positional_mask=qoff_positional_restraint_mask or positional_restraint_mask,
+            start_source=window_start_source,
         )
+        restart_equil_filename = None
+        if window_start_source == "snapshot" and config.sampling_mode == TISamplingMode.BIDIRECTIONAL:
+            # The reverse sweep revisits this lambda with velocities from the
+            # preceding window, so it must not reuse the fresh-start mdin.
+            restart_equil_filename = equil_filename.replace("_equil.in", "_equil_restart.in")
+            (output_dir / restart_equil_filename).write_text(
+                (output_dir / equil_filename).read_text(encoding="utf-8")
+                .replace("  ntx = 1,", "  ntx = 5,")
+                .replace("  irest = 0,", "  irest = 1,"),
+                encoding="utf-8",
+            )
         (qoff_dir / filename).write_text(content, encoding="utf-8")
         windows.append(
             TIWindow(
@@ -778,6 +793,7 @@ def generate_ti_inputs(
                 start_source=window_start_source,
                 content=content,
                 equil_filename=equil_filename,
+                restart_equil_filename=restart_equil_filename,
             )
         )
 
@@ -864,9 +880,9 @@ def _ti_manifest_payload(config: TIProtocolConfig, windows: list[TIWindow]) -> d
             "mode": config.sampling_mode.value,
             "replicas": 1,
             "directions": directions,
-            "window_equilibration_ns": config.window_equilibration_ns if bidirectional else 0.0,
+            "window_equilibration_ns": config.window_equilibration_ns,
             "production_time_ns": config.production_time_ns,
-            "equilibration_dvdl_excluded": bidirectional,
+            "equilibration_dvdl_excluded": True,
         },
         "runs": runs,
         "windows": [window.to_dict() for window in windows],

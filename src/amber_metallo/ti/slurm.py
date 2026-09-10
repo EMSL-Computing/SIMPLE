@@ -570,6 +570,13 @@ def _window_lines(
             "mkdir -p \"$QOFF_OUTPUT_DIR\"",
         ]
     )
+    if any(window.equil_filename for window in qoff_windows):
+        lines.extend(
+            [
+                'QOFF_EQUIL_OUTPUT_DIR="$QOFF_OUTPUT_DIR/equil"',
+                'mkdir -p "$QOFF_EQUIL_OUTPUT_DIR"',
+            ]
+        )
     if vdwoff_windows:
         lines.extend(
             [
@@ -577,6 +584,13 @@ def _window_lines(
                 "mkdir -p \"$VDWOFF_OUTPUT_DIR\"",
             ]
         )
+        if any(window.equil_filename for window in vdwoff_windows):
+            lines.extend(
+                [
+                    'VDWOFF_EQUIL_OUTPUT_DIR="$VDWOFF_OUTPUT_DIR/equil"',
+                    'mkdir -p "$VDWOFF_EQUIL_OUTPUT_DIR"',
+                ]
+            )
     lines.extend(["", f"echo 'Starting {qoff_label} TI windows...'"])
     if prep_stages:
         lines.append("START_COORD=\"$PREP_COORD\"")
@@ -601,13 +615,27 @@ def _window_lines(
     for window in initial_qoff_windows:
         stem = Path(window.filename).stem
         last_qoff_rst = "$QOFF_OUTPUT_DIR/" + f"{stem}.rst7"
+        if window.equil_filename:
+            lines.extend(
+                [
+                    f'INPUT="$INPUT_ROOT/{window.equil_filename}"',
+                    f'OUT="$QOFF_EQUIL_OUTPUT_DIR/{stem}_equil.out"',
+                    f'RST="$QOFF_EQUIL_OUTPUT_DIR/{stem}_equil.rst7"',
+                    f'TRAJ="$QOFF_EQUIL_OUTPUT_DIR/{stem}_equil.nc"',
+                    '$QOFF_RUNNER -O -i "$INPUT" -o "$OUT" -p "$QOFF_PRMTOP" -c "$START_COORD" -r "$RST" -x "$TRAJ"'
+                    + (' -ref "$QOFF_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
+                    'WINDOW_START_COORD="$RST"',
+                ]
+            )
+        else:
+            lines.append('WINDOW_START_COORD="$START_COORD"')
         lines.extend(
             [
                 f"INPUT=\"$INPUT_ROOT/{window.filename}\"",
                 f"OUT=\"$QOFF_OUTPUT_DIR/{stem}.out\"",
                 f"RST=\"{last_qoff_rst}\"",
                 f"TRAJ=\"$QOFF_OUTPUT_DIR/{stem}.nc\"",
-                "$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"$START_COORD\" -r \"$RST\" -x \"$TRAJ\""
+                "$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"$WINDOW_START_COORD\" -r \"$RST\" -x \"$TRAJ\""
                 + (' -ref "$QOFF_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
                 "START_COORD=\"$RST\"",
                 "",
@@ -698,11 +726,28 @@ def _window_lines(
             lines.extend(
                 [
                     "echo 'Starting terminal charge-off TI window after endpoint pre-equilibration...'",
+                    f'TERMINAL_START_COORD="{terminal_start_coord}"',
+                ]
+            )
+            if terminal_qoff_window.equil_filename:
+                lines.extend(
+                    [
+                        f'INPUT="$INPUT_ROOT/{terminal_qoff_window.equil_filename}"',
+                        f'OUT="$QOFF_EQUIL_OUTPUT_DIR/{stem}_equil.out"',
+                        f'RST="$QOFF_EQUIL_OUTPUT_DIR/{stem}_equil.rst7"',
+                        f'TRAJ="$QOFF_EQUIL_OUTPUT_DIR/{stem}_equil.nc"',
+                        '$QOFF_RUNNER -O -i "$INPUT" -o "$OUT" -p "$QOFF_PRMTOP" -c "$TERMINAL_START_COORD" -r "$RST" -x "$TRAJ"'
+                        + (' -ref "$QOFF_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
+                        'TERMINAL_START_COORD="$RST"',
+                    ]
+                )
+            lines.extend(
+                [
                     f"INPUT=\"$INPUT_ROOT/{terminal_qoff_window.filename}\"",
                     f"OUT=\"$QOFF_OUTPUT_DIR/{stem}.out\"",
                     f"RST=\"{last_qoff_rst}\"",
                     f"TRAJ=\"$QOFF_OUTPUT_DIR/{stem}.nc\"",
-                    f"$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"{terminal_start_coord}\" -r \"$RST\" -x \"$TRAJ\""
+                    "$QOFF_RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$QOFF_PRMTOP\" -c \"$TERMINAL_START_COORD\" -r \"$RST\" -x \"$TRAJ\""
                     + (' -ref "$QOFF_REFERENCE_COORD"' if qoff_has_positional_restraints else ""),
                     "",
                 ]
@@ -759,17 +804,37 @@ def _window_lines(
             ]
         )
     if vdwoff_windows:
-        lines.append("echo 'Starting VDW-off TI windows...'")
+        lines.extend(
+            [
+                "echo 'Starting VDW-off TI windows...'",
+                'VDWOFF_START_COORD="$QOFF_ENDPOINT"',
+            ]
+        )
         for window in vdwoff_windows:
             stem = Path(window.filename).stem
+            if window.equil_filename:
+                lines.extend(
+                    [
+                        f'INPUT="$INPUT_ROOT/{window.equil_filename}"',
+                        f'OUT="$VDWOFF_EQUIL_OUTPUT_DIR/{stem}_equil.out"',
+                        f'RST="$VDWOFF_EQUIL_OUTPUT_DIR/{stem}_equil.rst7"',
+                        f'TRAJ="$VDWOFF_EQUIL_OUTPUT_DIR/{stem}_equil.nc"',
+                        '$RUNNER -O -i "$INPUT" -o "$OUT" -p "$VDWOFF_PRMTOP" -c "$VDWOFF_START_COORD" -r "$RST" -x "$TRAJ"'
+                        + (' -ref "$QOFF_ENDPOINT"' if vdwoff_has_positional_restraints else ""),
+                        'WINDOW_START_COORD="$RST"',
+                    ]
+                )
+            else:
+                lines.append('WINDOW_START_COORD="$VDWOFF_START_COORD"')
             lines.extend(
                 [
                     f"INPUT=\"$INPUT_ROOT/{window.filename}\"",
                     f"OUT=\"$VDWOFF_OUTPUT_DIR/{stem}.out\"",
                     f"RST=\"$VDWOFF_OUTPUT_DIR/{stem}.rst7\"",
                     f"TRAJ=\"$VDWOFF_OUTPUT_DIR/{stem}.nc\"",
-                    "$RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$VDWOFF_PRMTOP\" -c \"$QOFF_ENDPOINT\" -r \"$RST\" -x \"$TRAJ\""
+                    "$RUNNER -O -i \"$INPUT\" -o \"$OUT\" -p \"$VDWOFF_PRMTOP\" -c \"$WINDOW_START_COORD\" -r \"$RST\" -x \"$TRAJ\""
                     + (' -ref "$QOFF_ENDPOINT"' if vdwoff_has_positional_restraints else ""),
+                    'VDWOFF_START_COORD="$RST"',
                     "",
                 ]
             )
@@ -864,9 +929,14 @@ def _bidirectional_lines(
         )
         for window in ordered:
             stem = Path(window.filename).stem
+            equil_filename = (
+                window.restart_equil_filename
+                if direction == "reverse" and window.restart_equil_filename
+                else window.equil_filename
+            )
             lines.extend(
                 [
-                    f'INPUT="$INPUT_ROOT/{window.equil_filename}"',
+                    f'INPUT="$INPUT_ROOT/{equil_filename}"',
                     f'OUT="$EQUIL_OUTPUT_DIR/{stem}_equil.out"',
                     f'RST="$EQUIL_OUTPUT_DIR/{stem}_equil.rst7"',
                     f'TRAJ="$EQUIL_OUTPUT_DIR/{stem}_equil.nc"',

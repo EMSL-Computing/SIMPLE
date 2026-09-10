@@ -42,6 +42,7 @@ def _default_vdw_lambdas() -> list[float]:
 class SnapshotMode(StrEnum):
     LAST = "last"
     CLUSTER = "cluster"
+    TIME = "time"
 
 
 class TIImplementationMode(StrEnum):
@@ -86,6 +87,7 @@ class ComplexInputConfig(BaseModel):
 
 class SnapshotConfig(BaseModel):
     mode: SnapshotMode = SnapshotMode.LAST
+    time_ns: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     cluster_radius_angstrom: float = Field(default=6.0, gt=0.0)
     cluster_epsilon_angstrom: float = Field(default=2.0, gt=0.0)
     cluster_sieve: int = Field(default=10, ge=1)
@@ -93,6 +95,12 @@ class SnapshotConfig(BaseModel):
     diffusion_cutoff_angstrom: float = Field(default=2.5, gt=0.0)
     donor_cutoff_angstrom: float = Field(default=3.0, gt=0.0)
     retained_donor_cutoff_angstrom: float = Field(default=3.5, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_time_selection(self) -> SnapshotConfig:
+        if self.mode == SnapshotMode.TIME and self.time_ns is None:
+            raise ValueError("snapshot.time_ns is required when snapshot.mode='time'")
+        return self
 
 
 class MetalSelectionConfig(BaseModel):

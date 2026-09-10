@@ -56,6 +56,7 @@ from amber_metallo.ti.restraints import (
     write_qoff_duplicate_bound_site_restraints,
 )
 from amber_metallo.ti.slurm import QoffCoordinateBridge, write_leg_slurm_scripts
+from amber_metallo.ti.snapshots import netcdf_restart_has_velocities, run_time_snapshot_extraction
 from amber_metallo.ti.topology import (
     inspect_prmtop_charge_state,
     missing_required_1264_charge_families,
@@ -1083,11 +1084,17 @@ def _parse_restart_value_count(path: Path) -> tuple[int, int] | None:
 
 
 def _restart_has_velocity_records(path: Path) -> bool:
+    with path.open("rb") as handle:
+        magic = handle.read(4)
+    if magic.startswith((b"CDF", b"\x89HDF")):
+        try:
+            return netcdf_restart_has_velocities(path)
+        except (ImportError, OSError, ValueError, TypeError):
+            # Unverified velocities must never select ntx=5 for a fresh start.
+            return False
     parsed = _parse_restart_value_count(path)
     if parsed is None:
-        # NetCDF/HDF restarts can contain velocities, but this lightweight check cannot inspect them.
-        # Keep them eligible rather than discarding a valid production restart.
-        return True
+        return False
     natom, value_count = parsed
     if natom <= 0:
         return False
@@ -1104,7 +1111,7 @@ def _eligible_production_restart(candidate: Path) -> Path | None:
     if _restart_has_velocity_records(candidate):
         return candidate.resolve()
     console.print(
-        "[bold yellow]Detected restart without velocity records; FreeE will generate a short bound-start prep before TI:[/bold yellow] "
+        "[bold yellow]Restart velocities are missing or could not be verified; FreeE will initialize velocities before TI production:[/bold yellow] "
         f"{candidate}"
     )
     return None
@@ -1307,22 +1314,48 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
     slurm_config = _effective_slurm_config(config)
 
     snapshot_dir = root / "snapshot"
-    with activity_status(
-        "[blink bold cyan]Processing...[/] Extracting the last snapshot from the production trajectory.",
-        plain_message="Processing... Extracting the last snapshot from the production trajectory.",
-    ):
-        last_snapshot = run_last_snapshot_extraction(
-            prmtop_path=config.complex_input.prmtop_path,
-            trajectory_path=config.complex_input.trajectory_path,
-            reference_structure_path=config.complex_input.reference_structure_path,
-            output_dir=snapshot_dir,
-            dry_run=dry_run,
+    time_manifest = None
+    snapshot_source = "last"
+    if config.snapshot.mode == SnapshotMode.TIME:
+        with activity_status(
+            "[blink bold cyan]Processing...[/] Extracting the snapshot at the requested trajectory time.",
+            plain_message="Processing... Extracting the snapshot at the requested trajectory time.",
+        ):
+            time_manifest = run_time_snapshot_extraction(
+                prmtop_path=config.complex_input.prmtop_path,
+                trajectory_path=config.complex_input.trajectory_path,
+                reference_structure_path=config.complex_input.reference_structure_path,
+                production_mdin_path=config.complex_input.production_mdin_path,
+                time_ns=config.snapshot.time_ns,
+                output_dir=snapshot_dir,
+                dry_run=dry_run,
+            )
+        selected_snapshot_pdb = Path(time_manifest["snapshot_pdb"])
+        selected_snapshot_rst7 = Path(time_manifest["snapshot_rst7"])
+        snapshot_source = "time"
+        console.print(
+            f"[cyan]Selected frame {time_manifest['frame_index']} at {time_manifest['selected_time_ns']:g} ns "
+            f"(requested {time_manifest['requested_time_ns']:g} ns).[/cyan]"
         )
+    else:
+        with activity_status(
+            "[blink bold cyan]Processing...[/] Extracting the last snapshot from the production trajectory.",
+            plain_message="Processing... Extracting the last snapshot from the production trajectory.",
+        ):
+            last_snapshot = run_last_snapshot_extraction(
+                prmtop_path=config.complex_input.prmtop_path,
+                trajectory_path=config.complex_input.trajectory_path,
+                reference_structure_path=config.complex_input.reference_structure_path,
+                output_dir=snapshot_dir,
+                dry_run=dry_run,
+            )
+        selected_snapshot_pdb = Path(last_snapshot["last_snapshot_pdb"])
+        selected_snapshot_rst7 = Path(last_snapshot["last_snapshot_rst7"])
 
     assessments = [
         assess_site_stability(
             config.complex_input.reference_structure_path,
-            last_snapshot["last_snapshot_pdb"],
+            selected_snapshot_pdb,
             candidate,
             diffusion_cutoff_angstrom=config.snapshot.diffusion_cutoff_angstrom,
             retained_donor_cutoff_angstrom=config.snapshot.retained_donor_cutoff_angstrom,
@@ -1347,13 +1380,10 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             )
         if not config.snapshot.allow_unstable_last_snapshot:
             raise RuntimeError(
-                "The selected metal site is unstable in the last snapshot. "
-                "Set snapshot.allow_unstable_last_snapshot = true to proceed with the last snapshot anyway."
+                "The selected metal site is unstable in the selected snapshot. "
+                "Set snapshot.allow_unstable_last_snapshot = true to proceed with this snapshot anyway."
             )
 
-    snapshot_source = "last"
-    selected_snapshot_pdb = Path(last_snapshot["last_snapshot_pdb"])
-    selected_snapshot_rst7 = Path(last_snapshot["last_snapshot_rst7"])
     cluster_manifest: dict[str, str] | None = None
     if config.snapshot.mode == SnapshotMode.CLUSTER and all(item.stable for item in selected_assessments):
         cluster_atom_indices: set[int] = set()
@@ -1396,7 +1426,11 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         start_restart_source=start_coordinate_path,
         output_dir=root,
     )
-    bound_start_source = "production_restart" if production_restart_path is not None else "cpu_prep"
+    bound_start_source = (
+        "production_restart" if production_restart_path is not None
+        else "snapshot" if _uses_combined_gti_decoupling(config)
+        else "cpu_prep"
+    )
 
     inherited_settings = parse_cntrl_settings(config.complex_input.production_mdin_path)
     bound_dir = root / "bound"
@@ -1558,7 +1592,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         else Path(_relative_path(combined_restraint_file, from_dir=bound_dir)).as_posix()
     )
     bound_start_prep_stages = None
-    if production_restart_path is None or (
+    if (production_restart_path is None and not _uses_combined_gti_decoupling(config)) or (
         bound_counterion_plan is not None and bound_counterion_plan.requires_preparation
     ):
         bound_prep_config = config.ti
@@ -1582,7 +1616,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         atom_mask=alchemical_atom_mask,
         restraint_file=bound_restraint_path,
         output_dir=bound_dir,
-        qoff_start_source="restart",
+        qoff_start_source="snapshot" if bound_start_source == "snapshot" else "restart",
         qoff_timask1=None if bound_qoff_topology is None else str(bound_qoff_topology["qoff_timask1"]),
         qoff_timask2=None if bound_qoff_topology is None else str(bound_qoff_topology["qoff_timask2"]),
         qoff_charge_mask=None if bound_qoff_topology is None else str(bound_qoff_topology["qoff_crgmask"]),
@@ -1786,9 +1820,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         "ti_sampling_mode": config.ti.sampling_mode.value,
         "ti_sampling_protocol": {
             "replicas": 1,
-            "window_equilibration_ns": config.ti.window_equilibration_ns
-            if config.ti.sampling_mode == TISamplingMode.BIDIRECTIONAL
-            else 0.0,
+            "window_equilibration_ns": config.ti.window_equilibration_ns,
             "directions": ["forward", "reverse"]
             if config.ti.sampling_mode == TISamplingMode.BIDIRECTIONAL
             else ["forward"],
@@ -1850,6 +1882,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             "selected_pdb": str(copied_selected_pdb),
             "selected_rst7": str(copied_selected_rst7),
             "cluster_manifest": cluster_manifest,
+            "time_manifest": time_manifest,
         },
         "copied_inputs": copied_inputs,
     }

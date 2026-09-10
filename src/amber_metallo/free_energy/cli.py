@@ -45,6 +45,8 @@ from amber_metallo.ti.analysis import (
 )
 from amber_metallo.ti.cli import (
     TIInputSelection,
+    _assess_time_snapshot,
+    _confirm_snapshot_stability,
     _default_output_directory,
     _display_site_table,
     _infer_charge_from_selected_site,
@@ -56,6 +58,7 @@ from amber_metallo.ti.cli import (
     _prompt_complex_input_selection,
     _prompt_complex_input_selections,
     _prompt_snapshot_mode,
+    _prompt_snapshot_time,
     _prompt_ti_charge_compensation_mode,
     _prompt_ti_decoupling_mode,
     _prompt_ti_execution_profile,
@@ -69,6 +72,7 @@ from amber_metallo.ti.config import (
     ComplexInputConfig,
     MetalSelectionConfig,
     SnapshotConfig,
+    SnapshotMode,
     TIDecouplingMode,
     TIMetalSelectionMode,
     TIImplementationMode,
@@ -1588,13 +1592,6 @@ def _build_single_free_energy_wizard_config(
             selected_sites = [selected]
 
     selected_assessments = [next(item for item in assessments if item.site == item_site.site) for item_site in selected_sites]
-    allow_unstable = False
-    unstable_assessments = [item for item in selected_assessments if not item.stable]
-    if unstable_assessments:
-        print_notice("Strong Warning", "\n".join(item.note for item in unstable_assessments), border_style="bold red")
-        allow_unstable = typer.confirm("Proceed with the selected site anyway?", default=False)
-        if not allow_unstable:
-            raise typer.Abort()
 
     if forced_method is None:
         _print_step_header(
@@ -1644,15 +1641,31 @@ def _build_single_free_energy_wizard_config(
                 )
         if shared_ti_settings is None:
             snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
-            ti_production_ensemble = _prompt_ti_production_ensemble()
-            ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
-            ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
         else:
             snapshot_mode = shared_ti_settings.snapshot.mode
             if snapshot_mode.value == "cluster" and not all(item.stable for item in selected_assessments):
                 snapshot_mode = _prompt_snapshot_mode(selected_stable=False)
             else:
                 console.print(f"[dim]Batch snapshot setting reused: {snapshot_mode.value}.[/dim]")
+        snapshot_time_ns = None
+        if snapshot_mode == SnapshotMode.TIME:
+            snapshot_time_ns = _prompt_snapshot_time(
+                input_selection.complex_input,
+                default_time_ns=None if shared_ti_settings is None else shared_ti_settings.snapshot.time_ns,
+            )
+            selected_assessments = _assess_time_snapshot(
+                complex_input=input_selection.complex_input,
+                time_ns=snapshot_time_ns,
+                candidates=selected_sites,
+                output_dir=wizard_tmp / "time_snapshot_probe",
+                dry_run=dry_run,
+            )
+        allow_unstable = _confirm_snapshot_stability(selected_assessments)
+        if shared_ti_settings is None:
+            ti_production_ensemble = _prompt_ti_production_ensemble()
+            ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
+            ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
+        else:
             ti_sampling_mode = shared_ti_settings.ti.sampling_mode
             ti_production_ensemble = shared_ti_settings.ti.production_ensemble
             ti_charge_compensation_mode = shared_ti_settings.ti.charge_compensation_mode
@@ -1731,6 +1744,7 @@ def _build_single_free_energy_wizard_config(
             complex_input=input_selection.complex_input.model_dump(mode="json"),
             snapshot=SnapshotConfig(
                 mode=snapshot_mode,
+                time_ns=snapshot_time_ns,
                 allow_unstable_last_snapshot=allow_unstable,
             ),
             metal=MetalSelectionConfig(
@@ -1774,6 +1788,7 @@ def _build_single_free_energy_wizard_config(
             output_dir=str(output_dir_path),
         )
 
+    allow_unstable = _confirm_snapshot_stability(selected_assessments)
     _print_step_header(
         3 if forced_method is None else 2,
         "Choose the MM-PBSA Settings",

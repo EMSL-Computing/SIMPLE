@@ -25,7 +25,7 @@ from amber_metallo.cli import (
 )
 from amber_metallo.config import SlurmProfile
 from amber_metallo.environment import detect_amber_environment
-from amber_metallo.reporting import console, print_notice
+from amber_metallo.reporting import activity_status, console, print_notice
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti import abfe as ti_abfe
 from amber_metallo.ti.analysis import (
@@ -58,6 +58,7 @@ from amber_metallo.ti.workflow import (
     water_reference_entry_matches,
     water_reference_root,
 )
+from amber_metallo.ti.snapshots import read_trajectory_times, run_time_snapshot_extraction
 from amber_metallo.ti.topology import (
     filter_ti_compatible_custom_126_frcmods,
     filter_ti_compatible_custom_1264_frcmods,
@@ -235,7 +236,6 @@ def _prompt_snapshot_mode(*, selected_stable: bool) -> SnapshotMode:
         console.print(
             "[bold yellow]Cluster analysis is disabled because the selected metal site is unstable in the last snapshot.[/bold yellow]"
         )
-        return SnapshotMode.LAST
 
     choices = [
         WizardChoice(SnapshotMode.LAST.value, "Last snapshot", "Use the final frame from the production trajectory."),
@@ -243,10 +243,89 @@ def _prompt_snapshot_mode(*, selected_stable: bool) -> SnapshotMode:
             SnapshotMode.CLUSTER.value,
             "Representative cluster snapshot",
             "Run cluster analysis on the binding-site neighborhood to choose a representative snapshot. This can take time.",
+            enabled=selected_stable,
+        ),
+        WizardChoice(
+            SnapshotMode.TIME.value,
+            "Snapshot at a specified time (ns)",
+            "Show the saved trajectory time range and select the frame nearest your requested time.",
         ),
     ]
     _display_choice_table("Snapshot source", choices)
     return SnapshotMode(_prompt_choice("Choose the snapshot source", choices, default_key=SnapshotMode.LAST.value))
+
+
+def _prompt_snapshot_time(complex_input: ComplexInputConfig, *, default_time_ns: float | None = None) -> float:
+    with activity_status(
+        "[blink bold cyan]Processing...[/] Reading trajectory frame times.",
+        plain_message="Processing... Reading trajectory frame times.",
+    ):
+        timeline = read_trajectory_times(
+            trajectory_path=complex_input.trajectory_path,
+            prmtop_path=complex_input.prmtop_path,
+            production_mdin_path=complex_input.production_mdin_path,
+        )
+    console.print(
+        f"[bold cyan]Trajectory:[/bold cyan] {len(timeline.times_ns):,} saved frames; "
+        f"{timeline.start_ns:g}–{timeline.end_ns:g} ns "
+        f"(saved time span {timeline.end_ns - timeline.start_ns:g} ns)."
+    )
+    console.print(f"[dim]{timeline.source}[/dim]")
+    default = timeline.end_ns if default_time_ns is None else default_time_ns
+    if not timeline.start_ns <= default <= timeline.end_ns:
+        default = timeline.end_ns
+    while True:
+        raw = typer.prompt("Snapshot time in ns (for example, 40 or 40 ns)", default=f"{default:g}").strip()
+        try:
+            requested = float(re.sub(r"\s*ns\s*$", "", raw, flags=re.IGNORECASE))
+            frame_index, actual_time = timeline.nearest_frame(requested)
+        except ValueError as exc:
+            console.print(f"[bold red]Invalid snapshot time:[/bold red] {exc}")
+            continue
+        console.print(
+            f"[cyan]Requested {requested:g} ns → frame {frame_index:,} at {actual_time:g} ns.[/cyan]"
+        )
+        return requested
+
+
+def _assess_time_snapshot(
+    *,
+    complex_input: ComplexInputConfig,
+    time_ns: float,
+    candidates,
+    output_dir: Path,
+    dry_run: bool,
+):
+    with activity_status(
+        "[blink bold cyan]Processing...[/] Inspecting the selected time snapshot.",
+        plain_message="Processing... Inspecting the selected time snapshot.",
+    ):
+        snapshot = run_time_snapshot_extraction(
+            prmtop_path=complex_input.prmtop_path,
+            trajectory_path=complex_input.trajectory_path,
+            reference_structure_path=complex_input.reference_structure_path,
+            production_mdin_path=complex_input.production_mdin_path,
+            time_ns=time_ns,
+            output_dir=output_dir,
+            dry_run=dry_run,
+        )
+    return [
+        assess_site_stability(
+            complex_input.reference_structure_path, snapshot["snapshot_pdb"], candidate,
+            diffusion_cutoff_angstrom=2.5, retained_donor_cutoff_angstrom=3.5,
+        )
+        for candidate in candidates
+    ]
+
+
+def _confirm_snapshot_stability(assessments) -> bool:
+    unstable = [item for item in assessments if not item.stable]
+    if not unstable:
+        return False
+    print_notice("Strong Warning", "\n".join(item.note for item in unstable), border_style="bold red")
+    if not typer.confirm("Proceed with the selected snapshot anyway?", default=False):
+        raise typer.Abort()
+    return True
 
 
 def _prompt_ti_implementation_mode() -> TIImplementationMode:
@@ -344,7 +423,7 @@ def _prompt_ti_sampling_mode(decoupling_mode: TIDecouplingMode) -> TISamplingMod
         WizardChoice(
             TISamplingMode.SINGLE_PASS.value,
             "Forward single pass",
-            "Default and recommended baseline. Run one conventional forward lambda sweep with sequential restart propagation.",
+            "Default baseline. Equilibrate each lambda window, exclude that segment from DV/DL analysis, then run one forward production sweep.",
         ),
         WizardChoice(
             TISamplingMode.BIDIRECTIONAL.value,
@@ -370,6 +449,13 @@ def _prompt_ti_sampling_mode(decoupling_mode: TIDecouplingMode) -> TISamplingMod
             "guaranteed accuracy improvement: a large forward/reverse difference indicates insufficient equilibration, "
             "slow relaxation, or path dependence and should not be hidden by averaging. Run the workflow again if "
             "independent repeats are needed.",
+            border_style="cyan",
+        )
+    else:
+        print_notice(
+            "Forward TI Sampling",
+            "Every lambda window receives a separate 200 ps equilibration whose DV/DL values are excluded, "
+            "followed by the requested production length. Each next window starts from the preceding production restart.",
             border_style="cyan",
         )
     return selection
@@ -2142,15 +2228,6 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
         selected = select_site(candidates, int(_prompt_choice("Choose the metal site to decouple", choices)))
 
     selected_assessment = next(item for item in assessments if item.site == selected.site)
-    allow_unstable = False
-    if not selected_assessment.stable:
-        print_notice("Strong Warning", selected_assessment.note, border_style="bold red")
-        allow_unstable = typer.confirm(
-            "Proceed with the last snapshot anyway?",
-            default=False,
-        )
-        if not allow_unstable:
-            raise typer.Abort()
 
     _print_step_header(
         2,
@@ -2177,6 +2254,15 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
         ti_implementation_mode = _prompt_ti_implementation_mode()
         ti_decoupling_mode = _prompt_ti_decoupling_mode(ti_implementation_mode)
     snapshot_mode = _prompt_snapshot_mode(selected_stable=selected_assessment.stable)
+    snapshot_time_ns = None
+    selected_assessments = [selected_assessment]
+    if snapshot_mode == SnapshotMode.TIME:
+        snapshot_time_ns = _prompt_snapshot_time(input_selection.complex_input)
+        selected_assessments = _assess_time_snapshot(
+            complex_input=input_selection.complex_input, time_ns=snapshot_time_ns, candidates=[selected],
+            output_dir=wizard_tmp / "time_snapshot_probe", dry_run=dry_run,
+        )
+    allow_unstable = _confirm_snapshot_stability(selected_assessments)
     ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
     ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
     if in_place_ti:
@@ -2253,6 +2339,7 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
         ),
         snapshot=SnapshotConfig(
             mode=snapshot_mode,
+            time_ns=snapshot_time_ns,
             allow_unstable_last_snapshot=allow_unstable,
         ),
         metal=MetalSelectionConfig(
