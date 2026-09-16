@@ -43,6 +43,11 @@ from amber_metallo.ti.config import (
     TIWorkflowConfig,
 )
 from amber_metallo.ti.counterions import CounterionPlan, prepare_charge_compensating_counterions
+from amber_metallo.ti.coordination import (
+    CORRECTION_NOTICE,
+    build_coordination_restraints,
+    checked_prepared_snapshot,
+)
 from amber_metallo.ti.protocols import (
     generate_bound_start_preparation_inputs,
     generate_qoff_endpoint_preparation_inputs,
@@ -319,7 +324,7 @@ def _water_reference_signature(
         "custom_ion_frcmods": config.water_reference.custom_ion_frcmods,
         "official_12_6_frcmods": list(official_126_frcmods or []),
         "inherited_md_settings": inherited_settings.to_dict(),
-        "ti_protocol": config.ti.model_dump(mode="json"),
+        "ti_protocol": config.ti.model_dump(mode="json", exclude={"coordination_restraint"}),
         "scheme_version": WATER_REFERENCE_SCHEME_VERSION,
     }
 
@@ -589,7 +594,7 @@ def _multi_water_reference_signature(
         "custom_ion_frcmods": config.water_reference.custom_ion_frcmods,
         "official_12_6_frcmods": list(official_126_frcmods or []),
         "inherited_md_settings": inherited_settings.to_dict(),
-        "ti_protocol": config.ti.model_dump(mode="json"),
+        "ti_protocol": config.ti.model_dump(mode="json", exclude={"coordination_restraint"}),
         "scheme_version": WATER_REFERENCE_SCHEME_VERSION + "-multi",
     }
 
@@ -1215,6 +1220,10 @@ def print_ti_workflow_summary(result: dict[str, Any]) -> None:
     overview.add_row("TI mode", str(result.get("ti_implementation_mode", "N/A")))
     overview.add_row("TI decoupling", str(result.get("ti_decoupling_mode", "N/A")))
     overview.add_row("Snapshot source", str(result.get("snapshot_source", "N/A")))
+    restraint_info = result.get("restraint", {})
+    if restraint_info.get("scheme_version") == "flat_bottom_donor_pairs_v1":
+        pair_count = sum(len(site["pairs"]) for site in restraint_info["sites"])
+        overview.add_row("Coordination restraints", f"{pair_count} donor pairs; reference: {restraint_info['reference_source']}")
     overview.add_row("Water term source", str(result.get("water_term_source", "simulation")))
     if result.get("water_term_source") == "disabled":
         overview.add_row("Water reference directory", "Disabled for in-place TI")
@@ -1227,13 +1236,20 @@ def print_ti_workflow_summary(result: dict[str, Any]) -> None:
     overview.add_row("Bound TI outputs", str(result.get("bound_runtime_output_dir", "N/A")))
     if result.get("water_term_source") != "disabled":
         overview.add_row("Water TI outputs", str(result.get("water_runtime_output_dir", "N/A")))
-    overview.add_row("Restraint correction (kcal/mol)", f"{float(result.get('restraint_correction_kcal_mol', 0.0)):.3f}")
+    overview.add_row(
+        "Restraint correction (kcal/mol)",
+        "NOT COMPUTED (donor-pair restraints)"
+        if result.get("restraint", {}).get("correction_status") == "not_computed"
+        else f"{float(result.get('restraint_correction_kcal_mol', 0.0)):.3f}",
+    )
     console.print(Panel(overview, title="[bold]TI Setup Complete[/bold]", border_style="green"))
 
     outputs = Table(title="Generated TI Assets")
     outputs.add_column("Item", style="bold white")
     outputs.add_column("Path", style="cyan", overflow="fold")
     outputs.add_row("Bound leg sbatch", str(result.get("bound_slurm", "N/A")))
+    if restraint_info.get("scheme_version") == "flat_bottom_donor_pairs_v1":
+        outputs.add_row("Coordination restraint file", str(restraint_info["restraint_file"]))
     if result.get("water_term_source") != "disabled":
         outputs.add_row("Water leg sbatch", str(result.get("water_slurm", "N/A")))
     outputs.add_row("Bound TI qoff prmtop", str(result.get("bound_ti_input_topology", "N/A")))
@@ -1257,6 +1273,20 @@ def print_ti_workflow_summary(result: dict[str, Any]) -> None:
 
 
 def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[str, Any]:
+    from amber_metallo.ti.config import TIEndpointMode
+    from amber_metallo.ti.transformation_workflow import validate_direct_config, run_direct_metal_workflow
+    validate_direct_config(config)
+    direct_metal = config.transformation.mode == TIEndpointMode.METAL
+    from amber_metallo.ti.atom_mapping import map_to_topology, remap_candidates, assess_mapped_site_stability
+    from amber_metallo.ti.coordination import prepare_restraint_snapshot
+    coordination_config = config.ti.coordination_restraint
+    use_coordination = coordination_config is not None and coordination_config.enabled
+    if use_coordination and not _uses_combined_gti_decoupling(config):
+        raise ValueError(
+            "Donor-pair restraints require amber_12_6_4_gti + combined_q_vdw; "
+            "split Q-off duplicate-metal restraint weighting is not validated."
+        )
+    prepared_restraint_snapshot = checked_prepared_snapshot(config, dry_run=dry_run)
     if config.ti.implementation_mode == TIImplementationMode.GROMACS_TABULATED_12_6_4:
         raise NotImplementedError(
             "GROMACS tabulated 12-6-4 TI mode is still under development and is not yet available."
@@ -1264,6 +1294,24 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
 
     root = config.output_path()
     root.mkdir(parents=True, exist_ok=True)
+    from amber_metallo.ti.full_structure import normalize_full_reference, full_pdb_from_restart
+    # Work from a complete, topology-ordered copy even when loading an old
+    # config directly (without the updated wizard). Do not alter caller inputs.
+    config = config.model_copy(deep=True)
+    reference_full = normalize_full_reference(
+        reference_pdb=config.complex_input.reference_structure_path,
+        prmtop_path=config.complex_input.prmtop_path, output_dir=root / "full_reference",
+        coordinate_candidates=([prepared_restraint_snapshot.pdb_path, prepared_restraint_snapshot.restart_path]
+                               if prepared_restraint_snapshot is not None else []),
+    )
+    config.complex_input.reference_structure_path = str(reference_full)
+    if prepared_restraint_snapshot is not None and not dry_run:
+        # Migrate pre-fix previews whose PDB omitted extra points; the stored
+        # restart remains the authoritative coordinates for that exact frame.
+        full_frame = full_pdb_from_restart(
+            prmtop_path=config.complex_input.prmtop_path, restart_path=prepared_restraint_snapshot.restart_path,
+            output_path=root / "snapshot" / "prepared_full.pdb")
+        prepared_restraint_snapshot = prepared_restraint_snapshot.model_copy(update={"pdb_path": str(full_frame)})
     copied_inputs = _copy_complex_inputs(config, root)
     amber_env = detect_amber_environment()
 
@@ -1277,6 +1325,16 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             donor_cutoff_angstrom=config.snapshot.donor_cutoff_angstrom,
             include_unbound_metals=_uses_in_place_bound_ti(config),
         )
+    reference_candidates = candidates
+    reference_selected_sites = _resolve_selected_sites(config, reference_candidates)
+    if use_coordination:
+        # The user's reference may omit H/solvent. Alchemical masks, charges and
+        # DISANG records must nevertheless use the full topology's atom indices.
+        candidates = remap_candidates(reference_candidates, map_to_topology(
+            config.complex_input.reference_structure_path, config.complex_input.prmtop_path))
+        if prepared_restraint_snapshot is None:
+            prepared_restraint_snapshot = prepare_restraint_snapshot(
+                config, reference_selected_sites, output_dir=root / "snapshot" / "restraint_frame", dry_run=dry_run)
     selected_sites = _resolve_selected_sites(config, candidates)
     selected = selected_sites[0]
     multi_site = len(selected_sites) > 1
@@ -1287,7 +1345,9 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
     formal_charge = formal_charges_by_site[selected.site]
     selected_atom_indices = [item.atom_index for item in selected_sites]
     alchemical_atom_mask = _atom_mask_from_indices(selected_atom_indices)
-    if _uses_in_place_bound_ti(config):
+    if direct_metal:
+        ti_ion_frcmods = []
+    elif _uses_in_place_bound_ti(config):
         if not _uses_gti_1264(config):
             raise ValueError(
                 "water_reference.bound_in_place=true or water_reference.enabled=false keeps the existing prmtop "
@@ -1316,7 +1376,14 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
     snapshot_dir = root / "snapshot"
     time_manifest = None
     snapshot_source = "last"
-    if config.snapshot.mode == SnapshotMode.TIME:
+    if prepared_restraint_snapshot is not None:
+        selected_snapshot_pdb = Path(prepared_restraint_snapshot.pdb_path)
+        selected_snapshot_rst7 = Path(prepared_restraint_snapshot.restart_path)
+        snapshot_source = config.snapshot.mode.value
+        if config.snapshot.mode == SnapshotMode.TIME:
+            time_manifest = prepared_restraint_snapshot.metadata
+        console.print("[cyan]Reusing the exact TI frame previewed during restraint selection.[/cyan]")
+    elif config.snapshot.mode == SnapshotMode.TIME:
         with activity_status(
             "[blink bold cyan]Processing...[/] Extracting the snapshot at the requested trajectory time.",
             plain_message="Processing... Extracting the snapshot at the requested trajectory time.",
@@ -1353,14 +1420,14 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         selected_snapshot_rst7 = Path(last_snapshot["last_snapshot_rst7"])
 
     assessments = [
-        assess_site_stability(
+        (assess_mapped_site_stability if use_coordination else assess_site_stability)(
             config.complex_input.reference_structure_path,
             selected_snapshot_pdb,
             candidate,
             diffusion_cutoff_angstrom=config.snapshot.diffusion_cutoff_angstrom,
             retained_donor_cutoff_angstrom=config.snapshot.retained_donor_cutoff_angstrom,
         )
-        for candidate in candidates
+        for candidate in reference_candidates
     ]
     record_site_analysis(output_path=snapshot_dir / "site_analysis.json", candidates=candidates, assessments=assessments)
     selected_assessments = [next(item for item in assessments if item.site == item_site.site) for item_site in selected_sites]
@@ -1384,8 +1451,16 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
                 "Set snapshot.allow_unstable_last_snapshot = true to proceed with this snapshot anyway."
             )
 
-    cluster_manifest: dict[str, str] | None = None
-    if config.snapshot.mode == SnapshotMode.CLUSTER and all(item.stable for item in selected_assessments):
+    cluster_manifest: dict[str, str] | None = (
+        prepared_restraint_snapshot.metadata
+        if prepared_restraint_snapshot is not None and config.snapshot.mode == SnapshotMode.CLUSTER
+        else None
+    )
+    if (
+        prepared_restraint_snapshot is None
+        and config.snapshot.mode == SnapshotMode.CLUSTER
+        and all(item.stable for item in selected_assessments)
+    ):
         cluster_atom_indices: set[int] = set()
         for selected_site in selected_sites:
             mask = build_cluster_atom_mask(
@@ -1414,10 +1489,12 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         selected_snapshot_rst7 = Path(cluster_manifest["representative_snapshot_rst7"])
         snapshot_source = "cluster"
 
-    production_restart_path = _resolve_production_restart_path(config) if snapshot_source == "last" else None
+    production_restart_path = (
+        _resolve_production_restart_path(config) if snapshot_source == "last" and not use_coordination else None
+    )
     start_coordinate_path = (
         production_restart_path or _resolve_coordinate_restart_path(config)
-        if snapshot_source == "last"
+        if snapshot_source == "last" and not use_coordination
         else None
     )
     copied_selected_pdb, copied_selected_rst7 = _write_bound_snapshot_placeholders(
@@ -1433,6 +1510,12 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
     )
 
     inherited_settings = parse_cntrl_settings(config.complex_input.production_mdin_path)
+    if direct_metal:
+        return run_direct_metal_workflow(
+            config=config, selected_sites=selected_sites, reference_selected_sites=reference_selected_sites,
+            selected_pdb=copied_selected_pdb, selected_rst7=copied_selected_rst7,
+            inherited_settings=inherited_settings, amber_env=amber_env, snapshot_source=snapshot_source,
+            assessments=selected_assessments, copied_inputs=copied_inputs, dry_run=dry_run)
     bound_dir = root / "bound"
     bound_dir.mkdir(parents=True, exist_ok=True)
     bound_counterion_plan: CounterionPlan | None = None
@@ -1478,7 +1561,34 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         alchemical_elements_by_index={item.atom_index: item.element for item in selected_sites},
         alchemical_charges_by_index={item.atom_index: formal_charges_by_site[item.site] for item in selected_sites},
     )
-    if _uses_in_place_bound_ti(config):
+    if use_coordination:
+        restraint_setup = None
+        restraint_setups = []
+        restraint_payload = build_coordination_restraints(
+            reference_pdb=config.complex_input.reference_structure_path,
+            snapshot_pdb=copied_selected_pdb,
+            source_prmtop=config.complex_input.prmtop_path,
+            ti_prmtop=bound_ti_topology["ti_prmtop"],
+            candidates=reference_selected_sites,
+            config=coordination_config,
+            output_dir=bound_dir / "restraints",
+            dry_run=dry_run,
+        )
+        combined_restraint_file = restraint_payload["restraint_file"]
+        print_notice("Uncorrected coordination-restrained TI", CORRECTION_NOTICE, border_style="yellow")
+        outside = [
+            pair for site in restraint_payload["sites"] for pair in site["pairs"]
+            if pair["start_outside_flat_bottom"]
+        ]
+        if outside:
+            print_notice(
+                "Starting distances outside the flat bottom",
+                f"{len(outside)} contact(s) start outside the selected range. Restrained minimization and "
+                "equilibration are generated; inspect them before running TI. See restraints/coordination.json.",
+                border_style="yellow",
+            )
+        (root / "RESTRAINT_WARNING.txt").write_text(CORRECTION_NOTICE + "\n", encoding="utf-8")
+    elif _uses_in_place_bound_ti(config):
         restraint_setup = None
         restraint_setups = []
         combined_restraint_file = None
@@ -1525,7 +1635,10 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         restraint_setups = [restraint_setup]
         combined_restraint_file = restraint_setup.restraint_file
         restraint_payload = restraint_setup.to_dict()
-    restraint_correction = sum(setup.correction_kcal_mol for setup in restraint_setups)
+    # A JSON string sentinel is intentional: existing float-based analysis accepts
+    # NaN and cannot silently interpret an uncomputed multi-distance correction as
+    # zero. No TI integration or window selection logic is changed.
+    restraint_correction = "NaN" if use_coordination else sum(setup.correction_kcal_mol for setup in restraint_setups)
     bound_decharged = prepare_decharged_topology(
         input_prmtop=Path(str(bound_ti_topology["ti_prmtop"])),
         atom_mask=alchemical_atom_mask,
@@ -1592,7 +1705,7 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
         else Path(_relative_path(combined_restraint_file, from_dir=bound_dir)).as_posix()
     )
     bound_start_prep_stages = None
-    if (production_restart_path is None and not _uses_combined_gti_decoupling(config)) or (
+    if use_coordination or (production_restart_path is None and not _uses_combined_gti_decoupling(config)) or (
         bound_counterion_plan is not None and bound_counterion_plan.requires_preparation
     ):
         bound_prep_config = config.ti
@@ -1610,6 +1723,8 @@ def run_ti_workflow(*, config: TIWorkflowConfig, dry_run: bool = False) -> dict[
             output_dir=bound_dir,
             positional_restraint_mask=bound_counterion_mask,
         )
+        if use_coordination:
+            bound_start_source = "coordination_restrained_cpu_prep"
     bound_windows = generate_ti_inputs(
         config=config.ti,
         inherited_settings=inherited_settings,

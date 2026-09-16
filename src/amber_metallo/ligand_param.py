@@ -20,6 +20,7 @@ from amber_metallo.qm.nwchem import (
     build_default_session_state,
     load_molecule,
     load_resp_charges,
+    load_resp_reference_molecule,
     load_session_state,
     molecule_fingerprint,
     MoleculeAtom,
@@ -654,6 +655,11 @@ def _resp_job_metal_pdb(resp_job_dir: str | Path | None) -> str | None:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if payload.get("metal_formal_charges") == []:
+        return None  # Explicitly metal-free setup; do not revive a stale separated-metal file.
+    local_copy = manifest_path.parent.parent / "inputs" / "resp_separated_metals.pdb"
+    if local_copy.exists():
+        return str(local_copy)
     raw_path = payload.get("metal_pdb_file") or (payload.get("files") or {}).get("metal_pdb")
     if not raw_path:
         return None
@@ -717,7 +723,7 @@ def _prepare_canonical_source_bundle(
             canonical_mol2=ligand_reference_mol2,
             resp_coordinate_mol2=resp_coordinate_mol2,
             ligand_reference_mol2=ligand_reference_mol2,
-            metal_pdb=str(metal_pdb_path) if metal_pdb_path.exists() else None,
+            metal_pdb=str(metal_pdb_path) if needs_projection and metal_pdb_path.exists() else None,
             materialized_pdb=_smiles_materialized_pdb_if_present(source_path, output_dir, residue_name),
             full_resp_charge_projection=needs_projection,
         )
@@ -728,12 +734,14 @@ def _prepare_canonical_source_bundle(
         output_dir=output_dir,
         metal_pdb_path=metal_pdb_path,
     )
+    metal_source = _materialized_smiles_paths(source_path, output_dir, residue_name)[0] if _is_smiles_input(source_path) else source_path
+    has_current_metals = any(_is_supported_metal_atom(atom) for atom in load_molecule(metal_source).atoms)
     return CanonicalSourceBundle(
         source_path=source_path,
         canonical_mol2=canonical_mol2,
         resp_coordinate_mol2=canonical_mol2,
         ligand_reference_mol2=canonical_mol2,
-        metal_pdb=str(metal_pdb_path) if metal_pdb_path.exists() else None,
+        metal_pdb=str(metal_pdb_path) if has_current_metals and metal_pdb_path.exists() else None,
         materialized_pdb=_smiles_materialized_pdb_if_present(source_path, output_dir, residue_name),
         full_resp_charge_projection=False,
     )
@@ -934,11 +942,36 @@ def parameterize_ligand(
         notes.extend(prep_notes)
         file_type = _input_file_type(antechamber_input)
         charges = load_resp_charges(resp_job_dir)
-        if canonical_bundle.full_resp_charge_projection:
+        charge_reference_path = canonical_mol2_path
+        resp_reference = load_resp_reference_molecule(resp_job_dir)
+        if resp_reference is not None:
+            if len(charges) != len(resp_reference.atoms):
+                raise ValueError(
+                    f"RESP output contains {len(charges)} charges for {len(resp_reference.atoms)} saved QM atoms. "
+                    "Use the result from the matching RESP job; do not add placeholder metal charges."
+                )
+            charges = [charge for atom, charge in zip(resp_reference.atoms, charges, strict=True) if not _is_supported_metal_atom(atom)]
+            ligand_reference, _metals = _split_supported_metals(resp_reference)
+            charge_reference_path = output_dir / f"{residue_name}_resp_charge_reference.mol2"
+            charge_reference_path.write_text(render_preview_mol2(ligand_reference, residue_name=residue_name), encoding="utf-8")
+        elif canonical_bundle.full_resp_charge_projection:
             charges = project_ligand_charges_from_full_resp(
                 full_resp_mol2_path=resp_coordinate_mol2_path,
                 charges=charges,
             )
+        ligand_count = len(load_molecule(canonical_mol2_path).atoms)
+        if len(charges) != ligand_count:
+            raise ValueError(
+                f"RESP has {len(charges)} ligand charges, but the MD ligand has {ligand_count} atoms. "
+                "Metal ions are handled separately; use the matching saved RESP/MD source structure."
+            )
+        typing_net_charge = net_charge
+        manifest_file = Path(resp_job_dir) / "manifests" / "resp_apply_manifest.json"
+        resp_manifest = json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.exists() else {}
+        if "ligand_net_charge" in resp_manifest:
+            typing_net_charge = int(resp_manifest["ligand_net_charge"])
+            if abs(sum(charges) - typing_net_charge) > 1e-5:
+                raise ValueError("RESP ligand charges do not sum to the saved ligand charge. Refit with fixed metal charges before continuing.")
         if separated_metal_pdb is None:
             separated_metal_pdb = _resp_job_metal_pdb(resp_job_dir)
         commands = prep_commands + _resp_commands(
@@ -949,7 +982,7 @@ def parameterize_ligand(
             frcmod_path=frcmod_path,
             atom_type=atom_type,
             residue_name=residue_name,
-            net_charge=net_charge,
+            net_charge=typing_net_charge,
             multiplicity=multiplicity,
         )
         notes.append(f"RESP charges will be read from {Path(resp_job_dir).expanduser().resolve()}.")
@@ -992,7 +1025,7 @@ def parameterize_ligand(
                 typed_mol2_path,
                 charges,
                 output_mol2=mol2_path,
-                reference_structure=canonical_mol2_path,
+                reference_structure=charge_reference_path,
             )
             try:
                 run_command(

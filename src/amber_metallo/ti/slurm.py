@@ -14,6 +14,7 @@ class QoffCoordinateBridge:
     original_atom_index: int | None = None
     duplicate_atom_index: int | None = None
     atom_pairs: list[tuple[int, int]] | None = None
+    use_gpu: bool = False
 
     def resolved_pairs(self) -> list[tuple[int, int]]:
         if self.atom_pairs:
@@ -852,6 +853,7 @@ def _bidirectional_lines(
     windows: list[TIWindow],
     qoff_prmtop: str,
     start_coord: str,
+    qoff_coordinate_bridge: QoffCoordinateBridge | None = None,
 ) -> list[str]:
     qoff_windows = [window for window in windows if window.phase == "qoff"]
     vdwoff_windows = [window for window in windows if window.phase == "vdwoff"]
@@ -912,6 +914,13 @@ def _bidirectional_lines(
                 ]
             )
         lines.extend(['BASE_COORD="$PREP_COORD"', ""])
+
+    if qoff_coordinate_bridge is not None:
+        lines.extend([
+            'PAIRED_COORD="$LEG_OUTPUT_ROOT/metal_transform_start.rst7"',
+            *_restart_bridge_lines(mode="expand", input_coord="$BASE_COORD", output_coord="$PAIRED_COORD", bridge=qoff_coordinate_bridge),
+            'BASE_COORD="$PAIRED_COORD"', "",
+        ])
 
     def append_sweep(*, direction: str, ordered: list[TIWindow], initial_coord: str) -> None:
         run_root = f"$LEG_OUTPUT_ROOT/{direction}"
@@ -995,6 +1004,7 @@ def _sampling_window_lines(*, ti_config: TIProtocolConfig | None, **kwargs) -> l
         windows=kwargs["windows"],
         qoff_prmtop=kwargs["qoff_prmtop"],
         start_coord=kwargs["start_coord"],
+        qoff_coordinate_bridge=kwargs["qoff_coordinate_bridge"],
     )
 
 
@@ -1027,7 +1037,7 @@ def render_leg_slurm_script(
     prep_runner = _placeholder_prep_runner(slurm_config, amber_binaries)
     qoff_runner = _placeholder_qoff_runner(
         slurm_config,
-        disjoint_dual_topology=qoff_coordinate_bridge is not None,
+        disjoint_dual_topology=qoff_coordinate_bridge is not None and not qoff_coordinate_bridge.use_gpu,
         amber_binaries=amber_binaries,
     )
     prep_label = _prep_label(leg_name)
@@ -1104,7 +1114,7 @@ def render_tahoma_leg_script(
 ) -> str:
     runner = _placeholder_runner(slurm_config)
     prep_runner = _placeholder_prep_runner(slurm_config)
-    qoff_runner = _placeholder_qoff_runner(slurm_config, disjoint_dual_topology=qoff_coordinate_bridge is not None)
+    qoff_runner = _placeholder_qoff_runner(slurm_config, disjoint_dual_topology=qoff_coordinate_bridge is not None and not qoff_coordinate_bridge.use_gpu)
     prep_label = _prep_label(leg_name)
     account = slurm_config.account or "emsl62113"
     walltime = slurm_config.walltime if slurm_config.walltime != "24:00:00" else "48:00:00"
@@ -1140,7 +1150,7 @@ def render_tahoma_leg_script(
             'PREP_RUNNER="${RUNNER}"',
             (
                 'QOFF_RUNNER="srun -n ${SLURM_NTASKS:-1} /tahoma/emsl62112/meji656/pmemd26/bin/pmemd.MPI"'
-                if qoff_coordinate_bridge is not None
+                if qoff_coordinate_bridge is not None and not qoff_coordinate_bridge.use_gpu
                 else 'QOFF_RUNNER="${RUNNER}"'
             ),
             "",

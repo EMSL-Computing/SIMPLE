@@ -58,6 +58,7 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
+"REF_DATA/Perkins2014_Ethaline_GAFF2" = "amber_metallo/data/ref_data/Perkins2014_Ethaline_GAFF2"
 "GUI.py" = "GUI.py"
 "FreeE.py" = "FreeE.py"
 "analyses.py" = "analyses.py"

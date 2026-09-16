@@ -13,6 +13,7 @@ from amber_metallo.config import BoxShape, SlurmConfig
 
 
 DEFAULT_WATER_REFERENCE_BUFFER_ANGSTROM = 18.0
+DEFAULT_COORDINATION_CUTOFF_ANGSTROM = 2.5
 
 
 def _default_charge_lambdas() -> list[float]:
@@ -77,6 +78,61 @@ class TIMetalSelectionMode(StrEnum):
     ALL_AT_ONCE = "all_at_once"
 
 
+class TIEndpointMode(StrEnum):
+    DUMMY = "dummy"
+    METAL = "metal"
+
+
+class TIMassMode(StrEnum):
+    LINEAR = "linear"
+    SOURCE = "source"
+
+
+class MetalEndpointConfig(BaseModel):
+    element: str = "Fe"
+    formal_charge: int = Field(default=3, ge=1, le=4)
+    parameter_set: str = "duvail"
+    water_model: str = "opc"
+
+    @model_validator(mode="after")
+    def normalize(self) -> "MetalEndpointConfig":
+        self.element = self.element.strip().title()
+        self.parameter_set = self.parameter_set.strip().lower()
+        self.water_model = self.water_model.strip().lower()
+        if self.parameter_set not in {"duvail", "li_merz"}:
+            raise ValueError("Endpoint parameter_set must be duvail or li_merz")
+        if self.parameter_set == "duvail" and self.water_model != "opc":
+            raise ValueError("Bundled Duvail endpoints require OPC parameters")
+        if not self.element:
+            raise ValueError("Endpoint element cannot be empty")
+        return self
+
+
+class TITransformationConfig(BaseModel):
+    mode: TIEndpointMode = TIEndpointMode.DUMMY
+    mass_mode: TIMassMode = TIMassMode.LINEAR
+    endpoint: MetalEndpointConfig | None = None
+    endpoints_by_site: dict[int, MetalEndpointConfig] = Field(default_factory=dict)
+    polarizability_file: str | None = None
+    tuning_factor: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_endpoints(self) -> "TITransformationConfig":
+        if any(site < 1 for site in self.endpoints_by_site):
+            raise ValueError("Transformation site indices must be positive")
+        if self.mode == TIEndpointMode.DUMMY and (self.endpoint or self.endpoints_by_site):
+            raise ValueError("Dummy transformation cannot specify metal endpoints")
+        if self.mode == TIEndpointMode.METAL and self.endpoint is None and not self.endpoints_by_site:
+            self.endpoint = MetalEndpointConfig()
+        return self
+
+    def for_site(self, site: int) -> MetalEndpointConfig:
+        endpoint = self.endpoints_by_site.get(site, self.endpoint)
+        if self.mode != TIEndpointMode.METAL or endpoint is None:
+            raise ValueError(f"No end metal was configured for site {site}")
+        return endpoint
+
+
 class ComplexInputConfig(BaseModel):
     prmtop_path: str
     trajectory_path: str
@@ -136,6 +192,44 @@ class MetalSelectionConfig(BaseModel):
         return self
 
 
+class RestraintReference(StrEnum):
+    REFERENCE_PDB = "reference_pdb"
+    SNAPSHOT = "snapshot"
+
+
+class PreparedRestraintSnapshot(BaseModel):
+    pdb_path: str
+    restart_path: str
+    input_signature: str
+    pdb_sha256: str
+    restart_sha256: str
+    dry_run: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CoordinationRestraintConfig(BaseModel):
+    """Opt-in native AMBER donor-pair restraints; no free-energy correction."""
+
+    enabled: bool = False
+    reference: RestraintReference = RestraintReference.SNAPSHOT
+    donor_cutoff_angstrom: float = Field(
+        default=DEFAULT_COORDINATION_CUTOFF_ANGSTROM, gt=0.0, allow_inf_nan=False,
+    )
+    half_width_angstrom: float = Field(default=0.5, ge=0.001, allow_inf_nan=False)
+    force_constant: float = Field(default=5.0, ge=0.001, allow_inf_nan=False)
+    donor_indices_by_site: dict[int, list[int]] = Field(default_factory=dict)
+    prepared_snapshot: PreparedRestraintSnapshot | None = None
+
+    @model_validator(mode="after")
+    def validate_donors(self) -> "CoordinationRestraintConfig":
+        for site, indices in self.donor_indices_by_site.items():
+            if site < 1 or not indices or any(index < 1 for index in indices):
+                raise ValueError("Restraint site/atom indices must be positive; donor selections cannot be empty")
+            if len(set(indices)) != len(indices):
+                raise ValueError("Duplicate restraint donor indices are not allowed")
+        return self
+
+
 class TIProtocolConfig(BaseModel):
     implementation_mode: TIImplementationMode = TIImplementationMode.AMBER_12_6_WORKAROUND
     decoupling_mode: TIDecouplingMode = TIDecouplingMode.SPLIT_Q_VDW
@@ -161,6 +255,9 @@ class TIProtocolConfig(BaseModel):
     restraint_force_constant: float = Field(default=5.0, gt=0.0)
     restraint_half_width_angstrom: float = Field(default=0.5, gt=0.0)
     restraint_anchor_count: int = Field(default=3, ge=1, le=8)
+    # None or enabled=false preserves historical TI/restraint behavior.
+    # Only enabled=true adds the new donor-pair restraint scheme.
+    coordination_restraint: CoordinationRestraintConfig | None = None
     scalpha: float = Field(default=0.5, gt=0.0)
     scbeta: float = Field(default=12.0, gt=0.0)
     logdvdl: bool = True
@@ -182,6 +279,14 @@ class TIProtocolConfig(BaseModel):
     def validate_lambdas(self) -> "TIProtocolConfig":
         self.charge_lambdas = _validate_lambda_schedule(self.charge_lambdas, label="charge_lambdas")
         self.vdw_lambdas = _validate_lambda_schedule(self.vdw_lambdas, label="vdw_lambdas")
+        if self.coordination_restraint is not None and self.coordination_restraint.enabled and not (
+            self.implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI
+            and self.decoupling_mode == TIDecouplingMode.COMBINED_Q_VDW
+        ):
+            raise ValueError(
+                "Pairwise coordination restraints currently require amber_12_6_4_gti + combined_q_vdw. "
+                "Split Q-off duplicates the metal; restraint weighting for that topology is not validated."
+            )
         if self.sampling_mode == TISamplingMode.BIDIRECTIONAL and not (
             self.implementation_mode == TIImplementationMode.AMBER_12_6_4_GTI
             and self.decoupling_mode == TIDecouplingMode.COMBINED_Q_VDW
@@ -219,6 +324,7 @@ class TIWorkflowConfig(BaseModel):
     complex_input: ComplexInputConfig
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     metal: MetalSelectionConfig = Field(default_factory=MetalSelectionConfig)
+    transformation: TITransformationConfig = Field(default_factory=TITransformationConfig)
     ti: TIProtocolConfig = Field(default_factory=TIProtocolConfig)
     water_reference: WaterReferenceConfig = Field(default_factory=WaterReferenceConfig)
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
@@ -265,7 +371,9 @@ def dump_config(config: TIWorkflowConfig) -> str:
     doc.add(nl())
     doc.add("metal", _section_from_model(config.metal.model_dump(mode="json")))
     doc.add(nl())
-    doc.add("ti", _section_from_model(config.ti.model_dump(mode="json")))
+    doc.add("transformation", _section_from_model(config.transformation.model_dump(mode="json", exclude_none=True)))
+    doc.add(nl())
+    doc.add("ti", _section_from_model(config.ti.model_dump(mode="json", exclude_none=True)))
     doc.add(nl())
     doc.add("water_reference", _section_from_model(config.water_reference.model_dump(mode="json")))
     doc.add(nl())

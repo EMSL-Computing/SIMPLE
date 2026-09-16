@@ -23,6 +23,7 @@ const state = {
   selectedAtomIndices: new Set(),
   selectedRespGroupId: null,
   metMetalElements: new Map(),
+  metMetalFormalCharges: new Map(),
   overlayComponent: null,
   proteinMetals: [],
   proteinSourceMetals: [],
@@ -354,15 +355,28 @@ function collectSelectedMetalCoordination() {
 function refreshRespChargeHint() {
   const node = $("resp_charge_hint");
   if (!node) return;
+  const fullResp = $("charge_method").value === "full_resp";
+  const am1bcc = $("charge_method").value === "antechamber";
+  const metalCount = state.metAtoms.filter((atom) => SUPPORTED_METALS.has(atom.element)).length;
+  const qmCount = fullResp ? state.metAtoms.length : state.metAtoms.length - metalCount;
+  document.querySelector('label[for="net_charge"]').textContent = fullResp ? "Complex net charge" : "Ligand net charge";
+  $("resp_scope_note").textContent = fullResp
+    ? `Metal-inclusive RESP uses all preview atoms: ${qmCount} atoms, ${metalCount} metals. Metal RESP charges are fixed to the selected integer values; only ligand charges are fitted. Uses non-HF DFT / def2. Metals are retained for MD.`
+    : am1bcc
+      ? "AM1-BCC parameterizes the ligand without supported metal ions; no NWChem RESP calculation is generated."
+      : `Ligand-only RESP excludes supported metal ions from QM/RESP. Preview: ${qmCount} QM atoms; ${metalCount} metals excluded and retained separately for MD.`;
+  const chargeHint = fullResp
+    ? "Enter the total charge and spin multiplicity of the entire metal-ligand complex. Neither value is inferred automatically."
+    : "Enter the ligand-only charge and multiplicity, excluding the separated metal ions. Neither value is inferred automatically.";
   const coordination = collectSelectedMetalCoordination();
   if (!coordination?.element) {
-    node.textContent = "For RESP fitting, use a net charge consistent with the atoms included in the RESP input.";
+    node.textContent = chargeHint;
     return;
   }
   const cnText = coordination.coordination_mode === "manual_selection"
     ? "manual donor selection"
     : `target CN ${coordination.target_cn}`;
-  node.textContent = `Selected ${coordination.element}+${coordination.formal_charge}, ${cnText}. Include this formal charge only when the RESP input contains the metal; multiplicity controls spin state only.`;
+  node.textContent = `Selected ${coordination.element}+${coordination.formal_charge}, ${cnText}. ${chargeHint}`;
 }
 
 async function api(path, payload = {}) {
@@ -1519,6 +1533,9 @@ function moleculePayloadFromState(residueName = "LIG") {
 }
 
 function renderMetalsAndDonors(data) {
+  if (Array.isArray(data.metal_formal_charges)) {
+    state.metMetalFormalCharges = new Map(data.metal_formal_charges.map(item => [Number(item.atom_index), Number(item.charge)]));
+  }
   state.metAtoms = data.atoms || [];
   state.metBonds = data.bonds || [];
   state.metMetals = data.metals || [];
@@ -1807,7 +1824,8 @@ function renderSystemMetalCharges(sites) {
     <table><thead>${header}</thead><tbody>
       ${sites.map((site) => {
         const savedCoordination = state.metCoordination && Number(state.metCoordination.metal_atom_index) === Number(site.atom_index);
-        const charge = savedCoordination && state.metCoordination.formal_charge !== null && state.metCoordination.formal_charge !== undefined
+        const savedCharge = showCoordination ? state.metMetalFormalCharges.get(Number(site.atom_index)) : null;
+        const charge = chargeOptions(site.element).includes(savedCharge) ? savedCharge : savedCoordination && state.metCoordination.formal_charge !== null && state.metCoordination.formal_charge !== undefined
           ? Number(state.metCoordination.formal_charge)
           : defaultMetalCharge(site.element);
         let coordinationCells = "";
@@ -1839,6 +1857,7 @@ function renderSystemMetalCharges(sites) {
       updateCoordinationSelect(row);
       syncSystemC4ParameterSet(true, true);
       if (showCoordination) {
+        state.metMetalFormalCharges.set(Number(row.dataset.atomIndex), Number(row.querySelector(".metal-charge-select").value));
         state.metCoordination = null;
         refreshMetalCoordinationStatus();
         updateViewerInfo();
@@ -2424,6 +2443,23 @@ function renderDesComponents(values = new Map()) {
   for (const check of document.querySelectorAll(".des-component-check")) {
     const saved = values.get(check.dataset.key || "");
     if (saved) check.checked = Boolean(saved.checked);
+    check.addEventListener("change", () => {
+      if (!check.checked) {
+        syncDes1264EnabledState();
+        return;
+      }
+      const selected = state.desComponents.find((item) => item.key === check.dataset.key);
+      if (!selected) return;
+      for (const other of document.querySelectorAll(".des-component-check")) {
+        if (other === check || !other.checked) continue;
+        const candidate = state.desComponents.find((item) => item.key === other.dataset.key);
+        if (!candidate) continue;
+        const sameMolecule = selected.molecule_key && selected.molecule_key === candidate.molecule_key;
+        const sameResidue = (selected.residues || []).some((name) => (candidate.residues || []).includes(name));
+        if (sameMolecule || sameResidue) other.checked = false;
+      }
+      syncDes1264EnabledState();
+    });
   }
   for (const ratio of document.querySelectorAll(".des-ratio")) {
     const saved = values.get(ratio.dataset.key || "");
@@ -2450,6 +2486,7 @@ function renderLibraryComponents() {
         <span>${escapeHtml((item.residues || []).join(", "))} &middot; ${item.custom ? "User-added" : "Built-in (protected)"}</span>
       </button>
       <div id="library-component-files-${index}" class="library-component-files" ${expanded ? "" : "hidden"}>
+        <p>${escapeHtml(item.description || "")}</p>
         ${(item.files || []).map((file) => `
           <button class="library-file-row ${state.selectedLibraryFile === file.path ? "selected" : ""}" data-path="${escapeHtml(file.path)}" type="button">
             <strong>${escapeHtml(file.name)}</strong><span>${escapeHtml(file.kind)}</span>
@@ -2481,9 +2518,7 @@ function renderLibraryComponents() {
 function refreshDesComponentsFromLibrary() {
   const values = snapshotDesComponentInputs();
   state.desComponents = state.libraryComponents.map((item) => ({
-    key: item.key,
-    label: item.label,
-    description: item.description,
+    ...item,
   }));
   renderDesComponents(values);
 }
@@ -2724,6 +2759,7 @@ function applyDesRecommended(item) {
     const idx = (item.components || []).indexOf(ratio.dataset.key);
     ratio.value = idx >= 0 ? item.ratios[idx] : "1";
   }
+  syncDes1264EnabledState();
 }
 
 function updateDesMetalCharges() {
@@ -2837,6 +2873,7 @@ function collectMetalCharges() {
     const select = row.querySelector(".metal-charge-select");
     out.push({
       site: Number(row.dataset.site),
+      atom_index: Number(row.dataset.atomIndex || 0),
       charge: Number(select.value),
       element: String(row.dataset.element || "").trim(),
     });
@@ -2971,6 +3008,7 @@ function collectPayload() {
       edited_bonds: state.metBonds || [],
       group_constraints: state.metGroupConstraints,
       metal_coordination: collectSelectedMetalCoordination(),
+      metal_formal_charges: collectMetalCharges(),
       auto_group_mode: $("resp_group_mode")?.value || "hydrogen_and_symmetry",
       auto_group_graph_method: $("resp_group_graph_method")?.value || "connectivity",
       qm_settings: currentQmSettings(),
@@ -3062,6 +3100,7 @@ function syncMetal1264Ui() {
   const isMetallophore = workflow === "metallophore";
   const existingResp = $("met_mode").value === "existing_resp";
   $("metal_1264_section").hidden = workflow === "deep_eutectic" || workflow === "add_library" || (isMetallophore && !existingResp);
+  $("system_metal_sites_section").hidden = workflow === "deep_eutectic" || workflow === "add_library";
   $("metallophore_geometry_actions").hidden = !isMetallophore || existingResp;
   syncSystem1264EnabledState(false);
 }
@@ -3157,6 +3196,12 @@ function syncSystem1264EnabledState(resetWaterOnEnable = false) {
 }
 
 function syncDes1264EnabledState() {
+  const selected = new Set(Array.from(document.querySelectorAll(".des-component-check"))
+    .filter((node) => node.checked).map((node) => node.dataset.key));
+  const unsupported = state.desComponents.some((item) => selected.has(item.key) && item.supports_c4 === false);
+  $("des_apply_1264").disabled = unsupported;
+  $("des_apply_1264").title = unsupported ? "Selected library is a 12-6-only model; no validated C4 parameters supplied." : "";
+  if (unsupported) $("des_apply_1264").checked = false;
   $("des_c4_parameter_set").disabled = !$("des_apply_1264").checked;
 }
 
@@ -3231,6 +3276,19 @@ function syncMetMode(clear = true) {
 
 function updateChargeMethodUi(showNotice = true) {
   const am1bcc = $("charge_method").value === "antechamber";
+  const fullResp = $("charge_method").value === "full_resp";
+  let qmChanged = false;
+  for (const id of ["qm_functional", "qm_resp_functional", "qm_basis", "qm_resp_basis"]) {
+    const select = $(id);
+    const isBasis = id.includes("basis");
+    for (const opt of select.options) {
+      opt.disabled = fullResp && (isBasis ? !opt.value.startsWith("def2-") : opt.value === "hf");
+    }
+    if (select.selectedOptions[0]?.disabled) {
+      select.value = isBasis ? "def2-tzvp" : "r2scan";
+      qmChanged = true;
+    }
+  }
   $("am1bcc_notice").hidden = !am1bcc;
   $("build_resp_assets").hidden = $("workflow_type").value !== "metallophore" || $("met_mode").value !== "resp_input" || am1bcc;
   for (const node of document.querySelectorAll(".nwchem-only input, .nwchem-only select")) {
@@ -3238,15 +3296,22 @@ function updateChargeMethodUi(showNotice = true) {
   }
   if (am1bcc && showNotice) {
     setStatus("AM1-BCC uses AmberTools/Antechamber directly during dry-run, not NWChem RESP.", "warn");
+  } else if (fullResp && showNotice) {
+    setStatus(`${qmChanged ? "Incompatible QM options changed to r2SCAN / def2-TZVP. " : ""}Metal-inclusive RESP selected. Review the entire complex net charge and multiplicity before building.`, "warn");
   }
   updateQmGeometryUi();
+  refreshRespChargeHint();
 }
 
 function updateQmGeometryUi() {
   const loaded = $("qm_geometry").value === "use_loaded_geometry";
-  $("qm_functional").disabled = loaded || $("charge_method").value === "antechamber";
-  $("qm_basis").disabled = loaded || $("charge_method").value === "antechamber";
   const same = $("qm_resp_same").checked;
+  $("qm_functional").disabled = (loaded && !same) || $("charge_method").value === "antechamber";
+  $("qm_basis").disabled = (loaded && !same) || $("charge_method").value === "antechamber";
+  if (same) {
+    $("qm_resp_functional").value = $("qm_functional").value;
+    $("qm_resp_basis").value = $("qm_basis").value;
+  }
   $("qm_resp_functional").disabled = same || $("charge_method").value === "antechamber";
   $("qm_resp_basis").disabled = same || $("charge_method").value === "antechamber";
 }
@@ -3507,6 +3572,7 @@ async function loadMetallophore() {
   }
   setStatus("Loading metallophore preview...", "warn");
   const data = await api("/api/metallophore/load", payload);
+  state.metMetalFormalCharges = new Map();
   rememberInitialMetallophore(data);
   state.metInsertedMetalIndices = new Set();
   renderMetalsAndDonors(data);
@@ -4114,12 +4180,17 @@ async function buildRespAssets() {
   if ($("charge_method").value === "antechamber") {
     throw new Error("AM1-BCC uses AmberTools/Antechamber during dry-run; no NWChem RESP assets are needed.");
   }
+  if (!state.metAtoms.length) throw new Error("Load the molecule preview before building RESP assets.");
+  if ($("charge_method").value === "full_resp" && !state.metAtoms.some((atom) => SUPPORTED_METALS.has(atom.element))) {
+    throw new Error("Metal-inclusive RESP requires a supported metal in the preview. Use Ligand-only RESP otherwise.");
+  }
   setStatus("Building RESP input assets...", "warn");
   const data = await api("/api/resp/build-assets", collectPayload());
   const assets = data.assets || {};
   $("resp_job_dir").value = assets.job_dir || "";
   $("finish_note").textContent = `RESP assets: ${assets.job_dir || ""}`;
-  setStatus(`RESP assets written: ${assets.job_dir}`, "ok");
+  const scope = data.charge_method === "full_resp" ? "Metal-inclusive RESP" : "Ligand-only RESP";
+  setStatus(`${scope} assets written: ${assets.job_dir} | QM: ${data.qm_atom_count} atoms, ${data.qm_metal_count} metals.`, "ok");
 }
 
 async function exportMetallophorePdb() {
@@ -4192,6 +4263,8 @@ function setupEvents() {
   $("multiplicity").addEventListener("input", refreshRespChargeHint);
   $("qm_geometry").addEventListener("change", updateQmGeometryUi);
   $("qm_resp_same").addEventListener("change", updateQmGeometryUi);
+  $("qm_functional").addEventListener("change", updateQmGeometryUi);
+  $("qm_basis").addEventListener("change", updateQmGeometryUi);
   $("salt_mode").addEventListener("change", updateSaltUi);
   $("neutralization_ion").addEventListener("change", updateSaltUi);
   $("md_protocol").addEventListener("change", updateMdProtocolUi);
@@ -4356,7 +4429,8 @@ async function init() {
   replaceOptions($("md_protocol"), [...boot.md_protocols, "des_solvent"], "15step");
   replaceOptions($("slurm_profile"), boot.slurm_profiles, "gpu");
   replaceOptions($("charge_method"), [
-    ["resp_antechamber", "RESP"],
+    ["resp_antechamber", "Ligand-only RESP"],
+    ["full_resp", "Metal-inclusive RESP"],
     ["antechamber", "Antechamber"],
   ], "resp_antechamber");
   replaceOptions($("qm_geometry"), boot.qm.geometry_modes, "use_loaded_geometry");

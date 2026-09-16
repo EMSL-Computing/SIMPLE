@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -64,6 +64,7 @@ from amber_metallo.des import (
     DES_COMPONENTS,
     DES_RECOMMENDED_SETS,
     available_des_components,
+    des_component_metadata,
     classify_des_library_bundle,
     discover_des_library_candidates,
     load_custom_des_components,
@@ -95,12 +96,16 @@ from amber_metallo.qm.nwchem import (
     build_default_session_state,
     find_resp_source_candidates,
     load_molecule,
+    load_resp_charges,
+    load_resp_reference_molecule,
     load_resp_job_candidate,
     molecule_fingerprint,
     normalize_qm_settings,
     render_preview_mol2,
     select_job_dir,
     suggest_group_constraints,
+    supported_metal_atom_indices,
+    validate_qm_settings_for_molecule,
     write_resp_job_assets,
 )
 from amber_metallo.qm.resp_fit import load_resp_charge_result
@@ -472,6 +477,59 @@ def _materialize_edited_molecule_source(
     return str(target.resolve())
 
 
+def _resp_qm_molecule_and_groups(
+    molecule: MoleculeData,
+    *,
+    charge_method: ChargeMethod,
+    group_payload: dict[str, Any],
+) -> tuple[MoleculeData, dict[str, Any], dict[int, int]]:
+    """Keep the requested QM atoms and remap preview constraints to XYZ order."""
+    metal_indices = supported_metal_atom_indices(molecule)
+    include_metals = charge_method == ChargeMethod.FULL_RESP
+    if include_metals and not metal_indices:
+        raise ValueError("Metal-inclusive RESP requires a supported metal in the preview. Use Ligand-only RESP otherwise.")
+    source_indices = {atom.index for atom in molecule.atoms}
+    if len(source_indices) != len(molecule.atoms):
+        raise ValueError("The RESP preview contains duplicate atom indices. Reload the molecule.")
+    kept_atoms = [atom for atom in molecule.atoms if include_metals or atom.index not in metal_indices]
+    if not kept_atoms:
+        raise ValueError("No ligand atoms remain for Ligand-only RESP.")
+    index_map = {atom.index: index for index, atom in enumerate(kept_atoms, start=1)}
+    qm_molecule = replace(
+        molecule,
+        atoms=[replace(atom, index=index_map[atom.index]) for atom in kept_atoms],
+        bonds=[
+            replace(bond, first=index_map[bond.first], second=index_map[bond.second])
+            for bond in molecule.bonds
+            if bond.first in index_map and bond.second in index_map
+        ],
+    )
+    groups = []
+    for group in group_payload.get("groups") or []:
+        indices = [int(index) for index in group.get("atom_indices") or []]
+        if set(indices) - source_indices:
+            raise ValueError("RESP equality groups refer to atoms absent from the preview. Rebuild the groups.")
+        mapped = sorted({index_map[index] for index in indices if index in index_map and index not in metal_indices})
+        if len(mapped) >= 2:
+            groups.append({**group, "atom_indices": mapped})
+    atom_groups = {index: group["group_id"] for group in groups for index in group["atom_indices"]}
+    qm_groups = {
+        **group_payload,
+        "atom_count": len(qm_molecule.atoms),
+        "atoms": [
+            {"index": atom.index, "name": atom.name, "element": atom.element, "group_id": atom_groups.get(atom.index)}
+            for atom in qm_molecule.atoms
+        ],
+        "groups": groups,
+        "auto_group_excluded_atom_indices": [
+            index_map[int(index)]
+            for index in group_payload.get("auto_group_excluded_atom_indices") or []
+            if int(index) in index_map
+        ],
+    }
+    return qm_molecule, qm_groups, index_map
+
+
 def _friendly_small_molecule_error(exc: Exception, payload: dict[str, Any]) -> str:
     message = str(exc)
     if payload.get("smiles_text"):
@@ -486,7 +544,64 @@ def _friendly_small_molecule_error(exc: Exception, payload: dict[str, Any]) -> s
     )
 
 
-def _molecule_with_resp_charges(molecule: Any, charge_path: Path | None) -> Any:
+def _resp_metal_formal_charges(molecule: MoleculeData, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    explicit = {int(item["atom_index"]): item for item in payload.get("metal_formal_charges") or []}
+    coordination = payload.get("metal_coordination") or {}
+    metals = supported_metal_atom_indices(molecule)
+    records = []
+    for atom in molecule.atoms:
+        if atom.index not in metals:
+            continue
+        charge = explicit.get(atom.index, {}).get("charge")
+        if charge is None and int(coordination.get("metal_atom_index") or 0) == atom.index:
+            charge = coordination.get("formal_charge")
+        if charge is None:
+            charge = DEFAULT_TLEAP_METAL_CHARGES.get(atom.element)
+        if charge is None or float(charge) != int(charge) or int(charge) not in allowed_metal_charges(atom.element):
+            raise ValueError(f"Select a supported integer formal charge for {atom.element} atom {atom.index}.")
+        records.append({"site": len(records) + 1, "atom_index": atom.index, "element": atom.element, "charge": int(charge)})
+    return records
+
+
+def _molecule_with_resp_charges(molecule: Any, charge_path: Path | None, *, candidate: Any = None) -> Any:
+    if candidate is not None and charge_path is not None:
+        charges = load_resp_charges(candidate.job_dir)
+        reference = load_resp_reference_molecule(candidate.job_dir)
+        metadata = candidate.payload
+        index_map = {int(index): int(qm_index) for index, qm_index in (metadata.get("preview_to_qm_atom_indices") or {}).items()}
+        metals = _resp_metal_formal_charges(molecule, {"metal_formal_charges": metadata.get("metal_formal_charges") or []})
+        metal_charges = {item["atom_index"]: item["charge"] for item in metals}
+        if reference is None:
+            # Legacy ligand-only jobs lack an explicit index map but retain source order.
+            included = [atom for atom in molecule.atoms if len(charges) == len(molecule.atoms) or atom.index not in metal_charges]
+            if len(included) != len(charges):
+                raise ValueError("RESP charge count does not match the saved QM atom list. Rebuild the RESP assets.")
+            index_map = {atom.index: index for index, atom in enumerate(included, start=1)}
+        elif len(reference.atoms) != len(charges):
+            raise ValueError("RESP charge count does not match the saved QM atom list. Rebuild the RESP assets.")
+        elif not index_map:
+            # Use the initial QM coordinates, not the optimized ESP XYZ, to identify source atoms.
+            unused = set(range(len(reference.atoms)))
+            for atom in molecule.atoms:
+                if atom.index in metal_charges:
+                    continue
+                matches = [index for index in unused if reference.atoms[index].element == atom.element and
+                           sum((getattr(reference.atoms[index], axis) - getattr(atom, axis)) ** 2 for axis in ("x", "y", "z")) < 0.05 ** 2]
+                if len(matches) != 1:
+                    raise ValueError("Cannot uniquely map saved RESP ligand charges to the MD source atoms.")
+                index_map[atom.index] = matches[0] + 1
+                unused.remove(matches[0])
+        atoms = []
+        for atom in molecule.atoms:
+            if atom.index in metal_charges:
+                charge = metal_charges[atom.index]
+            else:
+                index = index_map.get(atom.index, 0) - 1
+                if index < 0 or index >= len(charges):
+                    raise ValueError("The RESP atom map is missing a ligand atom from the MD structure.")
+                charge = charges[index]
+            atoms.append(replace(atom, charge=float(charge)))
+        return replace(molecule, atoms=atoms)
     if charge_path is None or not charge_path.exists():
         return molecule
     try:
@@ -502,8 +617,6 @@ def _molecule_with_resp_charges(molecule: Any, charge_path: Path | None) -> Any:
         return molecule
     if len(charges) != len(molecule.atoms):
         return molecule
-    from dataclasses import replace
-
     return molecule.__class__(
         source_file=molecule.source_file,
         source_format=molecule.source_format,
@@ -898,6 +1011,11 @@ def _protein_site_resp_config(data: dict[str, Any] | None, state: WebGuiState) -
 
 def _resolve_resp_resume_source(candidate: Any, state: WebGuiState) -> str:
     payload = getattr(candidate, "payload", {}) or {}
+    # A job may have been copied back from the QM host. Use its own complete
+    # MD snapshot before consulting absolute paths from the original machine.
+    for local_source in sorted((Path(candidate.job_dir) / "inputs").glob("resp_resume_input.*")):
+        if local_source.is_file():
+            return str(local_source.resolve())
     for key in ("resume_source_file", "source_file", "canonical_source_file"):
         raw = str(payload.get(key) or "").strip()
         if raw and Path(raw).expanduser().exists():
@@ -1033,6 +1151,10 @@ def build_workflow_config(
                 raise ValueError(f"RESP job manifest was not found under {job_dir}")
             source_file = _resolve_resp_resume_source(candidate, state)
             manifest = candidate.payload
+            if "metal_formal_charges" in manifest:
+                saved_system = {**(payload.get("system") or {}), "metal_charges": manifest["metal_formal_charges"]}
+                _validate_gui_c4_selection({"system": saved_system}, workflow_type=workflow_type)
+                system = _system_config(saved_system, include_protein=False)
             residue_name = str(manifest.get("residue_name") or residue_name).strip().upper()[:3] or residue_name
             ligand_payload.update(
                 {
@@ -1165,6 +1287,7 @@ def _des_library_component_payloads(state: WebGuiState) -> list[dict[str, Any]]:
                 "key": key_value,
                 "label": definition.label,
                 "description": definition.description,
+                **des_component_metadata(definition),
                 "residues": [item.residue_name for item in definition.residues],
                 "files": files,
                 "custom": key_value in custom_keys,
@@ -1392,6 +1515,7 @@ def _bootstrap_payload(state: WebGuiState) -> dict[str, Any]:
             "key": key.value if isinstance(key, DESComponent) else str(key),
             "label": definition.label,
             "description": definition.description,
+            **des_component_metadata(definition),
         }
         for key, definition in des_component_map.items()
     ]
@@ -1431,7 +1555,7 @@ def _bootstrap_payload(state: WebGuiState) -> dict[str, Any]:
         "salt_modes": [SaltMode.NONE.value, SaltMode.NEUTRALIZE.value, SaltMode.COUNT.value, SaltMode.CONCENTRATION.value],
         "md_protocols": [ProtocolKind.FIFTEEN_STEP.value, ProtocolKind.FOUR_STEP.value],
         "slurm_profiles": [item.value for item in SlurmProfile],
-        "charge_methods": [ChargeMethod.RESP_ANTECHAMBER.value, ChargeMethod.ANTECHAMBER.value],
+        "charge_methods": [ChargeMethod.RESP_ANTECHAMBER.value, ChargeMethod.FULL_RESP.value, ChargeMethod.ANTECHAMBER.value],
         "supported_metals": [
             {
                 "element": element,
@@ -1618,6 +1742,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
             data = dict(payload.get("metallophore") or payload)
             residue_name = str(data.get("residue_name") or "LIG").strip().upper()[:3] or "LIG"
             charge_path: Path | None = None
+            candidate = None
             if str(data.get("mode") or "resp_input") == "existing_resp":
                 job_dir = _path_from_payload(data.get("resp_job_dir"), base=state.launch_cwd)
                 candidate = load_resp_job_candidate(job_dir)
@@ -1633,11 +1758,12 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 residue_name=residue_name,
                 output_dir=state.session_root / "metallophore_preview",
             )
-            molecule = _molecule_with_resp_charges(molecule, charge_path)
+            molecule = _molecule_with_resp_charges(molecule, charge_path, candidate=candidate)
             group_constraints = _suggest_group_constraints_for_payload(molecule, data)
             return {
                 "ok": True,
                 "source_path": str(canonical),
+                **({"metal_formal_charges": candidate.payload["metal_formal_charges"]} if candidate and "metal_formal_charges" in candidate.payload else {}),
                 **molecule_payload(molecule, residue_name=residue_name, group_constraints=group_constraints),
             }
         except Exception as exc:
@@ -1863,20 +1989,40 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
         try:
             data = dict(payload.get("metallophore") or {})
             residue_name = str(data.get("residue_name") or "LIG").strip().upper()[:3] or "LIG"
-            source_file = _small_molecule_source(data, state, residue_name=residue_name)
+            source_file = (
+                _materialize_edited_molecule_source(data, state, residue_name=residue_name)
+                or _small_molecule_source(data, state, residue_name=residue_name)
+            )
             net_charge = int(data.get("ligands", {}).get("net_charge") or 0)
             multiplicity = int(data.get("ligands", {}).get("multiplicity") or 1)
             charge_method = ChargeMethod(str(data.get("ligands", {}).get("charge_method") or ChargeMethod.RESP_ANTECHAMBER.value))
+            if charge_method not in {ChargeMethod.RESP_ANTECHAMBER, ChargeMethod.FULL_RESP}:
+                raise ValueError("Build RESP Assets requires Ligand-only RESP or Metal-inclusive RESP.")
             seed_dir = _output_dir_from_payload(payload, state) / "01_prepare" / "_gui_resp_seed"
             seed_dir.mkdir(parents=True, exist_ok=True)
-            canonical = prepare_canonical_small_molecule_mol2(
+            metal_pdb = seed_dir / f"{residue_name}_separated_metals.pdb"
+            # Preserve one full, edited geometry for both QM selection and MD resume.
+            source_file = prepare_canonical_small_molecule_mol2(
                 source_file=source_file,
                 residue_name=residue_name,
                 output_dir=seed_dir,
-                split_supported_metals=charge_method != ChargeMethod.FULL_RESP,
-                canonical_filename=f"{residue_name}_gui_resp_input.mol2",
+                split_supported_metals=False,
+                metal_pdb_path=metal_pdb,
+                canonical_filename=f"{residue_name}_gui_resp_preview.mol2",
             )
-            molecule = load_molecule(canonical)
+            preview_molecule = load_molecule(source_file)
+            group_payload = data.get("group_constraints")
+            if not isinstance(group_payload, dict):
+                group_payload = suggest_group_constraints(
+                    preview_molecule,
+                    auto_group_mode=data.get("auto_group_mode") or AUTO_GROUP_MODE_HYDROGEN_AND_SYMMETRY,
+                    auto_group_graph_method=data.get("auto_group_graph_method") or AUTO_GROUP_GRAPH_METHOD_CONNECTIVITY,
+                )
+            molecule, qm_groups, index_map = _resp_qm_molecule_and_groups(
+                preview_molecule, charge_method=charge_method, group_payload=group_payload,
+            )
+            canonical = seed_dir / f"{residue_name}_gui_resp_input.mol2"
+            canonical.write_text(render_preview_mol2(molecule, residue_name=residue_name), encoding="utf-8")
             fingerprint = molecule_fingerprint(source_file, residue_name=residue_name, net_charge=net_charge, multiplicity=multiplicity)
             session_state = build_default_session_state(
                 molecule,
@@ -1884,17 +2030,39 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 fingerprint=fingerprint,
                 net_charge=net_charge,
                 multiplicity=multiplicity,
+                group_payload=qm_groups,
             )
-            if isinstance(data.get("group_constraints"), dict):
-                session_state["group_constraints"] = data["group_constraints"]
             if isinstance(data.get("qm_settings"), dict):
                 session_state["qm_settings"] = normalize_qm_settings(
-                    data["qm_settings"],
+                    {**data["qm_settings"], "net_charge": net_charge, "multiplicity": multiplicity},
                     net_charge=net_charge,
                     multiplicity=multiplicity,
                 )
+            validate_qm_settings_for_molecule(molecule, session_state["qm_settings"])
+            session_state["preview_to_qm_atom_indices"] = index_map
+            metal_formal_charges = _resp_metal_formal_charges(preview_molecule, data)
+            session_state["metal_formal_charges"] = metal_formal_charges
+            session_state["fixed_charges"] = {
+                index_map[item["atom_index"]] - 1: item["charge"]
+                for item in metal_formal_charges if item["atom_index"] in index_map
+            }
+            session_state["ligand_net_charge"] = net_charge - (
+                sum(item["charge"] for item in metal_formal_charges) if charge_method == ChargeMethod.FULL_RESP else 0
+            )
             if isinstance(data.get("metal_coordination"), dict):
-                session_state["metal_coordination"] = data["metal_coordination"]
+                coordination = dict(data["metal_coordination"])
+                session_state["preview_metal_coordination"] = coordination
+                metal_index = int(coordination.get("metal_atom_index") or 0)
+                if metal_index in index_map:
+                    session_state["metal_coordination"] = {
+                        **coordination,
+                        "metal_atom_index": index_map[metal_index],
+                        "required_donor_atom_indices": [
+                            index_map[int(index)]
+                            for index in coordination.get("required_donor_atom_indices") or []
+                            if int(index) in index_map
+                        ],
+                    }
             session_state["charge_method"] = charge_method.value
             job_dir = select_job_dir(
                 base_dir=_output_dir_from_payload(payload, state) / "01_prepare" / "resp_jobs",
@@ -1905,6 +2073,7 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 source_file=source_file,
                 coordinate_source_file=canonical,
                 resume_source_file=source_file,
+                metal_pdb_file=metal_pdb if supported_metal_atom_indices(preview_molecule) else None,
                 residue_name=residue_name,
                 net_charge=net_charge,
                 multiplicity=multiplicity,
@@ -1912,7 +2081,13 @@ def create_app(repo_root: Path, *, launch_cwd: Path | None = None) -> Any:
                 slurm_config=_slurm_config(payload.get("slurm") or {}, job_name=str(payload.get("job_name") or residue_name)),
                 session_state=session_state,
             )
-            return {"ok": True, "assets": assets}
+            return {
+                "ok": True,
+                "assets": assets,
+                "charge_method": charge_method.value,
+                "qm_atom_count": len(molecule.atoms),
+                "qm_metal_count": len(supported_metal_atom_indices(molecule)),
+            }
         except Exception as exc:
             return _api_error(exc, state)
 

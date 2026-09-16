@@ -77,6 +77,7 @@ from amber_metallo.des import (
     recommended_ratio_for_components,
     register_custom_des_component,
     resolve_des_neutralization_ion,
+    validate_des_component_selection,
 )
 from amber_metallo.environment import detect_amber_environment, environment_summary, is_linux_execution_host
 from amber_metallo.inspection import (
@@ -1011,7 +1012,9 @@ def _prompt_des_component_selection() -> list[DESComponent | str]:
     available_numbers = set(numbered_choices)
     while True:
         raw = typer.prompt(
-            "Choose DES component number(s), recommended set R1/R2, or B to go back (examples: 1,2 | 1,2,3,4 | R1)",
+            "Choose DES component number(s), recommended set "
+            + "/".join(key.upper() for key in set_lookup)
+            + ", or B to go back (examples: 1,2 | R1)",
             default="R1",
         ).strip()
         if _is_back_token(raw):
@@ -1027,7 +1030,13 @@ def _prompt_des_component_selection() -> list[DESComponent | str]:
         if not selected_numbers:
             console.print("[bold red]Please choose at least one DES component or recommended set.[/bold red]")
             continue
-        return [_des_component_from_key(numbered_choices[number].key) for number in selected_numbers]
+        selected = [_des_component_from_key(numbered_choices[number].key) for number in selected_numbers]
+        try:
+            validate_des_component_selection(selected)
+        except ValueError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            continue
+        return selected
 
 
 def _parse_des_ratio(raw: str, expected_count: int) -> list[int]:
@@ -1351,6 +1360,15 @@ def _prompt_des_config() -> DESConfig:
                 continue
 
             if step == 6:
+                component_map = _des_component_map()
+                if any(not component_map[key].supports_c4 for key in state.components):
+                    state.apply_1264 = False
+                    console.print(
+                        "[yellow]Selected library includes a 12-6-only hybrid model; "
+                        "no validated C4 parameters are supplied. 12-6-4 is disabled.[/yellow]"
+                    )
+                    step = 7
+                    continue
                 _display_choice_table("DES 12-6-4 parameter set", c4_parameter_choices)
                 back_step = 5
                 state.c4_parameter_set = DESC4ParameterSet(

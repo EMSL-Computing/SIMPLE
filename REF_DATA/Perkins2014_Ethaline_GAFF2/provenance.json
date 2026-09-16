@@ -1,0 +1,997 @@
+{
+  "id": "perkins2014_gaff2_hybrid_v1",
+  "label": "Perkins 2014 SI charges/LJ + GAFF2 bonded (hybrid)",
+  "citation": "Perkins, S. L.; Painter, P.; Colina, C. M. J. Chem. Eng. Data 2014, 59, 3652-3662.",
+  "title": "Experimental and Computational Studies of Choline Chloride-Based Deep Eutectic Solvents",
+  "doi": "10.1021/je500520h",
+  "si": "je500520h_si_001.pdf, pp. 6-7, Tables S1-S2; bonded terms described as GAFF",
+  "gaff2_source": "https://raw.githubusercontent.com/Amber-MD/AmberClassic/919e8b895a4566669325aee14ecf540a5fcb1b89/dat/leap/parm/gaff2.dat",
+  "gaff2_sha256": "2244b58627a85693776d12a0155a292f72b65b4398a03b87958136ad7460c67f",
+  "gaff2_header": "AMBER General Force Field for organic molecules (Version 2.2.30, Oct 2025)",
+  "chloride_lj_source": "Amber parm99.dat IM: Smith & Dang, J. Chem. Phys. 1994, 100, 3757; Rmin/2=2.47 A, epsilon=0.1 kcal/mol",
+  "chloride_lj_url": "https://raw.githubusercontent.com/Amber-MD/AmberClassic/919e8b895a4566669325aee14ecf540a5fcb1b89/dat/leap/parm/parm99.dat",
+  "chloride_charge": -0.9,
+  "chloride_charge_rationale": "Chosen to balance +0.9000 e choline after correcting +0.0002 e SI text-rounding drift; chloride LJ not specified in supplied SI.",
+  "choline_si_charges": {
+    "C2": -0.1208,
+    "N3": 0.0452,
+    "C3": -0.1208,
+    "C4": -0.1208,
+    "C5": -0.029,
+    "C6": 0.1351,
+    "O2": -0.557,
+    "H5": 0.1074,
+    "H6": 0.1074,
+    "H7": 0.1074,
+    "H8": 0.1074,
+    "H9": 0.1074,
+    "H10": 0.1074,
+    "H11": 0.1074,
+    "H12": 0.1074,
+    "H13": 0.1074,
+    "H14": 0.1004,
+    "H15": 0.1004,
+    "H16": 0.0459,
+    "H17": 0.0459,
+    "H18": 0.4091
+  },
+  "choline_rounding_correction": {
+    "original_total": 0.9002,
+    "target_total": 0.9,
+    "method": "Uniform -0.0002/21 e per atom, rounded to 8 decimals; final residual on unique N3. Equivalent-atom charges remain equal."
+  },
+  "recommended_components": [
+    "choline_chloride_perkins2014_gaff2",
+    "ethylene_glycol_perkins2014_gaff2"
+  ],
+  "recommended_ratio": [
+    1,
+    2
+  ],
+  "units": {
+    "charge": "e",
+    "radius": "Rmin/2, angstrom",
+    "epsilon": "kcal/mol"
+  },
+  "mixing_rule": "Amber Lorentz-Berthelot: additive Rmin/2, geometric epsilon",
+  "scee": 1.2,
+  "scnb": 2.0,
+  "warnings": [
+    "Hybrid model, NOT an exact reproduction of Perkins et al. 2014; density/RDF/transport properties have not been validated.",
+    "Standard GAFF bonded terms were replaced with pinned GAFF2 2.2.30 terms, not a claim of improved DES accuracy.",
+    "EG O3 epsilon=0.1700 and O4 epsilon=0.2104 are retained literally from SI Table S2; possible SI inconsistency is unresolved.",
+    "Chloride LJ is an explicitly substituted Amber IM value, not confirmed as the authors' chloride model.",
+    "Choline SI charges sum to +0.9002 e; a documented symmetry-preserving text-rounding correction gives +0.9000 e to balance Cl -0.9000 e.",
+    "No 12-6-4/C4 model is supplied for these scaled-charge types. Do not combine with C4 ions without new parameter validation.",
+    "Coordinates are starting geometries reused from SIMPLE, not published equilibrated coordinates. Minimize/equilibrate before production."
+  ],
+  "atom_type_mapping": {
+    "ZC": {
+      "gaff2": "c3",
+      "element": "C",
+      "mass": 12.01,
+      "rmin_half": 1.908,
+      "epsilon": 0.1094
+    },
+    "ZN": {
+      "gaff2": "n4",
+      "element": "N",
+      "mass": 14.01,
+      "rmin_half": 1.824,
+      "epsilon": 0.17
+    },
+    "ZX": {
+      "gaff2": "hx",
+      "element": "H",
+      "mass": 1.008,
+      "rmin_half": 1.1,
+      "epsilon": 0.0157
+    },
+    "ZH": {
+      "gaff2": "h1",
+      "element": "H",
+      "mass": 1.008,
+      "rmin_half": 1.387,
+      "epsilon": 0.0157
+    },
+    "ZO": {
+      "gaff2": "oh",
+      "element": "O",
+      "mass": 16.0,
+      "rmin_half": 1.721,
+      "epsilon": 0.2104
+    },
+    "ZE": {
+      "gaff2": "oh",
+      "element": "O",
+      "mass": 16.0,
+      "rmin_half": 1.721,
+      "epsilon": 0.17
+    },
+    "ZQ": {
+      "gaff2": "ho",
+      "element": "H",
+      "mass": 1.008,
+      "rmin_half": 0.112,
+      "epsilon": 0.001
+    },
+    "ZI": {
+      "gaff2": null,
+      "element": "Cl",
+      "mass": 35.45,
+      "rmin_half": 2.47,
+      "epsilon": 0.1
+    }
+  },
+  "atoms": {
+    "PC4.lib": [
+      {
+        "name": "C2",
+        "type": "ZC",
+        "charge": -0.12080952
+      },
+      {
+        "name": "N3",
+        "type": "ZN",
+        "charge": 0.0451904
+      },
+      {
+        "name": "C3",
+        "type": "ZC",
+        "charge": -0.12080952
+      },
+      {
+        "name": "C4",
+        "type": "ZC",
+        "charge": -0.12080952
+      },
+      {
+        "name": "C5",
+        "type": "ZC",
+        "charge": -0.02900952
+      },
+      {
+        "name": "C6",
+        "type": "ZC",
+        "charge": 0.13509048
+      },
+      {
+        "name": "O2",
+        "type": "ZO",
+        "charge": -0.55700952
+      },
+      {
+        "name": "H5",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H6",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H7",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H8",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H9",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H10",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H11",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H12",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H13",
+        "type": "ZX",
+        "charge": 0.10739048
+      },
+      {
+        "name": "H14",
+        "type": "ZX",
+        "charge": 0.10039048
+      },
+      {
+        "name": "H15",
+        "type": "ZX",
+        "charge": 0.10039048
+      },
+      {
+        "name": "H16",
+        "type": "ZH",
+        "charge": 0.04589048
+      },
+      {
+        "name": "H17",
+        "type": "ZH",
+        "charge": 0.04589048
+      },
+      {
+        "name": "H18",
+        "type": "ZQ",
+        "charge": 0.40909048
+      }
+    ],
+    "PE4.lib": [
+      {
+        "name": "O3",
+        "type": "ZE",
+        "charge": -0.634
+      },
+      {
+        "name": "C7",
+        "type": "ZC",
+        "charge": 0.1615
+      },
+      {
+        "name": "C8",
+        "type": "ZC",
+        "charge": 0.1615
+      },
+      {
+        "name": "O4",
+        "type": "ZO",
+        "charge": -0.634
+      },
+      {
+        "name": "H19",
+        "type": "ZQ",
+        "charge": 0.4069
+      },
+      {
+        "name": "H20",
+        "type": "ZH",
+        "charge": 0.0328
+      },
+      {
+        "name": "H21",
+        "type": "ZH",
+        "charge": 0.0328
+      },
+      {
+        "name": "H22",
+        "type": "ZH",
+        "charge": 0.0328
+      },
+      {
+        "name": "H23",
+        "type": "ZH",
+        "charge": 0.0328
+      },
+      {
+        "name": "H24",
+        "type": "ZQ",
+        "charge": 0.4069
+      }
+    ],
+    "PL4.lib": [
+      {
+        "name": "CL",
+        "type": "ZI",
+        "charge": -0.9
+      }
+    ]
+  },
+  "bonded_sources": {
+    "ZC-ZC": {
+      "gaff2_types": [
+        "c3",
+        "c3"
+      ],
+      "source_key": [
+        "c3",
+        "c3"
+      ],
+      "terms": [
+        [
+          "228.89",
+          "1.5354"
+        ]
+      ]
+    },
+    "ZC-ZE": {
+      "gaff2_types": [
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "285.15",
+          "1.4242"
+        ]
+      ]
+    },
+    "ZC-ZH": {
+      "gaff2_types": [
+        "c3",
+        "h1"
+      ],
+      "source_key": [
+        "c3",
+        "h1"
+      ],
+      "terms": [
+        [
+          "344.22",
+          "1.0969"
+        ]
+      ]
+    },
+    "ZC-ZN": {
+      "gaff2_types": [
+        "c3",
+        "n4"
+      ],
+      "source_key": [
+        "c3",
+        "n4"
+      ],
+      "terms": [
+        [
+          "215.86",
+          "1.5167"
+        ]
+      ]
+    },
+    "ZC-ZO": {
+      "gaff2_types": [
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "285.15",
+          "1.4242"
+        ]
+      ]
+    },
+    "ZC-ZX": {
+      "gaff2_types": [
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "c3",
+        "hx"
+      ],
+      "terms": [
+        [
+          "352.86",
+          "1.0911"
+        ]
+      ]
+    },
+    "ZE-ZQ": {
+      "gaff2_types": [
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "ho",
+        "oh"
+      ],
+      "terms": [
+        [
+          "535.51",
+          "0.9725"
+        ]
+      ]
+    },
+    "ZO-ZQ": {
+      "gaff2_types": [
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "ho",
+        "oh"
+      ],
+      "terms": [
+        [
+          "535.51",
+          "0.9725"
+        ]
+      ]
+    },
+    "ZC-ZC-ZE": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "76.79",
+          "109.66"
+        ]
+      ]
+    },
+    "ZC-ZC-ZH": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "h1"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "h1"
+      ],
+      "terms": [
+        [
+          "43.28",
+          "109.59"
+        ]
+      ]
+    },
+    "ZC-ZC-ZN": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "n4"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "n4"
+      ],
+      "terms": [
+        [
+          "62.94",
+          "116.26"
+        ]
+      ]
+    },
+    "ZC-ZC-ZO": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "76.79",
+          "109.66"
+        ]
+      ]
+    },
+    "ZC-ZC-ZX": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "hx"
+      ],
+      "terms": [
+        [
+          "43.17",
+          "110.28"
+        ]
+      ]
+    },
+    "ZC-ZE-ZQ": {
+      "gaff2_types": [
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "terms": [
+        [
+          "65.13",
+          "107.39"
+        ]
+      ]
+    },
+    "ZC-ZN-ZC": {
+      "gaff2_types": [
+        "c3",
+        "n4",
+        "c3"
+      ],
+      "source_key": [
+        "c3",
+        "n4",
+        "c3"
+      ],
+      "terms": [
+        [
+          "76.02",
+          "109.36"
+        ]
+      ]
+    },
+    "ZC-ZO-ZQ": {
+      "gaff2_types": [
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "terms": [
+        [
+          "65.13",
+          "107.39"
+        ]
+      ]
+    },
+    "ZE-ZC-ZH": {
+      "gaff2_types": [
+        "oh",
+        "c3",
+        "h1"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "56.29",
+          "110.38"
+        ]
+      ]
+    },
+    "ZH-ZC-ZH": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "h1"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "h1"
+      ],
+      "terms": [
+        [
+          "35.64",
+          "108.55"
+        ]
+      ]
+    },
+    "ZH-ZC-ZO": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "56.29",
+          "110.38"
+        ]
+      ]
+    },
+    "ZN-ZC-ZX": {
+      "gaff2_types": [
+        "n4",
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "hx",
+        "c3",
+        "n4"
+      ],
+      "terms": [
+        [
+          "46.79",
+          "108.17"
+        ]
+      ]
+    },
+    "ZX-ZC-ZX": {
+      "gaff2_types": [
+        "hx",
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "hx",
+        "c3",
+        "hx"
+      ],
+      "terms": [
+        [
+          "35.63",
+          "109.79"
+        ]
+      ]
+    },
+    "ZC-ZC-ZE-ZQ": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.060",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZC-ZC-ZN-ZC": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "n4",
+        "c3"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "n4",
+        "c3"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.156",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZC-ZC-ZO-ZQ": {
+      "gaff2_types": [
+        "c3",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "c3",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.060",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZC-ZN-ZC-ZX": {
+      "gaff2_types": [
+        "c3",
+        "n4",
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "X",
+        "c3",
+        "n4",
+        "X"
+      ],
+      "terms": [
+        [
+          "9",
+          "1.400",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZE-ZC-ZC-ZH": {
+      "gaff2_types": [
+        "oh",
+        "c3",
+        "c3",
+        "h1"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.000",
+          "0.000",
+          "-3.000"
+        ],
+        [
+          "1",
+          "0.250",
+          "0.000",
+          "1.000"
+        ]
+      ]
+    },
+    "ZE-ZC-ZC-ZO": {
+      "gaff2_types": [
+        "oh",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "oh",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "1",
+          "1.440",
+          "0.000",
+          "-3.000"
+        ],
+        [
+          "1",
+          "1.000",
+          "0.000",
+          "1.000"
+        ]
+      ]
+    },
+    "ZH-ZC-ZC-ZH": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "c3",
+        "h1"
+      ],
+      "source_key": [
+        "X",
+        "c3",
+        "c3",
+        "X"
+      ],
+      "terms": [
+        [
+          "9",
+          "1.400",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZH-ZC-ZC-ZN": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "c3",
+        "n4"
+      ],
+      "source_key": [
+        "X",
+        "c3",
+        "c3",
+        "X"
+      ],
+      "terms": [
+        [
+          "9",
+          "1.400",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZH-ZC-ZC-ZO": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.000",
+          "0.000",
+          "-3.000"
+        ],
+        [
+          "1",
+          "0.250",
+          "0.000",
+          "1.000"
+        ]
+      ]
+    },
+    "ZH-ZC-ZC-ZX": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "X",
+        "c3",
+        "c3",
+        "X"
+      ],
+      "terms": [
+        [
+          "9",
+          "1.400",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZH-ZC-ZE-ZQ": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.123",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZH-ZC-ZO-ZQ": {
+      "gaff2_types": [
+        "h1",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "source_key": [
+        "h1",
+        "c3",
+        "oh",
+        "ho"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.123",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    },
+    "ZN-ZC-ZC-ZO": {
+      "gaff2_types": [
+        "n4",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "source_key": [
+        "n4",
+        "c3",
+        "c3",
+        "oh"
+      ],
+      "terms": [
+        [
+          "1",
+          "0.144",
+          "0.000",
+          "-3.000"
+        ],
+        [
+          "1",
+          "1.300",
+          "0.000",
+          "2.000"
+        ]
+      ]
+    },
+    "ZO-ZC-ZC-ZX": {
+      "gaff2_types": [
+        "oh",
+        "c3",
+        "c3",
+        "hx"
+      ],
+      "source_key": [
+        "X",
+        "c3",
+        "c3",
+        "X"
+      ],
+      "terms": [
+        [
+          "9",
+          "1.400",
+          "0.000",
+          "3.000"
+        ]
+      ]
+    }
+  },
+  "asset_hash_normalization": "UTF-8/LF text; strip trailing whitespace at EOF, then append one LF",
+  "asset_sha256": {
+    "PC4.lib": "72eb8c81a74956737a7762a0316e1016faf818fbd8f2352671e984c1ed49d2b2",
+    "PE4.lib": "9bf2ccdac9895dce422f4ba9c41bed05511e09aac25278c8ed6a046aa21877b9",
+    "PL4.lib": "711b3ba67074618645e566b80c2b0151d38a5d1caae120ffc0abf089a2c0b201",
+    "perkins2014_gaff2.frcmod": "994e7b0bdeebfc8d4893e5b00066aec3c2c9463f0fda98217c6b0ab3807f777f"
+  }
+}

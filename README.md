@@ -327,12 +327,15 @@ In the FreeE TI wizard, **Snapshot at a specified time (ns)** shows the actual s
 
 Saved TI/FreeE configurations can use `[snapshot]` with `mode = "time"` and `time_ns = 40.0`. The chosen frame and time are recorded in `snapshot/time_snapshot_manifest.json`; a final production restart never overrides a time-selected frame. Last-frame and cluster selection remain available, with last-frame selection as the default.
 
+FreeE shows Reference PDB vs Last-frame coordination before snapshot selection, then the chosen frame's coordination. The Metalloprotein direct-coordination distance criterion (currently 3.0 Å) can be adjusted before opting into native AMBER metal–donor flat-bottom restraints. No preserves the existing TI behavior. The new restraints currently support combined 12-6-4 GTI; attachment/release corrections are not computed. See [coordination restraint setup and limitations](docs/ti_coordination_restraints.md).
+
 For combined softcore TI starting from coordinates without velocities, the first lambda equilibration assigns new velocities (`ntx=1, irest=0`). Production and subsequent windows continue from the preceding restart (`ntx=5, irest=1`). Verified velocity restarts and runs with a required preparation stage retain restart settings. NetCDF restart velocities are inspected as well as formatted restart velocities. Regenerate TI inputs and sbatch scripts after updating SIMPLE; already-generated files are not rewritten by a code update.
 
 Reusable TI analysis-library results are stored in the operating system's per-user application-data directory, not in the source checkout. Set `SIMPLE_ANALYSIS_LIBRARY_DIR` to use a reviewed shared or campaign-specific location.
 
 ## Documentation
 
+- [Direct metal TI](docs/ti_metal_transformations.md) — dummy default, Fe3+ endpoints, and per-case metal transformations
 - [Tutorial](docs/tutorial.md) — guided usage documentation
 - [Manual ligand parameters](docs/manual_ligands.md) — accepted Amber-ready parameter bundles
 

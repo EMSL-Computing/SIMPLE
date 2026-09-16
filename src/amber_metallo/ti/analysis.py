@@ -401,11 +401,11 @@ def render_last_snapshot_cpptraj_script(
     output_rst7: str | Path,
 ) -> str:
     return (
-        f"parm {Path(prmtop_path).as_posix()}\n"
-        f"trajin {Path(trajectory_path).as_posix()} lastframe\n"
+        f'parm "{Path(prmtop_path).expanduser().resolve().as_posix()}"\n'
+        f'trajin "{Path(trajectory_path).expanduser().resolve().as_posix()}" lastframe\n'
         "autoimage\n"
-        f"trajout {Path(output_pdb).as_posix()} pdb nobox\n"
-        f"trajout {Path(output_rst7).as_posix()} restart novelocity\n"
+        f'trajout "{Path(output_pdb).as_posix()}" pdb include_ep\n'
+        f'trajout "{Path(output_rst7).as_posix()}" restart novelocity\n'
         "run\n"
     )
 
@@ -420,16 +420,16 @@ def render_cluster_cpptraj_script(
     sieve: int,
 ) -> str:
     cluster_dir = Path(output_dir)
-    rep_prefix = cluster_dir / "representative"
+    rep_prefix = cluster_dir / "representative_restart"
     return (
-        f"parm {Path(prmtop_path).as_posix()}\n"
-        f"trajin {Path(trajectory_path).as_posix()}\n"
+        f'parm "{Path(prmtop_path).expanduser().resolve().as_posix()}"\n'
+        f'trajin "{Path(trajectory_path).expanduser().resolve().as_posix()}"\n'
         "autoimage\n"
         f"rms first {atom_mask}\n"
         f"cluster C0 hieragglo epsilon {epsilon_angstrom:.3f} rms {atom_mask} "
-        f"sieve {sieve} summary {cluster_dir.joinpath('cluster_summary.dat').as_posix()} "
-        f"info {cluster_dir.joinpath('cluster_info.dat').as_posix()} "
-        f"repout {rep_prefix.as_posix()} repfmt pdb\n"
+        f'sieve {sieve} summary "{cluster_dir.joinpath("cluster_summary.dat").as_posix()}" '
+        f'info "{cluster_dir.joinpath("cluster_info.dat").as_posix()}" '
+        f'repout "{rep_prefix.as_posix()}" repfmt restart\n'
         "run\n"
     )
 
@@ -618,56 +618,9 @@ def generate_reference_pdb_from_amber_restart(
     restart_path: str | Path,
     output_path: str | Path,
 ) -> Path:
-    target = Path(output_path).expanduser().resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    ambpdb = resolve_tool_binary("ambpdb", path_finder=shutil.which)
-    if ambpdb is not None:
-        log_path = target.with_suffix(".ambpdb.log")
-        command_variants = [
-            [ambpdb, "-p", str(Path(prmtop_path).expanduser().resolve()), "-c", str(Path(restart_path).expanduser().resolve())],
-            [ambpdb, "-p", str(Path(prmtop_path).expanduser().resolve())],
-        ]
-        last_error: Exception | None = None
-        for command in command_variants:
-            try:
-                stdin_payload = None
-                if len(command) == 3:
-                    stdin_payload = Path(restart_path).read_text(encoding="utf-8", errors="ignore")
-                result = subprocess.run(
-                    command,
-                    cwd=str(target.parent),
-                    input=stdin_payload,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                log_path.write_text(
-                    "\n".join(
-                        [
-                            f"$ {' '.join(command)}",
-                            "",
-                            "STDOUT:",
-                            result.stdout,
-                            "",
-                            "STDERR:",
-                            result.stderr,
-                        ]
-                    ),
-                    encoding="utf-8",
-                )
-                if result.returncode == 0 and ("ATOM" in result.stdout or "HETATM" in result.stdout):
-                    target.write_text(result.stdout, encoding="utf-8")
-                    return target
-                last_error = RuntimeError(f"ambpdb did not produce a PDB; see {log_path}")
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            # Fall through to the lightweight parser; it is sufficient for metal-site detection.
-            pass
-    return _write_reference_pdb_from_prmtop_restart(
-        prmtop_path=prmtop_path,
-        restart_path=restart_path,
-        output_path=target,
+    from amber_metallo.ti.full_structure import full_pdb_from_restart
+    return full_pdb_from_restart(
+        prmtop_path=prmtop_path, restart_path=restart_path, output_path=output_path,
     )
 
 
@@ -699,6 +652,8 @@ def run_last_snapshot_extraction(
         if binary is None:
             raise RuntimeError("cpptraj was not found on PATH, so the last snapshot could not be extracted.")
         run_command([binary, "-i", str(script_path)], cwd=target_dir, log_path=target_dir / "extract_last_snapshot.log")
+        generate_reference_pdb_from_amber_restart(
+            prmtop_path=prmtop_path, restart_path=output_rst7, output_path=output_pdb)
     manifest = {
         "script": str(script_path),
         "last_snapshot_pdb": str(output_pdb),
@@ -750,23 +705,14 @@ def run_cluster_representative_selection(
         if binary is None:
             raise RuntimeError("cpptraj was not found on PATH, so cluster analysis could not be executed.")
         run_command([binary, "-i", str(script_path)], cwd=target_dir, log_path=target_dir / "cluster_representative.log")
-        representative = _pick_representative_pdb(target_dir)
-        if representative is None:
+        representatives = sorted(p for p in target_dir.glob("representative_restart.c*") if p.is_file())
+        if not representatives:
             raise RuntimeError(
-                "cpptraj clustering completed, but no representative PDB file was produced."
+                "cpptraj clustering completed, but no complete representative restart was produced."
             )
-        copy_structure(representative, output_pdb)
-        convert_script = target_dir / "representative_to_restart.cpptraj.in"
-        convert_script.write_text(
-            (
-                f"parm {Path(prmtop_path).as_posix()}\n"
-                f"trajin {output_pdb.as_posix()}\n"
-                f"trajout {output_rst7.as_posix()} restart\n"
-                "run\n"
-            ),
-            encoding="utf-8",
-        )
-        run_command([binary, "-i", str(convert_script)], cwd=target_dir, log_path=target_dir / "representative_to_restart.log")
+        copy_structure(representatives[0], output_rst7)
+        generate_reference_pdb_from_amber_restart(
+            prmtop_path=prmtop_path, restart_path=output_rst7, output_path=output_pdb)
     manifest = {
         "script": str(script_path),
         "representative_snapshot_pdb": str(output_pdb),

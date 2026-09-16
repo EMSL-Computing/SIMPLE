@@ -6,11 +6,18 @@ import math
 import os
 import random
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 
+import matplotlib
+import numpy as np
 from platformdirs import user_data_path
+
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
 
 from amber_metallo.reporting import console, write_json
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
@@ -50,6 +57,11 @@ _DVDL_LINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _STARRED_DVDL_PATTERN = re.compile(r"\bDV/?DL\b\s*=\s*\*+", re.IGNORECASE)
+_NSTEP_PATTERN = re.compile(r"\bNSTEP\s*=\s*(?P<value>\d+)", re.IGNORECASE)
+_TIME_PS_PATTERN = re.compile(
+    r"\bTIME\(PS\)\s*=\s*(?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[DEde][+-]?\d+)?)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -67,6 +79,8 @@ class ParsedDVDL:
     parser_mode: str
     warning: str | None
     sample_values: list[float]
+    sample_times_ps: list[float] = field(default_factory=list)
+    sample_times_available: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,7 +88,22 @@ class ParsedDVDL:
             "parser_mode": self.parser_mode,
             "warning": self.warning,
             "sample_values": self.sample_values,
+            "sample_times_ps": self.sample_times_ps,
+            "sample_times_available": self.sample_times_available,
         }
+
+
+@dataclass(slots=True)
+class ConvergenceAnalysisOptions:
+    enabled: bool = False
+    discard_ns: float = 0.0
+    cumulative_points: int = 10
+
+    def __post_init__(self) -> None:
+        if self.discard_ns < 0.0:
+            raise ValueError("discard_ns must be zero or greater.")
+        if self.cumulative_points < 2:
+            raise ValueError("cumulative_points must be at least 2.")
 
 
 @dataclass(slots=True)
@@ -167,6 +196,32 @@ def rbfe_pair_compatibility(
     """Return blocking errors and non-blocking warnings for an RBFE leg pair."""
     errors: list[str] = []
     warnings: list[str] = []
+
+    def parameter_identity(parameters):
+        return tuple(round(parameters[key], digits) if key in parameters else None
+                     for key, digits in (("rmin_half", 4), ("epsilon", 5), ("c4", 3), ("self_c4", 3)))
+
+    def transformation_identity(case):
+        plan = case.metadata.get("transformation") or {}
+        if plan.get("mode") != "metal":
+            return None
+        return (round(plan.get("tuning_factor", 1.0), 8), sorted((s["source_element"], round(s["source_charge"], 4),
+                       parameter_identity(s.get("source_parameters", {})),
+                       s["endpoint"]["element"], s["endpoint"]["formal_charge"],
+                       s["endpoint"]["parameter_set"], s["endpoint"]["water_model"],
+                       parameter_identity(s["endpoint"]))
+                      for s in plan["sites"]))
+    if transformation_identity(bound_case) != transformation_identity(water_case):
+        errors.append("Bound and water legs have different metal transformation endpoints; dummy references cannot be paired with direct metal TI.")
+    bound_plan = bound_case.metadata.get("transformation") or {}
+    water_plan = water_case.metadata.get("transformation") or {}
+    if bound_plan.get("mode") == water_plan.get("mode") == "metal":
+        if bound_plan.get("gti_syn_mass") != water_plan.get("gti_syn_mass"):
+            warnings.append("Bound and water legs used different mass paths. Their configurational free energies remain comparable at equilibrium.")
+        bound_term = bound_plan.get("classical_kinetic_mass_term_kcal_mol")
+        water_term = water_plan.get("classical_kinetic_mass_term_kcal_mol")
+        if bound_term is not None and water_term is not None and abs(bound_term - water_term) > 1e-6:
+            warnings.append("The physical kinetic mass terms differ between legs; the reported configurational ddG excludes their difference.")
     bound_charge_mode = _charge_compensation_mode(bound_case)
     water_charge_mode = _charge_compensation_mode(water_case)
     known_charge_modes = {bound_charge_mode, water_charge_mode} - {"unknown", ""}
@@ -232,6 +287,13 @@ class AnalysisWindowResult:
     expected_mdout_path: Path | None = None
     endpoint_substituted: bool = False
     bootstrap_pool: list[float] = field(default_factory=list, repr=False)
+    block_means: list[float] = field(default_factory=list, repr=False)
+    sample_values: list[float] = field(default_factory=list, repr=False)
+    sample_times_ps: list[float] = field(default_factory=list, repr=False)
+    original_sample_values: list[float] = field(default_factory=list, repr=False)
+    original_sample_times_ps: list[float] = field(default_factory=list, repr=False)
+    sample_times_available: bool = field(default=False, repr=False)
+    discard_ns: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -253,6 +315,8 @@ class AnalysisWindowResult:
             "run_id": self.run_id,
             "expected_mdout_path": None if self.expected_mdout_path is None else str(self.expected_mdout_path),
             "endpoint_substituted": self.endpoint_substituted,
+            "block_means": self.block_means,
+            "discard_ns": self.discard_ns,
         }
 
 
@@ -301,6 +365,8 @@ class SingleCaseAnalysisResult:
     warnings: list[str] = field(default_factory=list)
     bootstrap_samples: list[float] = field(default_factory=list, repr=False)
     corrected_bootstrap_samples: list[float] = field(default_factory=list, repr=False)
+    convergence_options: ConvergenceAnalysisOptions = field(default_factory=ConvergenceAnalysisOptions)
+    analysis_artifacts: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,6 +387,8 @@ class SingleCaseAnalysisResult:
             "quality": self.quality,
             "warnings": self.warnings,
             "output_dir": str(self.output_dir),
+            "convergence_options": asdict(self.convergence_options),
+            "analysis_artifacts": self.analysis_artifacts,
         }
 
 
@@ -336,6 +404,8 @@ class RBFEAnalysisResult:
     quality: Literal["ok", "warning"] = "ok"
     warnings: list[str] = field(default_factory=list)
     bootstrap_samples: list[float] = field(default_factory=list, repr=False)
+    convergence_options: ConvergenceAnalysisOptions = field(default_factory=ConvergenceAnalysisOptions)
+    analysis_artifacts: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -348,6 +418,8 @@ class RBFEAnalysisResult:
             "quality": self.quality,
             "warnings": self.warnings,
             "output_dir": str(self.output_dir),
+            "convergence_options": asdict(self.convergence_options),
+            "analysis_artifacts": self.analysis_artifacts,
         }
 
 
@@ -452,8 +524,8 @@ def _quantile(values: list[float], fraction: float) -> float:
         return values[0]
     sorted_values = sorted(values)
     position = (len(sorted_values) - 1) * fraction
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
+    lower = math.floor(position)
+    upper = math.ceil(position)
     if lower == upper:
         return sorted_values[lower]
     weight = position - lower
@@ -532,7 +604,7 @@ def integrate_trapezoid(points: Iterable[tuple[float, float]]) -> float:
     if len(ordered) < 2:
         return ordered[0][1] if ordered else 0.0
     total = 0.0
-    for (lam_a, value_a), (lam_b, value_b) in zip(ordered[:-1], ordered[1:]):
+    for (lam_a, value_a), (lam_b, value_b) in pairwise(ordered):
         total += (lam_b - lam_a) * (value_a + value_b) / 2.0
     return total
 
@@ -559,20 +631,44 @@ def parse_mdout_dvdl(path: str | Path) -> ParsedDVDL:
                 break
         if average_value is not None:
             break
-    sample_values = [_coerce_float(match.group("value")) for match in _TIME_SERIES_PATTERN.finditer(text)]
+    sample_scan_lines = lines if average_index is None else lines[:average_index]
+    sample_values: list[float] = []
+    sample_times_ps: list[float] = []
+    pending_step: int | None = None
+    pending_time_ps: float | None = None
+    seen_records: set[tuple[int | None, float | None]] = set()
+    for line in sample_scan_lines:
+        step_match = _NSTEP_PATTERN.search(line)
+        time_match = _TIME_PS_PATTERN.search(line)
+        if step_match:
+            pending_step = int(step_match.group("value"))
+            pending_time_ps = None
+        if time_match:
+            pending_time_ps = _coerce_float(time_match.group("value"))
+        dvdl_match = _DVDL_LINE_PATTERN.search(line)
+        if dvdl_match is None or pending_step is None:
+            continue
+        record_key = (pending_step, pending_time_ps)
+        if record_key in seen_records:
+            continue
+        seen_records.add(record_key)
+        sample_values.append(_coerce_float(dvdl_match.group("value")))
+        sample_times_ps.append(float("nan") if pending_time_ps is None else pending_time_ps)
     if not sample_values:
-        sample_scan_lines = lines if average_index is None else lines[:average_index]
-        sample_values = []
         for line in sample_scan_lines:
             match = _DVDL_LINE_PATTERN.search(line)
             if match:
                 sample_values.append(_coerce_float(match.group("value")))
+        sample_times_ps = [float("nan")] * len(sample_values)
+    sample_times_available = bool(sample_times_ps) and all(math.isfinite(value) for value in sample_times_ps)
     if average_value is not None:
         return ParsedDVDL(
             value=average_value,
             parser_mode="final_average_block",
             warning=None,
             sample_values=sample_values,
+            sample_times_ps=sample_times_ps,
+            sample_times_available=sample_times_available,
         )
     if sample_values:
         return ParsedDVDL(
@@ -580,29 +676,61 @@ def parse_mdout_dvdl(path: str | Path) -> ParsedDVDL:
             parser_mode="time_series_mean",
             warning="Fell back to the DV/DL time-series mean because the final average block was not found.",
             sample_values=sample_values,
+            sample_times_ps=sample_times_ps,
+            sample_times_available=sample_times_available,
         )
     raise ValueError(f"Could not locate DV/DL data in {target}")
 
 
-def _window_statistics(parse: ParsedDVDL) -> tuple[float, float, float, str, int, int, list[float]]:
-    if parse.sample_values:
-        samples = list(parse.sample_values)
-    else:
-        samples = [parse.value]
+def _window_statistics(
+    samples: list[float],
+) -> tuple[float, float, float, str, int, int, list[float], list[float]]:
+    if not samples:
+        raise ValueError("At least one DV/DL sample is required for window statistics.")
     sample_mean = _safe_mean(samples)
     sample_std = _sample_std(samples)
-    if len(samples) >= (_DEFAULT_BLOCK_COUNT * 2):
+    if len(samples) >= _DEFAULT_BLOCK_COUNT:
         block_means = _contiguous_block_means(samples)
         sem = _sample_sem(block_means)
-        sem_mode = "block_average"
+        sem_mode = "five_block_average"
         block_count = len(block_means)
         bootstrap_pool = block_means
     else:
+        block_means = _contiguous_block_means(samples)
         sem = _sample_sem(samples)
         sem_mode = "sample_sem"
-        block_count = 1
+        block_count = len(block_means)
         bootstrap_pool = samples
-    return sample_mean, sample_std, sem, sem_mode, len(samples), block_count, bootstrap_pool
+    return sample_mean, sample_std, sem, sem_mode, len(samples), block_count, bootstrap_pool, block_means
+
+
+def _samples_after_discard(parsed: ParsedDVDL, discard_ns: float) -> tuple[list[float], list[float]]:
+    samples = list(parsed.sample_values) if parsed.sample_values else [parsed.value]
+    times = list(parsed.sample_times_ps) if parsed.sample_times_ps else [float("nan")] * len(samples)
+    if discard_ns <= 0.0:
+        return samples, times
+    if not parsed.sample_times_available or len(times) != len(samples):
+        raise ValueError(
+            "A nonzero discard requires TIME(PS) records in every analyzed mdout window. "
+            "Re-run without discard or use mdout files that contain the Amber time-series timestamps."
+        )
+    interval_ps = (
+        _safe_mean([right - left for left, right in pairwise(times) if right > left])
+        if len(times) > 1
+        else 0.0
+    )
+    production_start_ps = times[0] - max(interval_ps, 0.0)
+    cutoff_ps = discard_ns * 1000.0
+    kept = [
+        (sample, time_ps)
+        for sample, time_ps in zip(samples, times)
+        if (time_ps - production_start_ps) > cutoff_ps
+    ]
+    if not kept:
+        raise ValueError(
+            f"Discarding {discard_ns:.3f} ns removes every DV/DL sample from {len(samples)}-sample window."
+        )
+    return [item[0] for item in kept], [item[1] for item in kept]
 
 
 def _load_expected_windows(ti_manifest_path: Path, output_root: Path) -> list[TIWindowExpectation]:
@@ -834,7 +962,13 @@ def _combine_bootstrap_samples(
     return combined
 
 
-def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed_label: str) -> PhaseAnalysis:
+def _phase_analysis(
+    phase: str,
+    expectations: list[TIWindowExpectation],
+    *,
+    seed_label: str,
+    discard_ns: float = 0.0,
+) -> PhaseAnalysis:
     phase_windows = sorted((item for item in expectations if item.phase == phase), key=lambda item: item.clambda)
     if not phase_windows:
         return PhaseAnalysis(
@@ -850,11 +984,22 @@ def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed
     for expectation in phase_windows:
         analysis_output_path = expectation.analysis_output_path
         parsed = parse_mdout_dvdl(analysis_output_path)
-        sample_mean, sample_std, sem, sem_mode, sample_count, block_count, bootstrap_pool = _window_statistics(parsed)
+        selected_samples, selected_times = _samples_after_discard(parsed, discard_ns)
+        (
+            sample_mean,
+            sample_std,
+            sem,
+            sem_mode,
+            sample_count,
+            block_count,
+            bootstrap_pool,
+            block_means,
+        ) = _window_statistics(selected_samples)
+        delta_g_source_value = sample_mean if discard_ns > 0.0 else parsed.value
         warning_parts = [item for item in (expectation.substitution_reason, parsed.warning) if item]
         warning = " ".join(warning_parts) or None
         window_quality: Literal["ok", "warning"] = "ok"
-        if expectation.endpoint_substituted or parsed.parser_mode != "final_average_block" or sem_mode != "block_average":
+        if expectation.endpoint_substituted or parsed.parser_mode != "final_average_block" or sem_mode != "five_block_average":
             window_quality = "warning"
         if warning:
             warnings.append(f"{expectation.output_path}: {warning}")
@@ -865,7 +1010,7 @@ def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed
                 phase=phase,
                 clambda=expectation.clambda,
                 mdout_path=analysis_output_path,
-                delta_g_source_value=parsed.value,
+                delta_g_source_value=delta_g_source_value,
                 sample_mean_dvdl=sample_mean,
                 sample_std_dvdl=sample_std,
                 sem_dvdl=sem,
@@ -881,6 +1026,17 @@ def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed
                 run_id=expectation.run_id,
                 expected_mdout_path=expectation.output_path if expectation.endpoint_substituted else None,
                 endpoint_substituted=expectation.endpoint_substituted,
+                block_means=block_means,
+                sample_values=selected_samples,
+                sample_times_ps=selected_times,
+                original_sample_values=list(parsed.sample_values) if parsed.sample_values else [parsed.value],
+                original_sample_times_ps=(
+                    list(parsed.sample_times_ps)
+                    if parsed.sample_times_ps
+                    else [float("nan")] * len(selected_samples)
+                ),
+                sample_times_available=parsed.sample_times_available,
+                discard_ns=discard_ns,
             )
         )
     grouped: dict[str, list[AnalysisWindowResult]] = {}
@@ -928,11 +1084,6 @@ def _phase_analysis(phase: str, expectations: list[TIWindowExpectation], *, seed
         forward = [float(item["delta_g_kcal_mol"]) for item in run_summaries if item["direction"] == "forward"]
         reverse = [float(item["delta_g_kcal_mol"]) for item in run_summaries if item["direction"] == "reverse"]
         hysteresis = abs(_safe_mean(forward) - _safe_mean(reverse)) if forward and reverse else None
-        if hysteresis is not None and hysteresis > max(1.0, 2.0 * within_run_sem):
-            quality = "warning"
-            warnings.append(
-                f"Forward/reverse hysteresis is {hysteresis:.3f} kcal/mol, larger than the convergence threshold."
-            )
         return PhaseAnalysis(
             phase=phase,
             delta_g_kcal_mol=delta_g,
@@ -1002,6 +1153,7 @@ def inspect_water_case(path: str | Path) -> AnalysisCaseDiscovery | None:
             "metal": metal,
             "formal_charge": formal_charge,
             "metals": metals,
+            "transformation": manifest.get("transformation"),
             "water_model": str(manifest.get("water_model") or "tip3p").lower(),
             "ti_decoupling_scheme": decoupling_scheme,
             "ti_sampling_protocol": sampling_protocol,
@@ -1057,6 +1209,7 @@ def inspect_bound_case(path: str | Path) -> AnalysisCaseDiscovery | None:
             "selected_metal": description,
             "selected_site": manifest.get("selected_site"),
             "selected_sites": selected_sites,
+            "transformation": manifest.get("transformation"),
             "selected_formal_charge": manifest.get("selected_formal_charge"),
             "selected_formal_charges_by_site": manifest.get("selected_formal_charges_by_site") or {},
             "ti_selection_mode": manifest.get("ti_selection_mode") or "single",
@@ -1113,7 +1266,7 @@ def discover_analysis_cases(search_dir: str | Path, *, case_types: set[str] | No
         if batch_manifest.exists():
             try:
                 payload = _load_json(batch_manifest)
-            except Exception:
+            except (OSError, json.JSONDecodeError, TypeError):
                 payload = {}
             for case in payload.get("cases") or []:
                 output_dir = case.get("output_dir")
@@ -1303,12 +1456,15 @@ def discover_water_library_cases(
         if not isinstance(entry, dict):
             continue
         for group_selection, group in _library_sampling_groups(entry).items():
-            if sampling_selection is not None and group_selection != sampling_selection:
-                if not (
+            if (
+                sampling_selection is not None
+                and group_selection != sampling_selection
+                and not (
                     sampling_selection == SAMPLING_SELECTION_FORWARD_ONLY
                     and group_selection == SAMPLING_SELECTION_LEGACY_UNSPECIFIED
-                ):
-                    continue
+                )
+            ):
+                continue
             snapshot = _library_group_snapshot(
                 entry,
                 base_key=key,
@@ -1436,8 +1592,10 @@ def _result_from_library_case(
     )
     warnings = (
         [
-            "This is a legacy water-library value without direction metadata; it is being treated as "
-            "Forward-only for backward compatibility."
+            (
+                "This is a legacy water-library value without direction metadata; it is being treated as "
+                "Forward-only for backward compatibility."
+            )
         ]
         if legacy_forward_fallback
         else []
@@ -1504,6 +1662,19 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
         f"Quality: {result.quality}",
     ]
     selected_sites = result.case.metadata.get("selected_sites") or []
+    direct_metal = bool((result.case.metadata.get("transformation") or {}).get("mode") == "metal")
+    if direct_metal:
+        from amber_metallo.ti.transformation import mass_path_description
+        plan = result.case.metadata["transformation"]
+        lines[2] = "TI path: direct metal transformation (matched atoms)"
+        lines.append("Configurational dG = G(end potential) - G(source potential); kinetic mass term excluded. This is not an absolute binding free energy.")
+        lines.append("Mass treatment: " + mass_path_description(plan))
+        for site in plan.get("sites", []):
+            if "source_mass_da" in site and "endpoint_mass_da" in site:
+                lines.append(f"Endpoint masses, site {site['site']}: {site['source_mass_da']:.6f} -> {site['endpoint_mass_da']:.6f} Da")
+        mass_term = plan.get("classical_kinetic_mass_term_kcal_mol")
+        if mass_term is not None:
+            lines.append(f"Physical endpoint kinetic mass term at {plan['temperature_k']:g} K: {mass_term:+.6f} kcal/mol (reported separately; not added to dG).")
     if selected_sites:
         lines.append(
             "Selected metals: "
@@ -1519,7 +1690,7 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
         lines.append("This report summarizes the standalone water-reference dG.")
     else:
         lines.append("This report summarizes the standalone bound-case TI dG.")
-    phase_label = "combined" if decoupling_scheme == DECOUPLING_SCHEME_COMBINED else "qoff"
+    phase_label = "metal transformation" if direct_metal else "combined" if decoupling_scheme == DECOUPLING_SCHEME_COMBINED else "qoff"
     lines.extend(
         [
             "",
@@ -1528,7 +1699,7 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
         ]
     )
     if decoupling_scheme == DECOUPLING_SCHEME_COMBINED:
-        lines.append("vdwoff: N/A (combined single softcore path)")
+        lines.append("vdwoff: N/A (direct metal path)" if direct_metal else "vdwoff: N/A (combined single softcore path)")
     else:
         lines.extend(
             [
@@ -1551,7 +1722,7 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
             )
     lines.extend(
         [
-            f"Total dG: {_format_mean_sem(result.delta_g_kcal_mol, result.propagated_sem_kcal_mol)} kcal/mol",
+            f"{'Configurational dG' if direct_metal else 'Total dG'}: {_format_mean_sem(result.delta_g_kcal_mol, result.propagated_sem_kcal_mol)} kcal/mol",
             f"Total dG 95% CI: {_format_ci95(result.bootstrap_ci95)}",
         ]
     )
@@ -1568,6 +1739,7 @@ def render_single_case_report(result: SingleCaseAnalysisResult) -> str:
 
 
 def render_rbfe_report(result: RBFEAnalysisResult) -> str:
+    direct_metal = (result.bound.case.metadata.get("transformation") or {}).get("mode") == "metal"
     lines = [
         f"Bound case: {result.bound.case.display_name}",
         f"Water case: {result.water.case.display_name}",
@@ -1585,6 +1757,17 @@ def render_rbfe_report(result: RBFEAnalysisResult) -> str:
         f"Final ddG: {_format_mean_sem(result.ddg_kcal_mol, result.propagated_sem_kcal_mol)} kcal/mol",
         f"Final ddG 95% CI: {_format_ci95(result.bootstrap_ci95)}",
     ]
+    if direct_metal:
+        from amber_metallo.ti.transformation import mass_path_description
+        bound_plan = result.bound.case.metadata["transformation"]
+        water_plan = result.water.case.metadata["transformation"]
+        lines[2:4] = ["Bound TI path: direct metal transformation", "Water TI path: direct metal transformation"]
+        lines[7] = lines[7].replace("Bound qoff:", "Bound metal transformation:")
+        lines[8] = "Bound vdwoff: N/A (direct metal path)"
+        lines.append("Sign: ddG = binding free energy of end metal minus source metal; negative favors the end metal.")
+        lines.append("Bound mass treatment: " + mass_path_description(bound_plan))
+        lines.append("Water mass treatment: " + mass_path_description(water_plan))
+        lines.append("Classical kinetic mass terms cancel for matching source/end masses at the same temperature.")
     bound_hysteresis = _case_max_hysteresis(result.bound)
     water_hysteresis = _case_max_hysteresis(result.water)
     if bound_hysteresis is not None or water_hysteresis is not None:
@@ -1818,8 +2001,473 @@ def _update_bound_library(result: SingleCaseAnalysisResult) -> None:
     _save_library_json(bound_library_path(), payload)
 
 
+def _write_tsv(path: Path, rows: list[dict[str, Any]], headers: list[str]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _simulation_legs(
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+) -> list[tuple[str, SingleCaseAnalysisResult]]:
+    return [item for item in singles if item[1].case.source_kind == SOURCE_KIND_SIMULATION]
+
+
+def _all_windows(result: SingleCaseAnalysisResult) -> list[AnalysisWindowResult]:
+    return [*result.qoff.windows, *result.vdwoff.windows]
+
+
+def _five_block_rows(
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for leg, result in _simulation_legs(singles):
+        for window in _all_windows(result):
+            row: dict[str, Any] = {
+                "leg": leg,
+                "run_id": window.run_id,
+                "replica": window.replica,
+                "direction": window.direction,
+                "phase": window.phase,
+                "lambda": f"{window.clambda:.6f}",
+                "mdout": str(window.mdout_path),
+                "discard_ns": f"{window.discard_ns:.6f}",
+                "sample_count": window.sample_count,
+                "block_count": window.block_count,
+                "sample_mean_dvdl": f"{window.sample_mean_dvdl:.10f}",
+                "five_block_sem_dvdl": f"{window.sem_dvdl:.10f}",
+            }
+            for block_index in range(_DEFAULT_BLOCK_COUNT):
+                row[f"block_{block_index + 1}_mean_dvdl"] = (
+                    f"{window.block_means[block_index]:.10f}"
+                    if block_index < len(window.block_means)
+                    else ""
+                )
+            rows.append(row)
+    return rows
+
+
+def _plot_five_blocks(
+    path: Path,
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+) -> Path:
+    grouped: dict[tuple[str, str, str, str], list[AnalysisWindowResult]] = {}
+    for leg, result in _simulation_legs(singles):
+        for window in _all_windows(result):
+            grouped.setdefault((leg, window.run_id, window.direction, window.phase), []).append(window)
+    figure, axes = plt.subplots(
+        max(1, len(grouped)),
+        1,
+        figsize=(8.0, max(3.2, 2.8 * max(1, len(grouped)))),
+        squeeze=False,
+    )
+    if not grouped:
+        axes[0][0].text(0.5, 0.5, "No simulation-backed windows", ha="center", va="center")
+        axes[0][0].set_axis_off()
+    for axis, (group_key, windows) in zip(axes[:, 0], sorted(grouped.items())):
+        leg, run_id, direction, phase = group_key
+        ordered = sorted(windows, key=lambda item: item.clambda)
+        lambdas = [item.clambda for item in ordered]
+        for block_index in range(_DEFAULT_BLOCK_COUNT):
+            block_points = [
+                item.block_means[block_index] if block_index < len(item.block_means) else float("nan")
+                for item in ordered
+            ]
+            axis.plot(lambdas, block_points, marker=".", alpha=0.65, label=f"block {block_index + 1}")
+        axis.errorbar(
+            lambdas,
+            [item.sample_mean_dvdl for item in ordered],
+            yerr=[item.sem_dvdl for item in ordered],
+            color="black",
+            marker="o",
+            linewidth=1.5,
+            capsize=3,
+            label="mean ± 5-block SEM",
+        )
+        axis.set_title(f"{leg}: {phase}, {direction} ({run_id})")
+        axis.set_xlabel("lambda")
+        axis.set_ylabel("DV/DL (kcal/mol)")
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize="small", ncol=3)
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+    return path
+
+
+def _metric_from_window_values(
+    windows: list[AnalysisWindowResult],
+    values_for_window: Any,
+) -> tuple[float, float] | None:
+    if not windows:
+        return (0.0, 0.0)
+    grouped: dict[str, list[AnalysisWindowResult]] = {}
+    for window in windows:
+        grouped.setdefault(window.run_id, []).append(window)
+    run_values: list[float] = []
+    run_sems: list[float] = []
+    for run_windows in grouped.values():
+        ordered = sorted(run_windows, key=lambda item: item.clambda)
+        means: list[float] = []
+        sems: list[float] = []
+        for window in ordered:
+            selected = values_for_window(window)
+            if not selected:
+                return None
+            stats = _window_statistics(list(selected))
+            means.append(stats[0])
+            sems.append(stats[2])
+        lambdas = [item.clambda for item in ordered]
+        weights = _trapezoid_weights(lambdas)
+        run_values.append(integrate_trapezoid(zip(lambdas, means)))
+        run_sems.append(math.sqrt(math.fsum((weight * sem) ** 2 for weight, sem in zip(weights, sems))))
+    run_count = len(run_values)
+    within_sem = math.sqrt(math.fsum(value**2 for value in run_sems)) / float(run_count)
+    between_sem = _sample_sem(run_values)
+    return _safe_mean(run_values), math.sqrt(within_sem**2 + between_sem**2)
+
+
+def _case_metric_from_window_values(
+    result: SingleCaseAnalysisResult,
+    values_for_window: Any,
+) -> dict[str, float] | None:
+    qoff = _metric_from_window_values(result.qoff.windows, values_for_window)
+    vdwoff = _metric_from_window_values(result.vdwoff.windows, values_for_window)
+    if qoff is None or vdwoff is None:
+        return None
+    total = qoff[0] + vdwoff[0]
+    total_sem = math.sqrt(qoff[1] ** 2 + vdwoff[1] ** 2)
+    correction = float(result.restraint_correction_kcal_mol or 0.0)
+    return {
+        "qoff_dg_kcal_mol": qoff[0],
+        "qoff_sem_kcal_mol": qoff[1],
+        "vdwoff_dg_kcal_mol": vdwoff[0],
+        "vdwoff_sem_kcal_mol": vdwoff[1],
+        "total_dg_kcal_mol": total,
+        "total_sem_kcal_mol": total_sem,
+        "reported_dg_kcal_mol": total + correction,
+        "reported_sem_kcal_mol": total_sem,
+    }
+
+
+def _cumulative_rows(
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+    *,
+    points: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    fractions = [index / float(points) for index in range(1, points + 1)]
+    for leg, result in _simulation_legs(singles):
+        for origin in ("start", "end"):
+            for fraction in fractions:
+                def select(window: AnalysisWindowResult, *, _fraction: float = fraction, _origin: str = origin) -> list[float]:
+                    count = max(1, math.ceil(len(window.sample_values) * _fraction))
+                    return window.sample_values[:count] if _origin == "start" else window.sample_values[-count:]
+
+                metric = _case_metric_from_window_values(result, select)
+                if metric is not None:
+                    rows.append({"leg": leg, "sample_origin": origin, "fraction": fraction, **metric})
+    return rows
+
+
+def _autocorrelation_statistics(values: list[float], interval_ps: float | None) -> dict[str, float | str]:
+    count = len(values)
+    if count < 2:
+        return {
+            "statistical_inefficiency_g": 1.0,
+            "integrated_autocorrelation_samples": 0.5,
+            "integrated_autocorrelation_ns": "",
+            "effective_sample_size": float(count),
+        }
+    centered = np.asarray(values, dtype=float) - float(np.mean(values))
+    if np.allclose(centered, 0.0):
+        g_value = 1.0
+    else:
+        fft_size = 1 << (2 * count - 1).bit_length()
+        spectrum = np.fft.rfft(centered, n=fft_size)
+        acf = np.fft.irfft(spectrum * np.conjugate(spectrum), n=fft_size)[:count].real
+        acf /= np.arange(count, 0, -1, dtype=float)
+        acf /= acf[0]
+        positive = acf[1:]
+        nonpositive = np.flatnonzero(positive <= 0.0)
+        stop = int(nonpositive[0]) if nonpositive.size else len(positive)
+        g_value = max(1.0, 1.0 + 2.0 * float(np.sum(positive[:stop])))
+    tau_samples = 0.5 * g_value
+    return {
+        "statistical_inefficiency_g": g_value,
+        "integrated_autocorrelation_samples": tau_samples,
+        "integrated_autocorrelation_ns": "" if interval_ps is None else tau_samples * interval_ps / 1000.0,
+        "effective_sample_size": float(count) / g_value,
+    }
+
+
+def _autocorrelation_rows(
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for leg, result in _simulation_legs(singles):
+        for window in _all_windows(result):
+            intervals = [
+                right - left
+                for left, right in zip(window.sample_times_ps[:-1], window.sample_times_ps[1:])
+                if math.isfinite(left) and math.isfinite(right) and right > left
+            ]
+            interval_ps = _safe_mean(intervals) if intervals else None
+            rows.append(
+                {
+                    "leg": leg,
+                    "run_id": window.run_id,
+                    "replica": window.replica,
+                    "direction": window.direction,
+                    "phase": window.phase,
+                    "lambda": window.clambda,
+                    "sample_count": len(window.sample_values),
+                    "sample_interval_ps": "" if interval_ps is None else interval_ps,
+                    **_autocorrelation_statistics(window.sample_values, interval_ps),
+                }
+            )
+    return rows
+
+
+def _values_after_window_discard(window: AnalysisWindowResult, discard_ns: float) -> list[float]:
+    values = window.original_sample_values
+    times = window.original_sample_times_ps
+    if discard_ns <= 0.0:
+        return list(values)
+    if not window.sample_times_available or len(times) != len(values):
+        return []
+    intervals = [right - left for left, right in pairwise(times) if right > left]
+    start_ps = times[0] - (_safe_mean(intervals) if intervals else 0.0)
+    cutoff_ps = discard_ns * 1000.0
+    return [value for value, time_ps in zip(values, times) if (time_ps - start_ps) > cutoff_ps]
+
+
+def _discard_sensitivity_rows(
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+    *,
+    selected_discard_ns: float,
+) -> list[dict[str, Any]]:
+    candidate_cutoffs = sorted({0.0, 0.05, 0.1, 0.2, 0.3, 0.5, selected_discard_ns})
+    rows: list[dict[str, Any]] = []
+    for leg, result in _simulation_legs(singles):
+        for cutoff_ns in candidate_cutoffs:
+            metric = _case_metric_from_window_values(
+                result,
+                lambda window, _cutoff=cutoff_ns: _values_after_window_discard(window, _cutoff),
+            )
+            if metric is not None:
+                rows.append({"leg": leg, "discard_ns": cutoff_ns, **metric})
+    return rows
+
+
+def _append_rbfe_difference_rows(
+    rows: list[dict[str, Any]],
+    *,
+    keys: tuple[str, ...],
+) -> None:
+    bound_rows = {tuple(row[key] for key in keys): row for row in rows if row["leg"] == "bound"}
+    water_rows = {tuple(row[key] for key in keys): row for row in rows if row["leg"] == "water"}
+    for key in sorted(bound_rows.keys() & water_rows.keys()):
+        bound = bound_rows[key]
+        water = water_rows[key]
+        rows.append(
+            {
+                "leg": "rbfe_ddg",
+                **{name: value for name, value in zip(keys, key)},
+                "reported_dg_kcal_mol": bound["reported_dg_kcal_mol"] - water["reported_dg_kcal_mol"],
+                "reported_sem_kcal_mol": math.sqrt(
+                    bound["reported_sem_kcal_mol"] ** 2 + water["reported_sem_kcal_mol"] ** 2
+                ),
+                "qoff_dg_kcal_mol": "",
+                "qoff_sem_kcal_mol": "",
+                "vdwoff_dg_kcal_mol": "",
+                "vdwoff_sem_kcal_mol": "",
+                "total_dg_kcal_mol": "",
+                "total_sem_kcal_mol": "",
+            }
+        )
+
+
+def _plot_profile(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    x_key: str,
+    series_keys: tuple[str, ...],
+    x_label: str,
+    y_label: str,
+) -> Path:
+    figure, axis = plt.subplots(figsize=(8.0, 4.8))
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(tuple(row.get(key, "") for key in series_keys), []).append(row)
+    for key, group in sorted(grouped.items(), key=lambda item: tuple(str(value) for value in item[0])):
+        ordered = sorted(group, key=lambda item: float(item[x_key]))
+        axis.errorbar(
+            [float(item[x_key]) for item in ordered],
+            [float(item["reported_dg_kcal_mol"]) for item in ordered],
+            yerr=[float(item["reported_sem_kcal_mol"]) for item in ordered],
+            marker="o",
+            capsize=3,
+            label=" / ".join(str(value) for value in key),
+        )
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.grid(alpha=0.25)
+    if grouped:
+        axis.legend(fontsize="small")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+    return path
+
+
+_METRIC_HEADERS = [
+    "leg",
+    "sample_origin",
+    "fraction",
+    "discard_ns",
+    "qoff_dg_kcal_mol",
+    "qoff_sem_kcal_mol",
+    "vdwoff_dg_kcal_mol",
+    "vdwoff_sem_kcal_mol",
+    "total_dg_kcal_mol",
+    "total_sem_kcal_mol",
+    "reported_dg_kcal_mol",
+    "reported_sem_kcal_mol",
+]
+
+
+def _persist_numerical_diagnostics(
+    *,
+    output_dir: Path,
+    singles: list[tuple[str, SingleCaseAnalysisResult]],
+    convergence_options: ConvergenceAnalysisOptions,
+    include_rbfe_difference: bool,
+) -> list[dict[str, str]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: list[dict[str, str]] = []
+    block_headers = [
+        "leg", "run_id", "replica", "direction", "phase", "lambda", "mdout", "discard_ns",
+        "sample_count", "block_count", "sample_mean_dvdl", "five_block_sem_dvdl",
+        *[f"block_{index}_mean_dvdl" for index in range(1, _DEFAULT_BLOCK_COUNT + 1)],
+    ]
+    block_rows = _five_block_rows(singles)
+    _write_tsv(output_dir / "window_5block_sem.tsv", block_rows, block_headers)
+    _plot_five_blocks(output_dir / "window_5block_sem.png", singles)
+    artifacts.extend(
+        [
+            {
+                "path": str(output_dir / "window_5block_sem.tsv"),
+                "meaning": "Five contiguous time-block means and their per-window SEM for every TI lambda window.",
+            },
+            {
+                "path": str(output_dir / "window_5block_sem.png"),
+                "meaning": "DV/DL versus lambda for the five time blocks, with the full-window mean and 5-block SEM.",
+            },
+        ]
+    )
+    if not convergence_options.enabled:
+        return artifacts
+
+    cumulative = _cumulative_rows(singles, points=convergence_options.cumulative_points)
+    if include_rbfe_difference:
+        _append_rbfe_difference_rows(cumulative, keys=("sample_origin", "fraction"))
+    _write_tsv(output_dir / "cumulative_dg.tsv", cumulative, _METRIC_HEADERS)
+    _plot_profile(
+        output_dir / "cumulative_dg.png",
+        cumulative,
+        x_key="fraction",
+        series_keys=("leg", "sample_origin"),
+        x_label="Fraction of retained production samples",
+        y_label="Delta G (kcal/mol)",
+    )
+
+    autocorrelation = _autocorrelation_rows(singles)
+    autocorrelation_headers = [
+        "leg", "run_id", "replica", "direction", "phase", "lambda", "sample_count",
+        "sample_interval_ps", "statistical_inefficiency_g", "integrated_autocorrelation_samples",
+        "integrated_autocorrelation_ns", "effective_sample_size",
+    ]
+    _write_tsv(output_dir / "window_autocorrelation.tsv", autocorrelation, autocorrelation_headers)
+    figure, axis = plt.subplots(figsize=(8.0, 4.8))
+    autocorrelation_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in autocorrelation:
+        autocorrelation_groups.setdefault((row["leg"], row["phase"], row["direction"]), []).append(row)
+    for key, group in sorted(autocorrelation_groups.items()):
+        ordered = sorted(group, key=lambda item: float(item["lambda"]))
+        axis.plot(
+            [float(item["lambda"]) for item in ordered],
+            [float(item["effective_sample_size"]) for item in ordered],
+            marker="o",
+            label=" / ".join(key),
+        )
+    axis.set_xlabel("lambda")
+    axis.set_ylabel("Effective sample size")
+    axis.grid(alpha=0.25)
+    if autocorrelation_groups:
+        axis.legend(fontsize="small")
+    figure.tight_layout()
+    figure.savefig(output_dir / "window_autocorrelation.png", dpi=180)
+    plt.close(figure)
+
+    discard = _discard_sensitivity_rows(
+        singles,
+        selected_discard_ns=convergence_options.discard_ns,
+    )
+    if include_rbfe_difference:
+        _append_rbfe_difference_rows(discard, keys=("discard_ns",))
+    _write_tsv(output_dir / "discard_sensitivity.tsv", discard, _METRIC_HEADERS)
+    _plot_profile(
+        output_dir / "discard_sensitivity.png",
+        discard,
+        x_key="discard_ns",
+        series_keys=("leg",),
+        x_label="Discarded production time (ns)",
+        y_label="Delta G (kcal/mol)",
+    )
+    artifacts.extend(
+        [
+            {
+                "path": str(output_dir / "cumulative_dg.tsv"),
+                "meaning": "Delta G and propagated SEM as increasing fractions are taken from the start or end of production.",
+            },
+            {
+                "path": str(output_dir / "cumulative_dg.png"),
+                "meaning": "Temporal cumulative Delta G profiles from both ends of production.",
+            },
+            {
+                "path": str(output_dir / "window_autocorrelation.tsv"),
+                "meaning": "Per-window autocorrelation time, statistical inefficiency, and effective sample size.",
+            },
+            {
+                "path": str(output_dir / "window_autocorrelation.png"),
+                "meaning": "Effective sample size across lambda windows.",
+            },
+            {
+                "path": str(output_dir / "discard_sensitivity.tsv"),
+                "meaning": "Delta G and propagated SEM recalculated after several production-time discard cutoffs.",
+            },
+            {
+                "path": str(output_dir / "discard_sensitivity.png"),
+                "meaning": "Delta G sensitivity to the amount of production discarded.",
+            },
+        ]
+    )
+    return artifacts
+
+
 def _persist_single_case_result(result: SingleCaseAnalysisResult) -> SingleCaseAnalysisResult:
     result.output_dir.mkdir(parents=True, exist_ok=True)
+    result.analysis_artifacts = _persist_numerical_diagnostics(
+        output_dir=result.output_dir,
+        singles=[(result.case.case_type, result)],
+        convergence_options=result.convergence_options,
+        include_rbfe_difference=False,
+    )
     write_json(result.output_dir / "abfe_summary.json", result.to_dict())
     csv_rows: list[dict[str, Any]] = []
     for phase in (result.qoff, result.vdwoff):
@@ -1852,13 +2500,20 @@ def _persist_single_case_result(result: SingleCaseAnalysisResult) -> SingleCaseA
             )
     _write_windows_csv(result.output_dir / "abfe_windows.csv", csv_rows)
     (result.output_dir / "abfe_report.txt").write_text(render_single_case_report(result), encoding="utf-8")
-    _update_water_ref_library(result)
-    _update_bound_library(result)
+    if not (result.case.metadata.get("transformation") or {}).get("mode") == "metal":
+        _update_water_ref_library(result)
+        _update_bound_library(result)
     return result
 
 
 def _persist_rbfe_result(result: RBFEAnalysisResult) -> RBFEAnalysisResult:
     result.output_dir.mkdir(parents=True, exist_ok=True)
+    result.analysis_artifacts = _persist_numerical_diagnostics(
+        output_dir=result.output_dir,
+        singles=[("bound", result.bound), ("water", result.water)],
+        convergence_options=result.convergence_options,
+        include_rbfe_difference=True,
+    )
     write_json(result.output_dir / "rbfe_summary.json", result.to_dict())
     csv_rows: list[dict[str, Any]] = []
     for leg_name, single in (("bound", result.bound), ("water", result.water)):
@@ -1900,8 +2555,10 @@ def analyze_single_case(
     *,
     case_type: str | None = None,
     sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY,
+    convergence_options: ConvergenceAnalysisOptions | None = None,
 ) -> SingleCaseAnalysisResult:
     sampling_selection = _normalize_sampling_selection(sampling_selection)
+    resolved_convergence = convergence_options or ConvergenceAnalysisOptions()
     case = _resolve_case(case_or_root, case_type=case_type)
     if case.source_kind == SOURCE_KIND_LIBRARY:
         return _result_from_library_case(case, sampling_selection=sampling_selection)
@@ -1914,8 +2571,18 @@ def analyze_single_case(
         expectations = [item for item in expectations if item.direction == "forward"]
         if not expectations:
             raise ValueError("No forward TI windows were found in this case.")
-    qoff = _phase_analysis("qoff", expectations, seed_label=f"{case.root}:{sampling_selection}:qoff")
-    vdwoff = _phase_analysis("vdwoff", expectations, seed_label=f"{case.root}:{sampling_selection}:vdwoff")
+    qoff = _phase_analysis(
+        "qoff",
+        expectations,
+        seed_label=f"{case.root}:{sampling_selection}:qoff",
+        discard_ns=resolved_convergence.discard_ns,
+    )
+    vdwoff = _phase_analysis(
+        "vdwoff",
+        expectations,
+        seed_label=f"{case.root}:{sampling_selection}:vdwoff",
+        discard_ns=resolved_convergence.discard_ns,
+    )
     total_delta_g = qoff.delta_g_kcal_mol + vdwoff.delta_g_kcal_mol
     total_sem = math.sqrt(qoff.propagated_sem_kcal_mol**2 + vdwoff.propagated_sem_kcal_mol**2)
     total_bootstrap = _combine_bootstrap_samples(
@@ -1939,6 +2606,7 @@ def analyze_single_case(
         quality=quality,
         warnings=warnings,
         bootstrap_samples=total_bootstrap,
+        convergence_options=resolved_convergence,
     )
     if case.case_type == CASE_TYPE_BOUND:
         correction = float(case.metadata.get("restraint_correction_kcal_mol") or 0.0)
@@ -1956,8 +2624,10 @@ def analyze_rbfe(
     water_case_or_root: AnalysisCaseDiscovery | str | Path,
     *,
     sampling_selection: str = SAMPLING_SELECTION_FORWARD_ONLY,
+    convergence_options: ConvergenceAnalysisOptions | None = None,
 ) -> RBFEAnalysisResult:
     sampling_selection = _normalize_sampling_selection(sampling_selection)
+    resolved_convergence = convergence_options or ConvergenceAnalysisOptions()
     bound_case = _resolve_case(bound_case_or_root, case_type=CASE_TYPE_BOUND)
     if not bound_case.selectable:
         raise ValueError(bound_case.readiness_note)
@@ -1971,6 +2641,7 @@ def analyze_rbfe(
         bound_case,
         case_type=CASE_TYPE_BOUND,
         sampling_selection=sampling_selection,
+        convergence_options=resolved_convergence,
     )
     if isinstance(water_case, AnalysisCaseDiscovery) and water_case.source_kind == SOURCE_KIND_LIBRARY:
         water = _result_from_library_case(water_case, sampling_selection=sampling_selection)
@@ -1979,6 +2650,7 @@ def analyze_rbfe(
             water_case,
             case_type=CASE_TYPE_WATER,
             sampling_selection=sampling_selection,
+            convergence_options=resolved_convergence,
         )
     corrected_bound = bound.corrected_delta_g_kcal_mol if bound.corrected_delta_g_kcal_mol is not None else bound.delta_g_kcal_mol
     corrected_bound_sem = (
@@ -2008,8 +2680,33 @@ def analyze_rbfe(
         quality=quality,
         warnings=warnings,
         bootstrap_samples=ddg_bootstrap,
+        convergence_options=resolved_convergence,
     )
     return _persist_rbfe_result(result)
+
+
+def _relative_artifact_path(path: str, root: Path) -> str:
+    target = Path(path)
+    try:
+        relative = target.resolve().relative_to(root.resolve())
+    except ValueError:
+        relative = Path(target.name)
+    return f"./{relative.as_posix()}"
+
+
+def _print_artifacts(
+    artifacts: list[dict[str, str]],
+    *,
+    root: Path,
+    label: str | None = None,
+) -> None:
+    if not artifacts:
+        return
+    if label:
+        console.print(f"[dim]{label} outputs:[/dim]")
+    for artifact in artifacts:
+        relative = _relative_artifact_path(artifact["path"], root)
+        console.print(f"[dim]{relative} — {artifact['meaning']}[/dim]")
 
 
 def print_analysis_summary(
@@ -2018,156 +2715,76 @@ def print_analysis_summary(
     | list[SingleCaseAnalysisResult]
     | list[RBFEAnalysisResult],
 ) -> None:
-    if Table is None:
-        if isinstance(result, list):
-            console.print(json.dumps([item.to_dict() for item in result], indent=2))
-            return
-        console.print(json.dumps(result.to_dict(), indent=2))
+    results = result if isinstance(result, list) else [result]
+    if not results:
         return
-    if isinstance(result, list):
-        if result and all(isinstance(item, RBFEAnalysisResult) for item in result):
-            rbfe_results = [item for item in result if isinstance(item, RBFEAnalysisResult)]
-            table = Table(title="Batch RBFE", box=box.SIMPLE_HEAVY)
-            table.add_column("Bound case", style="bold white")
-            table.add_column("Water reference", style="white")
-            table.add_column("ddG", style="cyan", justify="right")
-            table.add_column("SEM", style="green", justify="right")
-            table.add_column("95% CI", style="magenta", justify="right")
-            table.add_column("Bound |F-R|", style="yellow", justify="right")
-            table.add_column("Water |F-R|", style="yellow", justify="right")
-            for item in rbfe_results:
-                table.add_row(
-                    item.bound.case.display_name,
-                    item.water.case.display_name,
-                    f"{item.ddg_kcal_mol:.6f}",
-                    f"{item.propagated_sem_kcal_mol:.6f}",
-                    _format_ci95(item.bootstrap_ci95),
-                    _format_mean_sem(_case_max_hysteresis(item.bound), None),
-                    _format_mean_sem(_case_max_hysteresis(item.water), None),
-                )
-            console.print(table)
-            console.print(
-                f"[dim]Analyzed {len(rbfe_results)} RBFE pair(s). Individual outputs were saved under each "
-                "bound case's analysis directory.[/dim]"
+    if Table is None:
+        for item in results:
+            if isinstance(item, RBFEAnalysisResult):
+                console.print(f"{item.bound.case.display_name}: ddG={item.ddg_kcal_mol:.6f}, SEM={item.propagated_sem_kcal_mol:.6f}")
+                _print_artifacts(item.analysis_artifacts, root=item.bound.case.root)
+            else:
+                console.print(f"{item.case.display_name}: dG={item.delta_g_kcal_mol:.6f}, SEM={item.propagated_sem_kcal_mol:.6f}")
+                _print_artifacts(item.analysis_artifacts, root=item.case.root)
+        return
+
+    if all(isinstance(item, RBFEAnalysisResult) for item in results):
+        rbfe_results = [item for item in results if isinstance(item, RBFEAnalysisResult)]
+        table = Table(title="RBFE" if len(rbfe_results) == 1 else "Batch RBFE", box=box.SIMPLE_HEAVY)
+        table.add_column("Bound case", style="bold white")
+        table.add_column("Water reference", style="white")
+        table.add_column("DeltaG (kcal/mol)", style="cyan", justify="right")
+        table.add_column("SEM (kcal/mol)", style="green", justify="right")
+        for item in rbfe_results:
+            table.add_row(
+                item.bound.case.display_name,
+                item.water.case.display_name,
+                f"{item.ddg_kcal_mol:.6f}",
+                f"{item.propagated_sem_kcal_mol:.6f}",
             )
-            return
-        table = Table(title="Batch Single-Case dG", box=box.SIMPLE_HEAVY)
+        console.print(table)
+        for item in rbfe_results:
+            _print_artifacts(
+                item.analysis_artifacts,
+                root=item.bound.case.root,
+                label=item.bound.case.display_name if len(rbfe_results) > 1 else None,
+            )
+        return
+
+    single_results = [item for item in results if isinstance(item, SingleCaseAnalysisResult)]
+    if len(single_results) > 1:
+        table = Table(title="Batch Single-Case DeltaG", box=box.SIMPLE_HEAVY)
         table.add_column("Case", style="bold white")
-        table.add_column("Type", style="white")
-        table.add_column("Scheme", style="magenta")
-        table.add_column("qoff", style="cyan", justify="right")
-        table.add_column("vdwoff", style="cyan", justify="right")
-        table.add_column("Total dG", style="cyan", justify="right")
-        table.add_column("SEM", style="green", justify="right")
-        table.add_column("95% CI", style="magenta", justify="right")
-        for item in result:
-            scheme = decoupling_scheme_for_result(item)
-            vdwoff_value = "N/A" if scheme == DECOUPLING_SCHEME_COMBINED else f"{item.vdwoff.delta_g_kcal_mol:.6f}"
+        table.add_column("DeltaG (kcal/mol)", style="cyan", justify="right")
+        table.add_column("SEM (kcal/mol)", style="green", justify="right")
+        for item in single_results:
             table.add_row(
                 item.case.display_name,
-                item.case.case_type,
-                _decoupling_scheme_detail(scheme),
-                f"{item.qoff.delta_g_kcal_mol:.6f}",
-                vdwoff_value,
                 f"{item.delta_g_kcal_mol:.6f}",
                 f"{item.propagated_sem_kcal_mol:.6f}",
-                _format_ci95(item.bootstrap_ci95),
             )
         console.print(table)
-        console.print(
-            f"[dim]Analyzed {len(result)} completed TI case(s). Individual outputs were saved under each "
-            "case's analysis directory.[/dim]"
-        )
+        for item in single_results:
+            _print_artifacts(item.analysis_artifacts, root=item.case.root, label=item.case.display_name)
         return
-    if isinstance(result, SingleCaseAnalysisResult):
-        title = "Single-Case dG"
-        table = Table(title=title, box=box.SIMPLE_HEAVY)
-        table.add_column("Component", style="bold white")
-        table.add_column("DeltaG (kcal/mol)", style="cyan", justify="right")
-        table.add_column("Propagated SEM", style="green", justify="right")
-        table.add_column("95% CI", style="magenta", justify="right")
-        decoupling_scheme = decoupling_scheme_for_result(result)
-        rows: list[tuple[str, float | None, float | None, ConfidenceInterval | None]] = [
-            ("qoff", result.qoff.delta_g_kcal_mol, result.qoff.propagated_sem_kcal_mol, result.qoff.bootstrap_ci95),
-        ]
-        if decoupling_scheme == DECOUPLING_SCHEME_COMBINED:
-            rows.append(("vdwoff", None, None, None))
-        else:
-            rows.append(("vdwoff", result.vdwoff.delta_g_kcal_mol, result.vdwoff.propagated_sem_kcal_mol, result.vdwoff.bootstrap_ci95))
-        rows.append(("Total dG", result.delta_g_kcal_mol, result.propagated_sem_kcal_mol, result.bootstrap_ci95))
-        if result.restraint_correction_kcal_mol is not None:
-            rows.append(("Restraint correction", result.restraint_correction_kcal_mol, 0.0, None))
-            rows.append(
-                (
-                    "Corrected bound dG",
-                    result.corrected_delta_g_kcal_mol or 0.0,
-                    result.corrected_propagated_sem_kcal_mol or 0.0,
-                    result.corrected_bootstrap_ci95,
-                )
-            )
-        for name, value, sem, ci95 in rows:
-            table.add_row(
-                name,
-                "N/A" if value is None else f"{value:.6f}",
-                "N/A" if sem is None else f"{sem:.6f}",
-                _format_ci95(ci95),
-            )
-        console.print(table)
-        console.print(f"[dim]TI decoupling: {_decoupling_scheme_detail(decoupling_scheme)}[/dim]")
-        if result.qoff.sampling_runs:
-            sweep_table = Table(title="Bidirectional sweep diagnostics", box=box.SIMPLE)
-            sweep_table.add_column("Direction", style="bold white")
-            sweep_table.add_column("DeltaG (kcal/mol)", style="cyan", justify="right")
-            sweep_table.add_column("Status", style="yellow")
-            for sampling_run in result.qoff.sampling_runs:
-                sweep_table.add_row(
-                    str(sampling_run.get("direction") or "unknown"),
-                    f"{float(sampling_run.get('delta_g_kcal_mol', 0.0)):.6f}",
-                    "APPROXIMATE (forward lambda=0 substituted)"
-                    if sampling_run.get("approximate")
-                    else "complete",
-                )
-            if result.qoff.forward_reverse_difference_kcal_mol is not None:
-                sweep_table.add_row(
-                    "hysteresis |F-R|",
-                    f"{result.qoff.forward_reverse_difference_kcal_mol:.6f}",
-                    "diagnostic",
-                )
-            console.print(sweep_table)
-        selected_sites = result.case.metadata.get("selected_sites") or []
-        if selected_sites:
-            metals = "; ".join(
-                f"site {item.get('site')} {item.get('element')} atom {item.get('atom_index')}"
-                for item in selected_sites
-                if isinstance(item, dict)
-            )
-            console.print(f"[dim]Selected metal(s): {metals}[/dim]")
-            if len(selected_sites) > 1:
-                console.print("[dim]Multi-site all-at-once result: total dG only, not per-metal decomposition.[/dim]")
-        console.print(f"[dim]Saved analysis outputs to {result.output_dir}[/dim]")
-        for warning in result.warnings:
-            console.print(f"[bold yellow]Warning:[/bold yellow] {warning}")
-        return
-    table = Table(title="RBFE", box=box.SIMPLE_HEAVY)
+
+    single = single_results[0]
+    table = Table(title="Single-Case DeltaG", box=box.SIMPLE_HEAVY)
     table.add_column("Component", style="bold white")
-    table.add_column("Value (kcal/mol)", style="cyan", justify="right")
-    table.add_column("Propagated SEM", style="green", justify="right")
-    table.add_column("95% CI", style="magenta", justify="right")
-    table.add_row(
-        "Bound corrected",
-        f"{(result.bound.corrected_delta_g_kcal_mol or result.bound.delta_g_kcal_mol):.6f}",
-        f"{(result.bound.corrected_propagated_sem_kcal_mol or result.bound.propagated_sem_kcal_mol):.6f}",
-        _format_ci95(result.bound.corrected_bootstrap_ci95 or result.bound.bootstrap_ci95),
-    )
-    table.add_row(
-        "Water",
-        f"{result.water.delta_g_kcal_mol:.6f}",
-        f"{result.water.propagated_sem_kcal_mol:.6f}",
-        _format_ci95(result.water.bootstrap_ci95),
-    )
-    table.add_row("Final ddG", f"{result.ddg_kcal_mol:.6f}", f"{result.propagated_sem_kcal_mol:.6f}", _format_ci95(result.bootstrap_ci95))
+    table.add_column("DeltaG (kcal/mol)", style="cyan", justify="right")
+    table.add_column("SEM (kcal/mol)", style="green", justify="right")
+    scheme = decoupling_scheme_for_result(single)
+    direct_metal = (single.case.metadata.get("transformation") or {}).get("mode") == "metal"
+    table.add_row("Metal transformation" if direct_metal else "qoff",
+                  f"{single.qoff.delta_g_kcal_mol:.6f}", f"{single.qoff.propagated_sem_kcal_mol:.6f}")
+    if scheme != DECOUPLING_SCHEME_COMBINED:
+        table.add_row("vdwoff", f"{single.vdwoff.delta_g_kcal_mol:.6f}", f"{single.vdwoff.propagated_sem_kcal_mol:.6f}")
+    table.add_row("Total", f"{single.delta_g_kcal_mol:.6f}", f"{single.propagated_sem_kcal_mol:.6f}")
+    if single.corrected_delta_g_kcal_mol is not None:
+        table.add_row(
+            "Corrected bound",
+            f"{single.corrected_delta_g_kcal_mol:.6f}",
+            f"{(single.corrected_propagated_sem_kcal_mol or 0.0):.6f}",
+        )
     console.print(table)
-    console.print(f"[dim]Bound TI decoupling: {_decoupling_scheme_detail(decoupling_scheme_for_result(result.bound))}[/dim]")
-    console.print(f"[dim]Water TI decoupling: {_decoupling_scheme_detail(decoupling_scheme_for_result(result.water))}[/dim]")
-    console.print("[dim]ddG = (dG_bound_ti + restraint_correction) - dG_water[/dim]")
-    console.print(f"[dim]Saved analysis outputs to {result.output_dir}[/dim]")
+    _print_artifacts(single.analysis_artifacts, root=single.case.root)

@@ -159,6 +159,8 @@ class TrajectoryAnalysisRequest:
     nbins: int = 75
     rdf_range: tuple[float, float] = (0.0, 12.0)
     label: str | None = None
+    metal_indices_by_case: dict[str, list[int]] = field(default_factory=dict)  # one-based topology atoms
+    coordination_cutoff_angstrom: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -166,6 +168,8 @@ class TrajectoryFrameSelection:
     stride: int = 1
     last_ns: float | None = None
     last_frames: int | None = None
+    start_ns: float | None = None
+    end_ns: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stride", int(self.stride))
@@ -175,12 +179,19 @@ class TrajectoryFrameSelection:
             object.__setattr__(self, "last_frames", int(self.last_frames))
         if self.stride < 1:
             raise ValueError("Frame stride must be a positive integer")
-        if self.last_ns is not None and self.last_ns <= 0:
+        if self.last_ns is not None and (not math.isfinite(self.last_ns) or self.last_ns <= 0):
             raise ValueError("Last-ns window must be positive")
         if self.last_frames is not None and self.last_frames < 1:
             raise ValueError("Last-frame window must be a positive integer")
         if self.last_ns is not None and self.last_frames is not None:
             raise ValueError("Choose either last_ns or last_frames, not both")
+        if (self.start_ns is None) != (self.end_ns is None):
+            raise ValueError("Specify both start_ns and end_ns")
+        if self.start_ns is not None:
+            if self.last_ns is not None or self.last_frames is not None:
+                raise ValueError("Explicit time range cannot be combined with a last-N window")
+            if not all(math.isfinite(v) for v in (self.start_ns, self.end_ns)) or not 0 <= self.start_ns < self.end_ns:
+                raise ValueError("Time range must be finite with 0 <= start_ns < end_ns")
 
 
 @dataclass(frozen=True)
@@ -215,6 +226,8 @@ class _ComputedAnalysis:
     y_label: str
     title: str
     stats: dict[str, float | int | str]
+    series_column: str | None = None
+    summary_rows: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -629,7 +642,9 @@ def validate_selection_across_cases(
 
 def describe_frame_selection(frame_selection: TrajectoryFrameSelection | None = None) -> str:
     selection = frame_selection or TrajectoryFrameSelection()
-    if selection.last_ns is not None:
+    if selection.start_ns is not None:
+        window = f"{selection.start_ns:g} to {selection.end_ns:g} ns"
+    elif selection.last_ns is not None:
         window = f"last {selection.last_ns:g} ns"
     elif selection.last_frames is not None:
         window = f"last {selection.last_frames} frames"
@@ -662,13 +677,23 @@ def _trajectory_dt_ps(universe: Any, time_step_ps: float) -> float:
     return time_step_ps
 
 
+def configure_fallback_frame_time(universe: Any, time_step_ps: float) -> None:
+    """ASCII Amber mdcrd has no timestamps; its reader's 1 ps default is not data."""
+    if not math.isfinite(time_step_ps) or time_step_ps <= 0:
+        raise ValueError("Time between trajectory frames must be finite and positive")
+    formats = getattr(universe.trajectory, "format", "")
+    formats = [formats] if isinstance(formats, str) else formats
+    if any(str(fmt).upper() in {"TRJ", "MDCRD", "CRDBOX"} for fmt in formats):
+        universe.trajectory.ts.dt = time_step_ps
+
+
 def _resolve_frame_selection(
     universe: Any,
     frame_selection: TrajectoryFrameSelection | None,
     *,
     time_step_ps: float,
 ) -> _ResolvedFrameSelection:
-    if time_step_ps <= 0:
+    if not math.isfinite(time_step_ps) or time_step_ps <= 0:
         raise ValueError("Time between trajectory frames must be positive")
     selection = frame_selection or TrajectoryFrameSelection()
     total_frames = len(universe.trajectory)
@@ -684,10 +709,25 @@ def _resolve_frame_selection(
         start = max(0, total_frames - frame_count)
 
     stop = total_frames
+    if selection.start_ns is not None or (selection.last_ns is not None and hasattr(universe.trajectory, "__getitem__")):
+        saved = getattr(universe.trajectory, "frame", 0)
+        try:
+            times = np.asarray([_frame_time(universe.trajectory[i], i, time_step_ps) / 1000.
+                                for i in range(total_frames)])
+        finally:
+            universe.trajectory[saved]
+        if not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0):
+            raise ValueError("Time-window selection requires finite, strictly increasing trajectory times.")
+        low = selection.start_ns if selection.start_ns is not None else times[-1] - selection.last_ns
+        high = selection.end_ns if selection.end_ns is not None else times[-1]
+        start = int(np.searchsorted(times, low - 1e-10, side="left"))
+        stop = int(np.searchsorted(times, high + 1e-10, side="right"))
     analyzed_frames = len(range(start, stop, selection.stride))
     if analyzed_frames < 1:
         raise ValueError("Frame selection did not include any trajectory frames")
-    if selection.last_ns is not None:
+    if selection.start_ns is not None:
+        window_label = f"{selection.start_ns:g} to {selection.end_ns:g} ns (inclusive saved times)"
+    elif selection.last_ns is not None:
         window_label = f"last {selection.last_ns:g} ns"
     elif selection.last_frames is not None:
         window_label = f"last {selection.last_frames} frames"
@@ -875,6 +915,9 @@ def calculate_rmsd(
     frame_selection: TrajectoryFrameSelection | None = None,
 ) -> _ComputedAnalysis:
     _, rms, _, _ = _import_mdanalysis_analysis()
+    # Alignment may modify MemoryReader coordinates. Other requested analyses
+    # (especially PBC-sensitive metal contacts) must see the original frames.
+    universe = universe.copy()
     _select_nonempty(universe, target_selection, "RMSD target")
     _select_nonempty(universe, alignment_selection, "RMSD alignment")
     frame_info = _resolve_frame_selection(universe, frame_selection, time_step_ps=time_step_ps)
@@ -883,7 +926,8 @@ def calculate_rmsd(
     except Exception:
         pass
     groupselections = None if target_selection == alignment_selection else [target_selection]
-    analysis = rms.RMSD(universe, universe, select=alignment_selection, groupselections=groupselections)
+    analysis = rms.RMSD(universe, universe, select=alignment_selection, groupselections=groupselections,
+                        ref_frame=frame_info.start)
     analysis.run(start=frame_info.start, stop=frame_info.stop, step=frame_info.step)
     data = np.asarray(analysis.results.rmsd, dtype=float)
     rmsd_column = 3 if groupselections else 2
@@ -915,6 +959,7 @@ def calculate_rmsf(
     frame_selection: TrajectoryFrameSelection | None = None,
 ) -> _ComputedAnalysis:
     align, rms, _, _ = _import_mdanalysis_analysis()
+    universe = universe.copy()
     target_atoms = _select_nonempty(universe, target_selection, "RMSF target")
     _select_nonempty(universe, alignment_selection, "RMSF alignment")
     frame_info = _resolve_frame_selection(universe, frame_selection, time_step_ps=time_step_ps)
@@ -1048,7 +1093,7 @@ def _write_csv(path: Path, rows: Sequence[dict[str, object]]) -> None:
             if key not in fieldnames:
                 fieldnames.append(key)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t" if path.suffix == ".tsv" else ",")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -1058,6 +1103,25 @@ def _write_plot(path: Path, result: _ComputedAnalysis, *, case_label: str) -> No
     if result.x_column is None or result.y_column is None:
         return
     plt = _import_pyplot()
+    if result.series_column:
+        groups = {}
+        for row in result.rows:
+            groups.setdefault(str(row[result.series_column]), []).append(row)
+        # Paginate rather than hide contacts or produce an unreadable legend.
+        items = list(groups.items())
+        for offset in range(0, len(items), 12):
+            fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
+            for label, rows in items[offset:offset + 12]:
+                ax.plot([float(r[result.x_column]) for r in rows],
+                        [float(r[result.y_column]) for r in rows], label=label, linewidth=1)
+            ax.axhline(float(result.stats["cutoff_angstrom"]), color="black", linestyle="--", label="cutoff")
+            ax.set(xlabel=result.x_label, ylabel=result.y_label, title=f"{case_label}: {result.title}")
+            ax.legend(fontsize="x-small", ncol=2)
+            ax.grid(alpha=.25)
+            target = path if offset == 0 else path.with_stem(f"{path.stem}_page_{offset // 12 + 1}")
+            fig.savefig(target, dpi=180)
+            plt.close(fig)
+        return
     x_values = [float(row[result.x_column]) for row in result.rows]
     y_values = [float(row[result.y_column]) for row in result.rows]
     fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
@@ -1116,7 +1180,7 @@ def _write_overlay_plots(output_root: Path, outputs: Sequence[AnalysisOutput]) -
     overlay_paths: list[Path] = []
     by_analysis: dict[str, list[AnalysisOutput]] = {}
     for output in outputs:
-        if output.x_column and output.y_column and output.analysis_type != "rmsf":
+        if output.x_column and output.y_column and output.analysis_type != "rmsf" and not output.analysis_type.startswith("metal_"):
             by_analysis.setdefault(output.analysis_type, []).append(output)
     for analysis_type, grouped in sorted(by_analysis.items()):
         if len(grouped) < 2:
@@ -1174,12 +1238,16 @@ def run_trajectory_analyses(
         raise ValueError("At least one trajectory case is required")
     if not requests:
         raise ValueError("At least one trajectory analysis request is required")
+    if len({case.label for case in cases}) != len(cases):
+        raise ValueError("Trajectory case labels must be unique to avoid ambiguous selections/output overwrites")
     frame_selection = frame_selection or TrajectoryFrameSelection()
     output_root = output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     loaded_universes = list(universes) if universes is not None else [load_universe(case) for case in cases]
     if len(loaded_universes) != len(cases):
         raise ValueError("case and universe counts do not match")
+    for universe in loaded_universes:
+        configure_fallback_frame_time(universe, time_step_ps)
     profiles = [build_case_profile(case.label, universe) for case, universe in zip(cases, loaded_universes)]
     check_case_compatibility(profiles)
 
@@ -1189,30 +1257,42 @@ def run_trajectory_analyses(
         case_dir.mkdir(parents=True, exist_ok=True)
         case_outputs: list[AnalysisOutput] = []
         for request in requests:
-            computed = _compute_analysis(
-                universe,
-                request,
-                time_step_ps=time_step_ps,
-                frame_selection=frame_selection,
-            )
-            csv_path = case_dir / f"{computed.slug}.csv"
-            png_path = case_dir / f"{computed.slug}.png"
-            _write_csv(csv_path, computed.rows)
-            _write_plot(png_path, computed, case_label=case.label)
-            placeholder_summary = case_dir / "summary.txt"
-            placeholder_json = case_dir / "summary.json"
-            output = AnalysisOutput(
-                case_label=case.label,
-                analysis_type=computed.analysis_type,
-                csv_path=csv_path,
-                png_path=png_path,
-                summary_txt_path=placeholder_summary,
-                summary_json_path=placeholder_json,
-                stats=computed.stats,
-                x_column=computed.x_column,
-                y_column=computed.y_column,
-            )
-            case_outputs.append(output)
+            if request.analysis_type == "metal_coordination":
+                from amber_metallo.metal_coordination_analysis import calculate_metal_coordination
+                computed_results = calculate_metal_coordination(
+                    universe, request.metal_indices_by_case.get(case.label),
+                    cutoff=request.coordination_cutoff_angstrom, time_step_ps=time_step_ps,
+                    frame_selection=frame_selection,
+                )
+            else:
+                computed_results = [_compute_analysis(
+                    universe,
+                    request,
+                    time_step_ps=time_step_ps,
+                    frame_selection=frame_selection,
+                )]
+            for computed in computed_results:
+                csv_path = case_dir / f"{computed.slug}.csv"
+                png_path = case_dir / f"{computed.slug}.png"
+                _write_csv(csv_path, computed.rows)
+                _write_csv(csv_path.with_suffix(".tsv"), computed.rows)
+                if computed.summary_rows:
+                    _write_csv(case_dir / f"{computed.slug}_statistics.tsv", computed.summary_rows)
+                _write_plot(png_path, computed, case_label=case.label)
+                placeholder_summary = case_dir / "summary.txt"
+                placeholder_json = case_dir / "summary.json"
+                output = AnalysisOutput(
+                    case_label=case.label,
+                    analysis_type=computed.analysis_type,
+                    csv_path=csv_path,
+                    png_path=png_path,
+                    summary_txt_path=placeholder_summary,
+                    summary_json_path=placeholder_json,
+                    stats=computed.stats,
+                    x_column=computed.x_column,
+                    y_column=computed.y_column,
+                )
+                case_outputs.append(output)
         summary_txt, summary_json = _write_case_summary(case_dir, case, case_outputs)
         finalized = [
             AnalysisOutput(
@@ -1232,6 +1312,7 @@ def run_trajectory_analyses(
 
     combined_summary = output_root / "combined_summary.csv"
     _write_combined_summary(combined_summary, all_outputs)
+    _write_combined_summary(combined_summary.with_suffix(".tsv"), all_outputs)
     overlay_paths = _write_overlay_plots(output_root, all_outputs)
     return TrajectoryAnalysisRunResult(
         output_dir=output_root,

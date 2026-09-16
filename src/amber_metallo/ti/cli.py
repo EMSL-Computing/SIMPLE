@@ -29,7 +29,6 @@ from amber_metallo.reporting import activity_status, console, print_notice
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti import abfe as ti_abfe
 from amber_metallo.ti.analysis import (
-    assess_site_stability,
     default_formal_charge,
     detect_bound_metal_sites,
     generate_reference_pdb_from_amber_restart,
@@ -59,6 +58,8 @@ from amber_metallo.ti.workflow import (
     water_reference_root,
 )
 from amber_metallo.ti.snapshots import read_trajectory_times, run_time_snapshot_extraction
+from amber_metallo.ti.restraint_cli import display_reference_frame_comparison, prompt_coordination_restraints, prepare_full_reference_input
+from amber_metallo.ti.atom_mapping import assess_mapped_site_stability as assess_site_stability
 from amber_metallo.ti.topology import (
     filter_ti_compatible_custom_126_frcmods,
     filter_ti_compatible_custom_1264_frcmods,
@@ -2197,9 +2198,19 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
         output_dir=wizard_tmp / "snapshot_probe",
         dry_run=dry_run,
     )
+    reference_structure_path = str(prepare_full_reference_input(
+        input_selection.complex_input, output_dir=wizard_tmp / "full_references",
+        coordinate_candidates=[last_snapshot["last_snapshot_pdb"], last_snapshot.get("last_snapshot_rst7")],
+    ))
+    if dry_run:
+        # The placeholder must use the same complete atom order as the reference.
+        last_snapshot = run_last_snapshot_extraction(
+            prmtop_path=prmtop_path, trajectory_path=trajectory_path,
+            reference_structure_path=reference_structure_path,
+            output_dir=wizard_tmp / "snapshot_probe", dry_run=True,
+        )
     candidates = detect_bound_metal_sites(
-        reference_structure_path,
-        prmtop_path,
+        reference_structure_path, prmtop_path,
         include_unbound_metals=_input_selection_includes_unbound_metal_sites(input_selection),
     )
     if not candidates:
@@ -2253,6 +2264,10 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
     else:
         ti_implementation_mode = _prompt_ti_implementation_mode()
         ti_decoupling_mode = _prompt_ti_decoupling_mode(ti_implementation_mode)
+    display_reference_frame_comparison(
+        reference_pdb=reference_structure_path, frame_pdb=last_snapshot["last_snapshot_pdb"],
+        prmtop_path=prmtop_path, candidates=[selected], frame_label="Last frame", dry_run=dry_run,
+    )
     snapshot_mode = _prompt_snapshot_mode(selected_stable=selected_assessment.stable)
     snapshot_time_ns = None
     selected_assessments = [selected_assessment]
@@ -2263,6 +2278,17 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
             output_dir=wizard_tmp / "time_snapshot_probe", dry_run=dry_run,
         )
     allow_unstable = _confirm_snapshot_stability(selected_assessments)
+    snapshot_config = SnapshotConfig(
+        mode=snapshot_mode, time_ns=snapshot_time_ns, allow_unstable_last_snapshot=allow_unstable,
+    )
+    restraint_probe = TIWorkflowConfig(
+        complex_input=input_selection.complex_input, snapshot=snapshot_config,
+        metal=MetalSelectionConfig(selected_site=selected.site),
+        ti=TIProtocolConfig(implementation_mode=ti_implementation_mode, decoupling_mode=ti_decoupling_mode),
+    )
+    prompt_coordination_restraints(restraint_probe, dry_run=dry_run)
+    ti_implementation_mode = restraint_probe.ti.implementation_mode
+    ti_decoupling_mode = restraint_probe.ti.decoupling_mode
     ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
     ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
     if in_place_ti:
@@ -2337,11 +2363,7 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
             production_mdin_path=production_mdin_path,
             production_restart_path=production_restart_path,
         ),
-        snapshot=SnapshotConfig(
-            mode=snapshot_mode,
-            time_ns=snapshot_time_ns,
-            allow_unstable_last_snapshot=allow_unstable,
-        ),
+        snapshot=snapshot_config,
         metal=MetalSelectionConfig(
             selected_site=selected.site,
             formal_charge=formal_charge,
@@ -2351,6 +2373,7 @@ def build_ti_wizard_config(write_config: str | None, *, dry_run: bool) -> TIWork
             decoupling_mode=ti_decoupling_mode,
             sampling_mode=ti_sampling_mode,
             charge_compensation_mode=ti_charge_compensation_mode,
+            coordination_restraint=restraint_probe.ti.coordination_restraint,
         ),
         water_reference=WaterReferenceConfig(
             enabled=water_reference_enabled,

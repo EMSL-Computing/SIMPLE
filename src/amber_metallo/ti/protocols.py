@@ -648,6 +648,7 @@ def generate_ti_inputs(
     qoff_restraint_file: str | None = None,
     positional_restraint_mask: str | None = None,
     qoff_positional_restraint_mask: str | None = None,
+    transformation: dict | None = None,
 ) -> list[TIWindow]:
     if qoff_start_source == "snapshot" and config.window_equilibration_ns <= 0:
         raise ValueError(
@@ -658,6 +659,8 @@ def generate_ti_inputs(
     windows: list[TIWindow] = []
 
     combined_layout = _uses_single_topology_gti_decoupling(config)
+    if transformation and not combined_layout:
+        raise ValueError("Direct metal transformation requires combined Amber GTI")
     qoff_dir = output_dir / "inputs" if combined_layout else output_dir / "qoff" / "inputs"
     vdwoff_dir = output_dir / "vdwoff" / "inputs"
     qoff_dir.mkdir(parents=True, exist_ok=True)
@@ -725,10 +728,20 @@ def generate_ti_inputs(
         if use_single_topology_gti_decoupling
         else config.charge_lambdas
     )
+    if transformation:
+        title_prefix = "12-6-4 direct metal transformation"
+        masks = dict(charge_mask=None, timask1=transformation["timask1"],
+                     timask2=transformation["timask2"], scmask1="", scmask2="")
+    elif use_single_topology_gti_decoupling:
+        title_prefix = "12-6-4 GTI softcore decoupling"
+        masks = dict(charge_mask=None, timask1=atom_mask, timask2="", scmask1=atom_mask, scmask2="")
+    else:
+        title_prefix = "Charge-off TI"
+        masks = dict(charge_mask=qoff_charge_mask or atom_mask, timask1=qoff_timask1 or atom_mask,
+                     timask2=qoff_timask2 or atom_mask, scmask1=None, scmask2=None)
 
     for index, clambda in enumerate(qoff_lambdas, start=1):
         window_start_source = qoff_start_source if index == 1 else "restart"
-        title_prefix = "12-6-4 GTI softcore decoupling" if use_single_topology_gti_decoupling else "Charge-off TI"
         lambda_label = _lambda_label(clambda)
         title = f"{title_prefix} window {index:02d} (lambda={lambda_label})"
         filename = f"{index:02d}_lambda_{lambda_label}.in"
@@ -741,11 +754,7 @@ def generate_ti_inputs(
             production_ensemble=config.production_ensemble,
             production_time_ns=config.production_time_ns,
             clambda=clambda,
-            charge_mask=None if use_single_topology_gti_decoupling else (qoff_charge_mask or atom_mask),
-            timask1=atom_mask if use_single_topology_gti_decoupling else (qoff_timask1 or atom_mask),
-            timask2="" if use_single_topology_gti_decoupling else (qoff_timask2 or atom_mask),
-            scmask1=atom_mask if use_single_topology_gti_decoupling else None,
-            scmask2="" if use_single_topology_gti_decoupling else None,
+            **masks,
             restraint_file=resolved_qoff_restraint_file,
             start_source="restart",
             scalpha=config.scalpha,
@@ -760,11 +769,7 @@ def generate_ti_inputs(
             filename=filename,
             title=title,
             clambda=clambda,
-            charge_mask=None if use_single_topology_gti_decoupling else (qoff_charge_mask or atom_mask),
-            timask1=atom_mask if use_single_topology_gti_decoupling else (qoff_timask1 or atom_mask),
-            timask2="" if use_single_topology_gti_decoupling else (qoff_timask2 or atom_mask),
-            scmask1=atom_mask if use_single_topology_gti_decoupling else None,
-            scmask2="" if use_single_topology_gti_decoupling else None,
+            **masks,
             restraint_path=resolved_qoff_restraint_file,
             dt_ps_override=config.qoff_dt_ps,
             positional_mask=qoff_positional_restraint_mask or positional_restraint_mask,
@@ -798,7 +803,14 @@ def generate_ti_inputs(
         )
 
     if use_single_topology_gti_decoupling:
-        write_json(output_dir / "ti_manifest.json", _ti_manifest_payload(config, windows))
+        if transformation:
+            # Apply the same recorded mass path in forward and reverse sweeps.
+            from amber_metallo.ti.transformation import finalize_direct_inputs
+            finalize_direct_inputs(output_dir, windows, transformation=transformation)
+        payload = _ti_manifest_payload(config, windows)
+        if transformation:
+            payload["transformation"] = transformation
+        write_json(output_dir / "ti_manifest.json", payload)
         return windows
 
     for index, clambda in enumerate(config.vdw_lambdas, start=1):

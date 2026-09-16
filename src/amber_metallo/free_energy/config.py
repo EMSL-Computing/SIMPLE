@@ -15,6 +15,7 @@ from amber_metallo.ti.config import (
     MetalSelectionConfig,
     SnapshotConfig,
     TIProtocolConfig,
+    TITransformationConfig,
     TIWorkflowConfig,
     WaterReferenceConfig,
 )
@@ -138,6 +139,7 @@ class FreeEnergyWorkflowConfig(BaseModel):
     complex_input: ComplexInputConfig
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     metal: MetalSelectionConfig = Field(default_factory=MetalSelectionConfig)
+    transformation: TITransformationConfig = Field(default_factory=TITransformationConfig)
     free_energy: FreeEnergyConfig = Field(default_factory=FreeEnergyConfig)
     ti: TIProtocolConfig = Field(default_factory=TIProtocolConfig)
     mmpbsa: MMPBSAConfig = Field(default_factory=MMPBSAConfig)
@@ -178,9 +180,11 @@ def dump_config(config: FreeEnergyWorkflowConfig) -> str:
     doc.add(nl())
     doc.add("metal", _section_from_model(config.metal.model_dump(mode="json")))
     doc.add(nl())
+    doc.add("transformation", _section_from_model(config.transformation.model_dump(mode="json", exclude_none=True)))
+    doc.add(nl())
     doc.add("free_energy", _section_from_model(config.free_energy.model_dump(mode="json")))
     doc.add(nl())
-    doc.add("ti", _section_from_model(config.ti.model_dump(mode="json")))
+    doc.add("ti", _section_from_model(config.ti.model_dump(mode="json", exclude_none=True)))
     doc.add(nl())
     doc.add("mmpbsa", _section_from_model(config.mmpbsa.model_dump(mode="json")))
     doc.add(nl())
@@ -204,6 +208,7 @@ def to_ti_config(config: FreeEnergyWorkflowConfig) -> TIWorkflowConfig:
         complex_input=config.complex_input.model_dump(mode="json"),
         snapshot=config.snapshot.model_dump(mode="json"),
         metal=config.metal.model_dump(mode="json"),
+        transformation=config.transformation.model_dump(mode="json"),
         ti=config.ti.model_dump(mode="json"),
         water_reference=config.water_reference.model_dump(mode="json"),
         slurm=config.slurm.model_dump(mode="json"),
@@ -216,6 +221,7 @@ def from_ti_config(config: TIWorkflowConfig) -> FreeEnergyWorkflowConfig:
         complex_input=config.complex_input.model_dump(mode="json"),
         snapshot=config.snapshot.model_dump(mode="json"),
         metal=config.metal.model_dump(mode="json"),
+        transformation=config.transformation.model_dump(mode="json"),
         free_energy={"method": FreeEnergyMethod.TI},
         ti=config.ti.model_dump(mode="json"),
         water_reference=config.water_reference.model_dump(mode="json"),

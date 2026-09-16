@@ -699,7 +699,10 @@ def _zero_c4_for_atom_indices(
             + ", ".join(str(index) for index in invalid_indices)
         )
 
-    ntypes = max(atom_type_indices) if atom_type_indices else int(pointer_values[1])
+    # NONBONDED_PARM_INDEX has NTYPES columns, including any unused types.
+    # Inferring its stride from used atoms corrupts pairs after an atom subset
+    # or type reassignment leaves the highest type unused.
+    ntypes = int(pointer_values[1])
     nonbonded_index = _tokens_to_ints(sections["NONBONDED_PARM_INDEX"])
     acoefs = _tokens_to_floats(sections["LENNARD_JONES_ACOEF"])
     bcoefs = _tokens_to_floats(sections["LENNARD_JONES_BCOEF"])

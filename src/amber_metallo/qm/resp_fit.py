@@ -382,6 +382,8 @@ def render_constrained_runtime_resp_fit_script(
     xyz_filename: str = "site_resp.xyz",
     grid_filename: str = "site_resp.grid",
     fingerprint: str | None = None,
+    output_prefix: str = "site_resp",
+    plain_text_charges: bool = False,
 ) -> str:
     """Render a standalone constrained fitter for cluster execution hosts."""
     module_source = Path(__file__).read_text(encoding="utf-8")
@@ -410,11 +412,12 @@ def render_constrained_runtime_resp_fit_script(
         (
             '    Path("site_resp_charges.txt").write_text('
             'render_constrained_charge_table(_result), encoding="utf-8")'
-            if 'Path("site_resp_charges.txt").write_text' in line
+            if 'Path("site_resp_charges.txt").write_text' in line and not plain_text_charges
             else line
         )
         for line in runner.splitlines()
     ) + "\n"
+    runner = runner.replace('Path("site_resp_charges.', f'Path("{output_prefix}_charges.')
     return module_source + runner
 
 
@@ -425,7 +428,21 @@ def render_runtime_resp_fit_script(
     equality_pairs: list[tuple[int, int]],
     xyz_filename: str = "resp_job.xyz",
     grid_filename: str = "resp_job.grid",
+    fixed_charges: dict[int, float] | None = None,
 ) -> str:
+    if fixed_charges:
+        return render_constrained_runtime_resp_fit_script(
+            atom_names=atom_names,
+            total_charge=total_charge,
+            equality_pairs=equality_pairs,
+            fixed_charges=fixed_charges,
+            sum_constraints=[],
+            atom_metadata=[{} for _ in atom_names],
+            xyz_filename=xyz_filename,
+            grid_filename=grid_filename,
+            output_prefix="resp",
+            plain_text_charges=True,
+        )
     names_json = json.dumps(atom_names)
     pairs_json = json.dumps([[int(i), int(j)] for i, j in equality_pairs])
     lines = [

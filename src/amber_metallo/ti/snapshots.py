@@ -247,7 +247,7 @@ def run_time_snapshot_extraction(
         f'parm "{Path(prmtop_path).expanduser().resolve().as_posix()}"\n'
         f'trajin "{Path(trajectory_path).expanduser().resolve().as_posix()}" {frame_index} {frame_index}\n'
         "autoimage\n"
-        f'trajout "{output_pdb.as_posix()}" pdb nobox\n'
+        f'trajout "{output_pdb.as_posix()}" pdb include_ep\n'
         f'trajout "{output_rst7.as_posix()}" restart novelocity\n'
         "run\n",
         encoding="utf-8",
@@ -270,6 +270,8 @@ def run_time_snapshot_extraction(
             raise RuntimeError(
                 "cpptraj did not produce the requested time snapshot PDB and restart."
             )
+        from amber_metallo.ti.full_structure import full_pdb_from_restart
+        full_pdb_from_restart(prmtop_path=prmtop_path, restart_path=output_rst7, output_path=output_pdb)
     manifest = {
         "script": str(script_path),
         "snapshot_pdb": str(output_pdb),

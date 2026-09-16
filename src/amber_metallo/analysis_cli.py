@@ -7,7 +7,12 @@ import typer
 from rich import box
 from rich.table import Table
 
-from amber_metallo.cli import WizardChoice, _display_choice_table, _prompt_choice, _print_step_header
+from amber_metallo.cli import (
+    WizardChoice,
+    _display_choice_table,
+    _print_step_header,
+    _prompt_choice,
+)
 from amber_metallo.reporting import console, print_notice
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti.abfe import (
@@ -16,6 +21,7 @@ from amber_metallo.ti.abfe import (
     SAMPLING_SELECTION_FORWARD_ONLY,
     SAMPLING_SELECTION_FORWARD_REVERSE,
     AnalysisCaseDiscovery,
+    ConvergenceAnalysisOptions,
     RBFEAnalysisResult,
     SingleCaseAnalysisResult,
     analyze_rbfe,
@@ -27,6 +33,36 @@ from amber_metallo.ti.abfe import (
     inspect_analysis_case,
     rbfe_pair_compatibility,
 )
+
+
+def _prompt_convergence_options() -> ConvergenceAnalysisOptions:
+    choices = [
+        WizardChoice(
+            "standard",
+            "Standard outputs",
+            "Always write the per-window 5-block means and SEM, without additional temporal analyses.",
+        ),
+        WizardChoice(
+            "extended",
+            "Extended convergence outputs",
+            "Also write cumulative Delta G, discard-sensitivity, autocorrelation-time, and effective-sample-size data and plots.",
+        ),
+    ]
+    _display_choice_table("TI numerical outputs", choices)
+    selection = _prompt_choice("Choose the TI numerical outputs", choices, default_key="standard")
+    if selection == "standard":
+        return ConvergenceAnalysisOptions()
+    while True:
+        discard_ns = float(
+            typer.prompt(
+                "Initial production time to discard from every window (ns; 0 keeps all production)",
+                default=0.2,
+                type=float,
+            )
+        )
+        if discard_ns >= 0.0:
+            return ConvergenceAnalysisOptions(enabled=True, discard_ns=discard_ns)
+        console.print("[red]Discard time must be zero or greater.[/red]")
 
 
 def _analysis_mode_choices() -> list[WizardChoice]:
@@ -44,7 +80,7 @@ def _analysis_mode_choices() -> list[WizardChoice]:
         WizardChoice(
             "extra",
             "Additional analyses",
-            "Run RMSD, RMSF, radius of gyration, RDF, and distance analyses on one or more trajectories.",
+            "Run RMSD, RMSF, radius of gyration, RDF, distance, and metal O-CN analyses; 0 / A selects all.",
         ),
     ]
 
@@ -479,8 +515,13 @@ def run_analysis_wizard() -> (
             prompt_text="Choose case number(s) (0 = analyze all ready, M = enter a path manually)",
         )
         sampling_selection = _prompt_sampling_selection(case_selections)
+        convergence_options = _prompt_convergence_options()
         results = [
-            analyze_single_case(case_selection, sampling_selection=sampling_selection)
+            analyze_single_case(
+                case_selection,
+                sampling_selection=sampling_selection,
+                convergence_options=convergence_options,
+            )
             for case_selection in case_selections
         ]
         return results[0] if len(results) == 1 else results
@@ -533,8 +574,14 @@ def run_analysis_wizard() -> (
             "All bound/water selections are complete. SIMPLE will now run the calculations without pausing for more case choices.",
             border_style="cyan",
         )
+        convergence_options = _prompt_convergence_options()
         results = [
-            analyze_rbfe(bound_case, water_case, sampling_selection=sampling_selection)
+            analyze_rbfe(
+                bound_case,
+                water_case,
+                sampling_selection=sampling_selection,
+                convergence_options=convergence_options,
+            )
             for bound_case, water_case in pairings
         ]
         return results[0] if len(results) == 1 else results

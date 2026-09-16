@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 from typing import Sequence
 
 import typer
@@ -18,6 +19,7 @@ from amber_metallo.trajectory_analysis import (
     TrajectoryAnalysisRunResult,
     TrajectoryCase,
     candidate_masks_for_universe,
+    configure_fallback_frame_time,
     default_output_root,
     dependency_install_hint,
     describe_frame_selection,
@@ -36,6 +38,7 @@ def _analysis_choices() -> list[WizardChoice]:
         WizardChoice("rg", "Radius of gyration", "Frame-by-frame compactness for a selected atom group."),
         WizardChoice("rdf", "RDF", "Radial distribution function and cumulative coordination-style profile."),
         WizardChoice("distance", "Distance", "Frame-by-frame distance between two atom selections or group centers."),
+        WizardChoice("metal_coordination", "Metal O-CN / O distances", "Per-metal oxygen CN, identified O distances, means/SD and contact occupancy; TSV + PNG."),
     ]
 
 
@@ -190,8 +193,11 @@ def _prompt_mask(
 def _prompt_analysis_types() -> list[str]:
     choices = _analysis_choices()
     _display_choice_table("Trajectory analysis types", choices)
+    console.print("[cyan]0 / A = all listed analyses (each still asks for its required selections).[/cyan]")
     while True:
-        raw = typer.prompt("Choose analysis number(s)", default="1").strip()
+        raw = typer.prompt("Choose analysis number(s), or 0 / A for all", default="1").strip()
+        if raw.lower() in {"0", "a", "all"}:
+            return [choice.key for choice in choices]
         try:
             indices = _parse_indices(raw, max_index=len(choices))
         except ValueError:
@@ -208,7 +214,7 @@ def _prompt_positive_float(message: str, *, default: float) -> float:
         except ValueError:
             console.print("[bold red]Please enter a number.[/bold red]")
             continue
-        if value > 0:
+        if math.isfinite(value) and value > 0:
             return value
         console.print("[bold red]Please enter a positive number.[/bold red]")
 
@@ -239,7 +245,7 @@ def _prompt_range(message: str, *, default: tuple[float, float]) -> tuple[float,
         except ValueError:
             console.print("[bold red]Enter two numeric range bounds.[/bold red]")
             continue
-        if low >= 0 and high > low:
+        if math.isfinite(low) and math.isfinite(high) and low >= 0 and high > low:
             return low, high
         console.print("[bold red]Lower bound must be >= 0 and upper bound must be larger.[/bold red]")
 
@@ -250,6 +256,7 @@ def _prompt_frame_selection() -> TrajectoryFrameSelection:
         WizardChoice("all", "All frames", "Analyze the full trajectory using the selected stride."),
         WizardChoice("last_ns", "Last N ns", "Analyze only the final time window using the selected stride."),
         WizardChoice("last_frames", "Last N frames", "Analyze only the final frame window using the selected stride."),
+        WizardChoice("range", "Specific time range (ns)", "Analyze saved trajectory times within an inclusive start/end range."),
     ]
     _display_choice_table("Trajectory frame window", choices)
     while True:
@@ -262,7 +269,46 @@ def _prompt_frame_selection() -> TrajectoryFrameSelection:
         if raw in {"3", "last_frames", "frames", "f"}:
             last_frames = _prompt_positive_int("Analyze only the last how many frames", default=1000)
             return TrajectoryFrameSelection(stride=stride, last_frames=last_frames)
-        console.print("[bold red]Please choose 1, 2, or 3.[/bold red]")
+        if raw in {"4", "range", "r"}:
+            start_ns, end_ns = _prompt_range("Time range in ns (start end)", default=(0.0, 10.0))
+            return TrajectoryFrameSelection(stride=stride, start_ns=start_ns, end_ns=end_ns)
+        console.print("[bold red]Please choose 1, 2, 3, or 4.[/bold red]")
+
+
+def _prompt_metal_coordination(cases, universes):
+    from amber_metallo.metal_coordination_analysis import metal_atom_options
+    indices_by_case = {}
+    for case, universe in zip(cases, universes, strict=True):
+        options = metal_atom_options(universe)
+        if not options:
+            console.print(f"[yellow]{case.label}: no metal atoms detected; skipping metal O-CN for this case.[/yellow]")
+            indices_by_case[case.label] = []
+            continue
+        table = Table(title=f"{case.label}: metals for oxygen coordination analysis")
+        for column in ("No.", "Topology atom", "Element", "Residue / atom"):
+            table.add_column(column)
+        for number, option in enumerate(options, start=1):
+            table.add_row(str(number), str(option["atom_index"]), option["element"], option["atom_label"])
+        console.print(table)
+        while True:
+            raw = typer.prompt("Choose metal number(s), e.g. 1,3-5; 0 / A = all metals", default="1").strip().lower()
+            if raw in {"0", "a", "all"}:
+                selected = list(range(1, len(options) + 1))
+            else:
+                try:
+                    selected = _parse_indices(raw, max_index=len(options))
+                except ValueError:
+                    console.print("[red]Choose listed metal numbers, or 0 / A for all.[/red]")
+                    continue
+            indices_by_case[case.label] = [options[i - 1]["atom_index"] for i in selected]
+            break
+    cutoff = _prompt_positive_float("Metal-O cutoff / neighbor search distance (Angstrom)", default=4.0)
+    console.print("[dim]Counts O atoms only (not chemical bonds); water and non-water CN are separate. "
+                  "Track every O that enters this cutoff in the chosen frames, with residue/atom labels. "
+                  "Distance means include outside-cutoff frames; contact-only means and occupancy are also saved. "
+                  "SD is a population standard deviation, not an uncertainty/SEM.[/dim]")
+    return TrajectoryAnalysisRequest("metal_coordination", metal_indices_by_case=indices_by_case,
+                                     coordination_cutoff_angstrom=cutoff)
 
 
 def _build_requests(
@@ -273,7 +319,9 @@ def _build_requests(
 ) -> list[TrajectoryAnalysisRequest]:
     requests: list[TrajectoryAnalysisRequest] = []
     for analysis_type in analysis_types:
-        if analysis_type == "rg":
+        if analysis_type == "metal_coordination":
+            requests.append(_prompt_metal_coordination(cases, universes))
+        elif analysis_type == "rg":
             target = _prompt_mask(
                 "Mask for radius of gyration",
                 mask_options,
@@ -363,6 +411,8 @@ def print_trajectory_analysis_summary(result: TrajectoryAnalysisRunResult) -> No
         table.add_row(output.case_label, output.analysis_type, str(output.csv_path), str(output.png_path))
     console.print(table)
     console.print(f"[bold green]Output directory:[/bold green] {result.output_dir}")
+    console.print("[dim]Every CSV also has a TSV copy. Metal *_statistics.tsv files contain mean/SD, "
+                  "residue/atom identities and occupancy; distance PNGs are paginated if needed.[/dim]")
     if result.combined_summary_csv_path is not None:
         console.print(f"[bold green]Combined summary:[/bold green] {result.combined_summary_csv_path}")
     for overlay in result.overlay_paths:
@@ -404,7 +454,15 @@ def run_trajectory_analysis_wizard() -> TrajectoryAnalysisRunResult:
     )
     analysis_types = _prompt_analysis_types()
     requests = _build_requests(analysis_types, mask_options, cases, universes)
-    time_step_ps = _prompt_positive_float("Time between trajectory frames in ps", default=1.0)
+    time_step_ps = _prompt_positive_float("Frame interval in ps for files WITHOUT saved times (mdcrd: MD dt * ntwx)", default=1.0)
+    console.print("[dim]Saved trajectory times take precedence (e.g. NetCDF/XTC). "
+                  "For timestamp-free mdcrd, time starts at 0 with the interval entered above.[/dim]")
+    for case, universe in zip(cases, universes, strict=True):
+        configure_fallback_frame_time(universe, time_step_ps)
+        first = float(universe.trajectory[0].time) / 1000.
+        last = float(universe.trajectory[-1].time) / 1000.
+        universe.trajectory[0]
+        console.print(f"[cyan]{case.label}: {len(universe.trajectory)} frames; {first:g} to {last:g} ns.[/cyan]")
 
     _print_step_header(
         4,
@@ -417,7 +475,7 @@ def run_trajectory_analysis_wizard() -> TrajectoryAnalysisRunResult:
     _print_step_header(
         5,
         "Choose Output Directory",
-        "CSV data, PNG plots, and summary files will be written under this folder.",
+        "CSV/TSV data, PNG plots, and summary files will be written under this folder.",
     )
     default_root = default_output_root(Path.cwd())
     output_raw = typer.prompt("Output directory", default=str(default_root)).strip()

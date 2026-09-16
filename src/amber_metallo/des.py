@@ -70,6 +70,12 @@ class DESComponentDefinition:
     description: str
     directory: str
     residues: tuple[DESResidueDefinition, ...]
+    molecule_key: str | None = None
+    parameter_set: str = "existing_library"
+    citation: str | None = None
+    provenance_file: str | None = None
+    atom_types: tuple[tuple[str, str, str], ...] = ()
+    supports_c4: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +116,15 @@ class DESPlan:
         return asdict(self)
 
 
+_PERKINS_CITATION = "Perkins, Painter & Colina, J. Chem. Eng. Data 2014, 59, 3652-3662; doi:10.1021/je500520h."
+_PERKINS_PARAMETER_SET = "perkins2014_gaff2_hybrid_v1"
+_PERKINS_ATOM_TYPES = (
+    ("ZC", "C", "sp3"), ("ZN", "N", "sp3"), ("ZX", "H", "sp3"),
+    ("ZH", "H", "sp3"), ("ZO", "O", "sp3"), ("ZE", "O", "sp3"),
+    ("ZQ", "H", "sp3"), ("ZI", "Cl", "sp3"),
+)
+
+
 DES_COMPONENTS: dict[DESComponent | str, DESComponentDefinition] = {
     DESComponent.N8888_BR: DESComponentDefinition(
         key=DESComponent.N8888_BR,
@@ -131,6 +146,7 @@ DES_COMPONENTS: dict[DESComponent | str, DESComponentDefinition] = {
     DESComponent.CHOLINE_CHLORIDE: DESComponentDefinition(
         key=DESComponent.CHOLINE_CHLORIDE,
         label="Choline Chloride",
+        molecule_key="choline_chloride",
         description="Choline chloride ion pair; expands to CH1 + CL residues.",
         directory="Choline",
         residues=(
@@ -141,6 +157,7 @@ DES_COMPONENTS: dict[DESComponent | str, DESComponentDefinition] = {
     DESComponent.ETHYLENE_GLYCOL: DESComponentDefinition(
         key=DESComponent.ETHYLENE_GLYCOL,
         label="Ethylene Glycol",
+        molecule_key="ethylene_glycol",
         description="Ethylene glycol HBD component.",
         directory="Ethylene-glycol",
         residues=(DESResidueDefinition("EG1", "EG1_h.pdb", "EG1_h.frcmod", "EG1_h_ptmpsi.lib"),),
@@ -166,11 +183,49 @@ DES_COMPONENTS: dict[DESComponent | str, DESComponentDefinition] = {
         directory="Methanol",
         residues=(DESResidueDefinition("MEO", None, "MeOH_h.frcmod", "MeOH_h_ptmpsi.lib"),),
     ),
+    DESComponent.CHOLINE_CHLORIDE_PERKINS2014_GAFF2: DESComponentDefinition(
+        key=DESComponent.CHOLINE_CHLORIDE_PERKINS2014_GAFF2,
+        label="Choline Chloride (Perkins 2014 / GAFF2 hybrid)",
+        description=(
+            "SI choline charges/LJ + GAFF2 2.2.30 bonded; choline +0.9, Cl -0.9 e. "
+            "Cl LJ substituted from Amber IM (not confirmed in SI). 12-6 only; unvalidated hybrid. "
+            + _PERKINS_CITATION
+        ),
+        directory="Perkins2014_Ethaline_GAFF2",
+        residues=(
+            DESResidueDefinition("PC4", None, "perkins2014_gaff2.frcmod", "PC4.lib"),
+            DESResidueDefinition("PL4", None, "perkins2014_gaff2.frcmod", "PL4.lib"),
+        ),
+        molecule_key="choline_chloride",
+        parameter_set=_PERKINS_PARAMETER_SET,
+        citation=_PERKINS_CITATION,
+        provenance_file="provenance.json",
+        atom_types=_PERKINS_ATOM_TYPES,
+        supports_c4=False,
+    ),
+    DESComponent.ETHYLENE_GLYCOL_PERKINS2014_GAFF2: DESComponentDefinition(
+        key=DESComponent.ETHYLENE_GLYCOL_PERKINS2014_GAFF2,
+        label="Ethylene Glycol (Perkins 2014 / GAFF2 hybrid)",
+        description=(
+            "SI charges/LJ + GAFF2 2.2.30 bonded. O3/O4 epsilon 0.1700/0.2104 kcal/mol "
+            "retained as printed in SI; discrepancy unresolved. 12-6 only; unvalidated hybrid. "
+            + _PERKINS_CITATION
+        ),
+        directory="Perkins2014_Ethaline_GAFF2",
+        residues=(DESResidueDefinition("PE4", None, "perkins2014_gaff2.frcmod", "PE4.lib"),),
+        molecule_key="ethylene_glycol",
+        parameter_set=_PERKINS_PARAMETER_SET,
+        citation=_PERKINS_CITATION,
+        provenance_file="provenance.json",
+        atom_types=_PERKINS_ATOM_TYPES,
+        supports_c4=False,
+    ),
 }
 
 DES_RECOMMENDED_SETS: tuple[tuple[tuple[DESComponent, DESComponent], tuple[int, int]], ...] = (
     ((DESComponent.N8888_BR, DESComponent.HEXANOIC_ACID), (1, 2)),
     ((DESComponent.CHOLINE_CHLORIDE, DESComponent.ETHYLENE_GLYCOL), (1, 2)),
+    ((DESComponent.CHOLINE_CHLORIDE_PERKINS2014_GAFF2, DESComponent.ETHYLENE_GLYCOL_PERKINS2014_GAFF2), (1, 2)),
 )
 
 CUSTOM_DES_REGISTRY_FILENAME = "custom_des_components.json"
@@ -233,6 +288,9 @@ def _custom_component_from_record(key: str, record: dict[str, object]) -> DESCom
         description=description,
         directory=directory,
         residues=(DESResidueDefinition(residue_name, None, frcmod, lib),),
+        molecule_key=str(record.get("molecule_key") or "").strip() or None,
+        parameter_set=str(record.get("parameter_set") or key),
+        citation=str(record.get("citation") or "").strip() or None,
     )
 
 
@@ -262,6 +320,45 @@ def _component_definition(ref_data_dir: Path, component: DESComponent | str) -> 
         return components[key]
     except KeyError as exc:
         raise KeyError(f"DES component is not registered: {_component_key_value(component)}") from exc
+
+
+def validate_des_component_selection(
+    components: list[DESComponent | str], ref_data_dir: str | Path = "REF_DATA",
+) -> None:
+    """Versions can coexist in the library, but not redefine one mixture unit."""
+    resolved = resolve_ref_data_dir(ref_data_dir)
+    molecules: dict[str, str] = {}
+    residues: dict[str, str] = {}
+    for key in components:
+        definition = _component_definition(resolved, key)
+        if definition.molecule_key:
+            previous = molecules.get(definition.molecule_key)
+            if previous is not None:
+                raise ValueError(
+                    f"Choose only one parameter variant for {definition.molecule_key}: "
+                    f"{previous} / {definition.label}."
+                )
+            molecules[definition.molecule_key] = definition.label
+        for residue in definition.residues:
+            name = residue.residue_name.upper()
+            previous = residues.get(name)
+            if previous is not None:
+                raise ValueError(
+                    f"DES residue {name} is defined by both {previous} and {definition.label}. "
+                    "Choose only one parameter variant for each residue."
+                )
+            residues[name] = definition.label
+
+
+def des_component_metadata(definition: DESComponentDefinition) -> dict[str, object]:
+    """Shared selection metadata for GUI, saved manifests, and future variants."""
+    return {
+        "molecule_key": definition.molecule_key,
+        "parameter_set": definition.parameter_set,
+        "citation": definition.citation,
+        "supports_c4": definition.supports_c4,
+        "residues": [item.residue_name for item in definition.residues],
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +425,7 @@ def classify_des_library_bundle(
     residue_name = library_residue_name(lib)
     lib_hash = _file_sha256(lib)
     frcmod_hash = _file_sha256(frcmod)
+    different: DESLibraryCandidate | None = None
     for key, component in available_des_components(resolved_ref).items():
         for known_residue, known_lib_hash, known_frcmod_hash in _component_asset_hashes(resolved_ref, component):
             if known_residue.upper() != residue_name:
@@ -341,7 +439,7 @@ def classify_des_library_bundle(
                     matched_component=_component_key_value(key),
                     matched_label=component.label,
                 )
-            return DESLibraryCandidate(
+            different = different or DESLibraryCandidate(
                 lib_path=lib,
                 frcmod_path=frcmod,
                 residue_name=residue_name,
@@ -349,7 +447,7 @@ def classify_des_library_bundle(
                 matched_component=_component_key_value(key),
                 matched_label=component.label,
             )
-    return DESLibraryCandidate(lib_path=lib, frcmod_path=frcmod, residue_name=residue_name, status="new")
+    return different or DESLibraryCandidate(lib_path=lib, frcmod_path=frcmod, residue_name=residue_name, status="new")
 
 
 def _candidate_component_key(base: str, existing_keys: set[str]) -> str:
@@ -1814,6 +1912,7 @@ def _des_c4_residue_names(
 
 def _estimate_des_plan(config: DESConfig, ion_plan: dict[str, object] | None = None) -> DESPlan:
     ref_data_dir = resolve_ref_data_dir(config.ref_data_dir)
+    validate_des_component_selection(config.components, ref_data_dir)
     added_ions = dict((ion_plan or {}).get("added_ions") or {})
     added_ion_count = sum(max(0, int(count)) for count in added_ions.values())
     ratio_units, component_counts = _component_counts_for_config(
@@ -1874,6 +1973,16 @@ def _estimate_des_plan(config: DESConfig, ion_plan: dict[str, object] | None = N
         box_lengths[0] * box_lengths[1] * box_lengths[2],
     )
     c4_residue_names = _des_c4_residue_names(config, metal_specs, added_ions)
+    if c4_residue_names:
+        incompatible = [
+            _component_definition(ref_data_dir, key).label for key in config.components
+            if not _component_definition(ref_data_dir, key).supports_c4
+        ]
+        if incompatible:
+            raise ValueError(
+                "No validated 12-6-4/C4 parameters are supplied for " + ", ".join(incompatible)
+                + ". Disable apply_1264 for this 12-6 hybrid model, or choose a C4-compatible library set."
+            )
     c4_mask = ":" + ",".join(c4_residue_names) if c4_residue_names else None
     box_volume = box_lengths[0] * box_lengths[1] * box_lengths[2]
     metal_sites = _des_metal_plan_entries(
@@ -2590,9 +2699,19 @@ def _copy_residue_assets(config: DESConfig, output_dir: Path) -> dict[str, Path]
                     continue
                 source = _residue_file(ref_data_dir, component, residue, kind)
                 target = inputs_dir / source.name
+                if target in copied.values() and _file_sha256(target) != _file_sha256(source):
+                    raise ValueError(
+                        f"DES library assets share filename {source.name} but have different contents. "
+                        "Rename the custom assets before combining these components."
+                    )
                 if str(source.resolve()) != str(target.resolve()):
                     shutil.copy2(source, target)
                 copied[f"{residue.residue_name}_{kind}"] = target
+        if component.provenance_file:
+            source = _component_dir(ref_data_dir, component) / component.provenance_file
+            target = inputs_dir / f"{component.parameter_set}_provenance.json"
+            shutil.copy2(source, target)
+            copied[f"{_component_key_value(component_key)}_provenance"] = target
     return copied
 
 
@@ -2831,8 +2950,14 @@ def _render_tleap(
         lines.append(_ion_1264_parameter_line(config, amber_env, output_dir))
     loaded_frcmods: set[Path] = set()
     loaded_libs: set[Path] = set()
+    registered_types: set[tuple[str, str, str]] = set()
     for component_key in config.components:
         component = _component_definition(resolve_ref_data_dir(config.ref_data_dir), component_key)
+        for atom_type in component.atom_types:
+            if atom_type not in registered_types:
+                name, element, hybridization = atom_type
+                lines.append(f'addAtomTypes {{ {{ "{name}" "{element}" "{hybridization}" }} }}')
+                registered_types.add(atom_type)
         for residue in component.residues:
             frcmod = copied_assets.get(f"{residue.residue_name}_frcmod")
             lib = copied_assets.get(f"{residue.residue_name}_lib")
@@ -2936,6 +3061,19 @@ def build_des_system(
     warnings: list[str] = []
     salt_config = system_config.salt if system_config is not None else SaltConfig()
     plan = estimate_des_plan(des_config, salt_config)
+    selected_parameters: list[dict[str, object]] = []
+    reported_models: set[str] = set()
+    for key in des_config.components:
+        component = _component_definition(resolve_ref_data_dir(des_config.ref_data_dir), key)
+        selected_parameters.append({
+            "key": _component_key_value(key), "label": component.label,
+            "description": component.description, **des_component_metadata(component),
+        })
+        if component.provenance_file and component.parameter_set not in reported_models:
+            source = _component_dir(resolve_ref_data_dir(des_config.ref_data_dir), component) / component.provenance_file
+            provenance = json.loads(source.read_text(encoding="utf-8"))
+            warnings.extend(str(message) for message in provenance.get("warnings", []))
+            reported_models.add(component.parameter_set)
     if plan.estimated_initial_density_g_ml < 0.25:
         warnings.append(
             "The planned DES initial density is only "
@@ -3068,6 +3206,8 @@ def build_des_system(
         output_dir / "des_manifest.json",
         {
             "plan": plan.to_dict(),
+            "selected_parameters": selected_parameters,
+            "parameter_warnings": warnings,
             "copied_assets": {key: str(path) for key, path in copied_assets.items()},
             "mixture_pdb": str(mixture_pdb),
             "charge_normalizations": charge_normalizations,
@@ -3101,6 +3241,7 @@ def build_des_system(
         system_metadata={
             "workflow_type": "des",
             "des": plan.to_dict(),
+            "des_selected_parameters": selected_parameters,
             "actual_tleap_charge": actual_tleap_charge,
             "actual_tleap_atom_count": actual_tleap_atom_count,
             "box_lengths_source": "inpcrd" if actual_box_lengths is not None else "planned",

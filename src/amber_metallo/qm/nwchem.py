@@ -11,6 +11,7 @@ from typing import Any
 
 from amber_metallo.config import RespApplyMode, SlurmConfig
 from amber_metallo.qm.resp_fit import (
+    fit_constrained_resp_payload,
     equality_groups_from_pairs,
     equality_pairs_from_group_payload,
     load_resp_charge_result,
@@ -1474,7 +1475,7 @@ def _render_dft_theory_block(
             "dft",
             f" mult {int(multiplicity)}",
             f" xc {_xc_keyword(functional)}",
-            f" grid {grid} nodisk",
+            f" grid {grid}",
             f" iterations {int(maxiter)}",
             convergence,
         ]
@@ -1814,12 +1815,22 @@ def _fit_resp_charge_payload(
     equality_pairs: list[tuple[int, int]],
     xyz_path: Path,
     grid_path: Path,
+    fixed_charges: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     import numpy as np
 
     natoms = len(atom_names)
     _, coords_list = _load_xyz_coordinates(xyz_path, natoms)
     grid_list = _load_grid_rows(grid_path)
+    if fixed_charges:
+        return fit_constrained_resp_payload(
+            atom_names=atom_names,
+            coordinates_bohr=coords_list,
+            grid_rows=grid_list,
+            total_charge=total_charge,
+            equality_pairs=equality_pairs,
+            fixed_charges=fixed_charges,
+        )
     coords = np.array(coords_list, dtype=float)
     grid = np.array(grid_list, dtype=float)
     groups = equality_groups_from_pairs(natoms, equality_pairs)
@@ -1931,25 +1942,54 @@ def _materialize_resp_charge_result(job_dir: str | Path, *, force_refit: bool = 
         equality_pairs=equality_pairs_from_group_payload(group_payload),
         xyz_path=xyz_path,
         grid_path=grid_path,
+        fixed_charges={int(index): float(charge) for index, charge in (candidate.payload.get("fixed_charges") or {}).items()},
     )
     _write_resp_charge_payload(output_dir, payload)
     return output_dir / "resp_charges.json"
 
 
+def load_resp_reference_molecule(job_dir: str | Path) -> MoleculeData | None:
+    """Read the atom list actually used for RESP, not the metal-inclusive MD source."""
+    root = Path(job_dir)
+    local_source = root / "inputs" / "resp_source.mol2"
+    if local_source.exists():
+        return load_molecule(local_source)
+    session_path = root / "manifests" / "popup_state.json"
+    if session_path.exists():
+        molecule = _molecule_from_session_state(load_session_state(session_path))
+        if molecule is not None:
+            return molecule
+    candidate = load_resp_job_candidate(root)
+    raw = (candidate.payload.get("canonical_source_file") or "") if candidate else ""
+    return load_molecule(raw) if raw and Path(raw).exists() else None
+
+
 def load_resp_charges(job_dir: str | Path) -> list[float]:
+    candidate = load_resp_job_candidate(job_dir)
+    manifest = candidate.payload if candidate else {}
+    fixed = {int(index): float(charge) for index, charge in (manifest.get("fixed_charges") or {}).items()}
+
+    def acceptable(values: list[float]) -> bool:
+        return _resp_charge_values_look_physical(values) and (
+            not fixed or (
+                all(0 <= index < len(values) and abs(values[index] - charge) < 1e-6 for index, charge in fixed.items())
+                and abs(sum(values) - float(manifest["net_charge"])) < 1e-5
+            )
+        )
+
     output_dir = Path(job_dir) / "output"
     json_path = output_dir / "resp_charges.json"
     if json_path.exists():
         charges = load_resp_charge_result(json_path)
-        if _resp_charge_values_look_physical(charges):
+        if acceptable(charges):
             return charges
         generated = _materialize_resp_charge_result(job_dir, force_refit=True)
         if generated is not None and generated.exists():
             refreshed = load_resp_charge_result(generated)
-            if _resp_charge_values_look_physical(refreshed):
+            if acceptable(refreshed):
                 return refreshed
         raise ValueError(
-            "RESP charge data was found, but the stored charge magnitudes look non-physical. "
+            "RESP charge data was found, but the values are non-physical or violate fixed-metal/total-charge constraints. "
             f"Existing file: {json_path}"
         )
 
@@ -1961,21 +2001,24 @@ def load_resp_charges(job_dir: str | Path) -> list[float]:
             if not stripped:
                 continue
             charges.append(float(stripped))
-        if _resp_charge_values_look_physical(charges):
+        if acceptable(charges):
             return charges
         generated = _materialize_resp_charge_result(job_dir, force_refit=True)
         if generated is not None and generated.exists():
             refreshed = load_resp_charge_result(generated)
-            if _resp_charge_values_look_physical(refreshed):
+            if acceptable(refreshed):
                 return refreshed
         raise ValueError(
-            "RESP charge data was found, but the stored charge magnitudes look non-physical. "
+            "RESP charge data was found, but the values are non-physical or violate fixed-metal/total-charge constraints. "
             f"Existing file: {text_path}"
         )
 
     generated = _materialize_resp_charge_result(job_dir)
     if generated is not None and generated.exists():
-        return load_resp_charge_result(generated)
+        charges = load_resp_charge_result(generated)
+        if acceptable(charges):
+            return charges
+        raise ValueError("The refitted RESP charges do not satisfy the stored metal/total-charge constraints.")
 
     raise FileNotFoundError(
         "RESP charges were not found in the selected job directory. "
@@ -2096,6 +2139,7 @@ def write_resp_job_assets(
             atom_names=[atom.name for atom in molecule.atoms],
             total_charge=int(net_charge),
             equality_pairs=equality_pairs,
+            fixed_charges={int(index): float(charge) for index, charge in (state.get("fixed_charges") or {}).items()},
         ),
         encoding="utf-8",
     )
@@ -2131,6 +2175,7 @@ def write_resp_job_assets(
         "net_charge": int(net_charge),
         "multiplicity": int(multiplicity),
         "job_dir": str(target_dir.resolve()),
+        **{key: state[key] for key in ("metal_formal_charges", "fixed_charges", "ligand_net_charge", "preview_to_qm_atom_indices") if key in state},
         "files": {
             "resume_source_file": str(resume_copy_path),
             "canonical_source_file": str(canonical_source_path),

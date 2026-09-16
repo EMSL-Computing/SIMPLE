@@ -36,7 +36,6 @@ from amber_metallo.free_energy.trajectory import count_trajectory_frames
 from amber_metallo.reporting import console, print_notice, write_json
 from amber_metallo.subdirectory_search import search_subdirectories_enabled
 from amber_metallo.ti.analysis import (
-    assess_site_stability,
     default_formal_charge,
     detect_bound_metal_sites,
     parse_cntrl_settings,
@@ -77,8 +76,15 @@ from amber_metallo.ti.config import (
     TIMetalSelectionMode,
     TIImplementationMode,
     TIProtocolConfig,
+    TIWorkflowConfig,
+    TIEndpointMode,
+    TITransformationConfig,
     WaterReferenceConfig,
 )
+from amber_metallo.ti.restraint_cli import display_reference_frame_comparison, prompt_coordination_restraints, prepare_full_reference_input
+from amber_metallo.ti.atom_mapping import assess_mapped_site_stability as assess_site_stability
+from amber_metallo.ti.coordination import snapshot_input_signature
+from amber_metallo.ti.transformation_cli import prompt_metal_transformation, prompt_transformation_charge_compensation
 
 
 _PH_DIR_RE = re.compile(r"^PH", re.IGNORECASE)
@@ -346,6 +352,20 @@ def _expand_ti_one_by_one_config(config: FreeEnergyWorkflowConfig) -> FreeEnergy
                 },
             )
         )
+        child = child_configs[-1]
+        if child.transformation.mode == TIEndpointMode.METAL:
+            child.transformation = config.transformation.model_copy(deep=True, update={
+                "endpoint": config.transformation.for_site(site), "endpoints_by_site": {}})
+        restraint = child.ti.coordination_restraint
+        if restraint is not None and restraint.enabled:
+            restraint.donor_indices_by_site = {
+                key: indices for key, indices in restraint.donor_indices_by_site.items() if key == site
+            }
+            if restraint.prepared_snapshot is not None:
+                # Separate-site cases share the explicitly previewed parent frame.
+                restraint.prepared_snapshot.input_signature = snapshot_input_signature(
+                    child, dry_run=restraint.prepared_snapshot.dry_run,
+                )
         suffixes.append((label,))
         case_plans.append(TIBatchCasePlan(site=site, element=candidate.element, atom_index=candidate.atom_index, output_dir=output_dir))
     return FreeEnergyWizardBuildResult(
@@ -1521,6 +1541,7 @@ def _build_single_free_energy_wizard_config(
     forced_method: FreeEnergyMethod | None,
     input_selection: TIInputSelection | None = None,
     shared_ti_settings: FreeEnergyWorkflowConfig | None = None,
+    transformation_plan: dict | None = None,
 ) -> FreeEnergyWorkflowConfig:
     amber_env = detect_amber_environment()
     if input_selection is None:
@@ -1544,9 +1565,19 @@ def _build_single_free_energy_wizard_config(
         output_dir=wizard_tmp / "snapshot_probe",
         dry_run=dry_run,
     )
+    reference_structure_path = str(prepare_full_reference_input(
+        input_selection.complex_input, output_dir=wizard_tmp / "full_references",
+        coordinate_candidates=[last_snapshot["last_snapshot_pdb"], last_snapshot.get("last_snapshot_rst7")],
+    ))
+    if dry_run:
+        # The placeholder must use the same complete atom order as the reference.
+        last_snapshot = run_last_snapshot_extraction(
+            prmtop_path=prmtop_path, trajectory_path=trajectory_path,
+            reference_structure_path=reference_structure_path,
+            output_dir=wizard_tmp / "snapshot_probe", dry_run=True,
+        )
     candidates = detect_bound_metal_sites(
-        reference_structure_path,
-        prmtop_path,
+        reference_structure_path, prmtop_path,
         include_unbound_metals=_input_selection_includes_unbound_metal_sites(input_selection),
     )
     if not candidates:
@@ -1572,7 +1603,8 @@ def _build_single_free_energy_wizard_config(
     else:
         choices = [
             WizardChoice("0", "Each metal separately", "Default. Generate one TI setup per detected metal site."),
-            WizardChoice("all", "All at once", "Decouple all detected metal sites together in one TI setup; reports one total dG."),
+            WizardChoice("all", "All at once", "Transform all detected metal sites together in one TI setup; reports one total dG."),
+            WizardChoice("subset", "Choose specific metal sites", "Select a subset, then run together or separately."),
         ] + [
             WizardChoice(str(candidate.site), f"Site {candidate.site}", f"{candidate.element} at {candidate.key}")
             for candidate in candidates
@@ -1587,6 +1619,22 @@ def _build_single_free_energy_wizard_config(
             ti_selection_mode = TIMetalSelectionMode.ALL_AT_ONCE
             selected_sites = list(candidates)
             selected = selected_sites[0]
+        elif raw_selection.lower() == "subset":
+            while True:
+                raw_sites = typer.prompt("Metal site numbers (comma-separated)")
+                try:
+                    site_numbers = sorted({int(token.strip()) for token in raw_sites.split(",")})
+                    selected_sites = [select_site(candidates, site) for site in site_numbers]
+                    if not selected_sites:
+                        raise ValueError
+                    break
+                except (ValueError, TypeError):
+                    console.print("[red]Enter site numbers from the detected metal table.[/red]")
+            selected = selected_sites[0]
+            if len(selected_sites) > 1:
+                ti_selection_mode = (TIMetalSelectionMode.ALL_AT_ONCE if typer.confirm(
+                    "Transform these selected sites together in one TI calculation?", default=False)
+                    else TIMetalSelectionMode.ONE_BY_ONE)
         else:
             selected = select_site(candidates, int(raw_selection))
             selected_sites = [selected]
@@ -1604,6 +1652,9 @@ def _build_single_free_energy_wizard_config(
         method = forced_method
 
     if method == FreeEnergyMethod.TI:
+        transformation = prompt_metal_transformation(
+            candidates=selected_sites, input_selection=input_selection,
+            amber_env=amber_env, batch_plan=transformation_plan)
         in_place_ti = _input_selection_uses_in_place_ti(input_selection)
         _print_step_header(
             3 if forced_method is None else 2,
@@ -1615,7 +1666,11 @@ def _build_single_free_energy_wizard_config(
                 else "First choose how TI should be implemented. Then pick the snapshot source and confirm the metal-in-water reference settings used for the DeltaG reference leg."
             ),
         )
-        if in_place_ti:
+        if transformation.mode == TIEndpointMode.METAL:
+            ti_implementation_mode = TIImplementationMode.AMBER_12_6_4_GTI
+            ti_decoupling_mode = TIDecouplingMode.COMBINED_Q_VDW
+            console.print("[cyan]Direct metal transformation: Amber 12-6-4 GTI, lambda 0 = source, lambda 1 = end metal.[/cyan]")
+        elif in_place_ti:
             ti_implementation_mode = TIImplementationMode.AMBER_12_6_4_GTI
             ti_decoupling_mode = (
                 TIDecouplingMode.COMBINED_Q_VDW
@@ -1639,14 +1694,13 @@ def _build_single_free_energy_wizard_config(
                 console.print(
                     f"[dim]Batch setting reused: {ti_implementation_mode.value}, {ti_decoupling_mode.value}.[/dim]"
                 )
-        if shared_ti_settings is None:
-            snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
-        else:
-            snapshot_mode = shared_ti_settings.snapshot.mode
-            if snapshot_mode.value == "cluster" and not all(item.stable for item in selected_assessments):
-                snapshot_mode = _prompt_snapshot_mode(selected_stable=False)
-            else:
-                console.print(f"[dim]Batch snapshot setting reused: {snapshot_mode.value}.[/dim]")
+        display_reference_frame_comparison(
+            reference_pdb=reference_structure_path, frame_pdb=last_snapshot["last_snapshot_pdb"],
+            prmtop_path=prmtop_path, candidates=selected_sites, frame_label="Last frame", dry_run=dry_run,
+        )
+        # Inspect and choose the frame for every case, even when other batch TI
+        # settings are shared. Different trajectories need their own assessment.
+        snapshot_mode = _prompt_snapshot_mode(selected_stable=all(item.stable for item in selected_assessments))
         snapshot_time_ns = None
         if snapshot_mode == SnapshotMode.TIME:
             snapshot_time_ns = _prompt_snapshot_time(
@@ -1661,10 +1715,26 @@ def _build_single_free_energy_wizard_config(
                 dry_run=dry_run,
             )
         allow_unstable = _confirm_snapshot_stability(selected_assessments)
+        snapshot_config = SnapshotConfig(
+            mode=snapshot_mode, time_ns=snapshot_time_ns, allow_unstable_last_snapshot=allow_unstable,
+        )
+        restraint_probe = TIWorkflowConfig(
+            complex_input=input_selection.complex_input, snapshot=snapshot_config,
+            metal=MetalSelectionConfig(
+                selection_mode=ti_selection_mode, selected_site=selected.site,
+                selected_sites=[item.site for item in selected_sites],
+            ),
+            ti=TIProtocolConfig(implementation_mode=ti_implementation_mode, decoupling_mode=ti_decoupling_mode),
+            transformation=transformation,
+        )
+        prompt_coordination_restraints(restraint_probe, dry_run=dry_run)
+        ti_implementation_mode = restraint_probe.ti.implementation_mode
+        ti_decoupling_mode = restraint_probe.ti.decoupling_mode
         if shared_ti_settings is None:
             ti_production_ensemble = _prompt_ti_production_ensemble()
             ti_sampling_mode = _prompt_ti_sampling_mode(ti_decoupling_mode)
-            ti_charge_compensation_mode = _prompt_ti_charge_compensation_mode()
+            ti_charge_compensation_mode = (prompt_transformation_charge_compensation()
+                if transformation.mode == TIEndpointMode.METAL else _prompt_ti_charge_compensation_mode())
         else:
             ti_sampling_mode = shared_ti_settings.ti.sampling_mode
             ti_production_ensemble = shared_ti_settings.ti.production_ensemble
@@ -1673,7 +1743,17 @@ def _build_single_free_energy_wizard_config(
                 f"[dim]Batch TI ensemble/sampling/charge settings reused: {ti_production_ensemble.value}, "
                 f"{ti_sampling_mode.value}, {ti_charge_compensation_mode.value}.[/dim]"
             )
-        if in_place_ti:
+        direct_source_charges = {}
+        if transformation.mode == TIEndpointMode.METAL:
+            from amber_metallo.ti.topology import inspect_prmtop_charge_state
+            source_state = inspect_prmtop_charge_state(prmtop_path)
+            direct_source_charges = {item.site: round(source_state.atoms[item.atom_index - 1].charge) for item in selected_sites}
+            formal_charge = direct_source_charges[selected.site]
+            water_model = transformation.for_site(selected.site).water_model
+            water_reference_enabled = typer.confirm("Generate the matching source-to-end metal transformation in water?", default=not in_place_ti)
+            custom_ion_frcmods = []
+            reuse_existing, reuse_from_library, library_key = False, False, None
+        elif in_place_ti:
             formal_charge = _infer_charge_from_selected_site(selected) or default_formal_charge(selected.element)
             water_reference_enabled = typer.confirm(
                 "Generate a metal-in-water reference leg for RBFE analysis?",
@@ -1742,18 +1822,15 @@ def _build_single_free_energy_wizard_config(
         console.print(f"[bold cyan]Output directory:[/bold cyan] {output_dir_path}")
         return FreeEnergyWorkflowConfig(
             complex_input=input_selection.complex_input.model_dump(mode="json"),
-            snapshot=SnapshotConfig(
-                mode=snapshot_mode,
-                time_ns=snapshot_time_ns,
-                allow_unstable_last_snapshot=allow_unstable,
-            ),
+            snapshot=snapshot_config,
+            transformation=transformation,
             metal=MetalSelectionConfig(
                 selection_mode=ti_selection_mode,
                 selected_site=selected.site,
                 selected_sites=[item.site for item in selected_sites],
                 formal_charge=formal_charge,
                 formal_charges_by_site={
-                    item.site: _infer_charge_from_selected_site(item) or default_formal_charge(item.element)
+                    item.site: direct_source_charges.get(item.site) or _infer_charge_from_selected_site(item) or default_formal_charge(item.element)
                     for item in selected_sites
                 },
             ),
@@ -1764,6 +1841,7 @@ def _build_single_free_energy_wizard_config(
                 production_ensemble=ti_production_ensemble,
                 sampling_mode=ti_sampling_mode,
                 charge_compensation_mode=ti_charge_compensation_mode,
+                coordination_restraint=restraint_probe.ti.coordination_restraint,
             ),
             water_reference=WaterReferenceConfig(
                 enabled=water_reference_enabled,
@@ -1958,6 +2036,7 @@ def _build_ti_multi_workflow_result(
     suffixes: list[tuple[str, ...]] = []
     case_plans: list[TIBatchCasePlan] = []
     shared_ti_settings: FreeEnergyWorkflowConfig | None = None
+    transformation_plan: dict = {"multiple_workflows": len(selections) > 1}
 
     for index, input_selection in enumerate(selections, start=1):
         case_label = (
@@ -1978,6 +2057,7 @@ def _build_ti_multi_workflow_result(
             forced_method=FreeEnergyMethod.TI,
             input_selection=input_selection,
             shared_ti_settings=shared_ti_settings,
+            transformation_plan=transformation_plan,
         )
         if shared_ti_settings is None:
             shared_ti_settings = base_config

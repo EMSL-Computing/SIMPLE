@@ -1,5 +1,20 @@
 # Third-Party Notices
 
+## Perkins-inspired ethaline hybrid parameter data
+
+`REF_DATA/Perkins2014_Ethaline_GAFF2` contains factual charge/Lennard-Jones data
+transcribed from Tables S1-S2 of the Supporting Information for Perkins, S. L.;
+Painter, P.; Colina, C. M., *J. Chem. Eng. Data* 2014, 59, 3652-3662,
+https://doi.org/10.1021/je500520h, combined with selected GAFF2 bonded parameter
+values from Amber-MD/AmberClassic and the Amber `parm99.dat` IM chloride LJ entry
+(attributed there to Smith & Dang, J. Chem. Phys. 1994, 100, 3757).
+
+This is an unvalidated SIMPLE hybrid, not the original published force field.
+See its README and `provenance.json` for substitutions, SI ambiguities, numerical
+units, pinned upstream revision, and source/asset hashes. The paper, its SI PDF,
+and complete Amber parameter files are not redistributed here. Starting
+coordinates/connectivity come from the pre-existing SIMPLE component templates.
+
 ## NGL Viewer
 
 SIMPLE includes a minified NGL Viewer browser bundle at

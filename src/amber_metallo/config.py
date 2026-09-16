@@ -26,6 +26,8 @@ class DESComponent(StrEnum):
     ACETONE = "acetone"
     ETHANOL = "ethanol"
     METHANOL = "methanol"
+    CHOLINE_CHLORIDE_PERKINS2014_GAFF2 = "choline_chloride_perkins2014_gaff2"
+    ETHYLENE_GLYCOL_PERKINS2014_GAFF2 = "ethylene_glycol_perkins2014_gaff2"
 
 
 class DESC4ParameterSet(StrEnum):
