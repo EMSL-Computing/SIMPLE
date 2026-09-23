@@ -415,6 +415,8 @@
             <aside id="met_resp_options" class="side-card" hidden>
               <div class="section-title">RESP / Ligand</div>
               <div class="field"><label for="charge_method">Charge fitting</label><select id="charge_method"></select></div>
+              <label class="check nwchem-only"><input id="resp_include_metals" type="checkbox" aria-describedby="resp_scope_note"> Include metals (including REEs) in QM/RESP</label>
+              <div class="small">Uncheck to fit the ligand alone. Metals remain in the simulation structure. Toggling this box adjusts the net charge using the selected metal formal charges; review the spin multiplicity.</div>
               <div id="resp_scope_note" class="infobox small"></div>
               <div id="am1bcc_notice" class="infobox small warn-box" hidden>AM1-BCC uses AmberTools/Antechamber directly during dry-run; it does not write or run an NWChem RESP input.</div>
 

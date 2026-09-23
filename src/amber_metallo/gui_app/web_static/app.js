@@ -352,6 +352,29 @@ function collectSelectedMetalCoordination() {
   };
 }
 
+function setRespMetalInclusion(includeMetals) {
+  const previousMethod = $("charge_method").value;
+  if (previousMethod === "antechamber") return;
+  const previouslyIncluded = previousMethod === "full_resp";
+  if (previouslyIncluded !== includeMetals) {
+    const currentCharge = Number($("net_charge").value);
+    if (!$("net_charge").value.trim() || !Number.isInteger(currentCharge)) {
+      $("resp_include_metals").checked = previouslyIncluded;
+      setStatus("Enter an integer net charge before changing the RESP metal selection.", "error");
+      return;
+    }
+    const selectedCharges = new Map(collectMetalCharges().map(item => [Number(item.atom_index), Number(item.charge)]));
+    const metalCharge = state.metAtoms
+      .filter(atom => SUPPORTED_METALS.has(atom.element))
+      .reduce((total, atom) => total + (selectedCharges.get(Number(atom.index))
+        ?? state.metMetalFormalCharges.get(Number(atom.index)) ?? defaultMetalCharge(atom.element)), 0);
+    $("net_charge").value = String(currentCharge + (includeMetals ? metalCharge : -metalCharge));
+  }
+  $("charge_method").value = includeMetals ? "full_resp" : "resp_antechamber";
+  updateChargeMethodUi(false);
+  setStatus(`RESP will ${includeMetals ? "include" : "exclude"} metals. Net charge: ${$("net_charge").value}. Review the spin multiplicity for the selected QM atoms.`, "warn");
+}
+
 function refreshRespChargeHint() {
   const node = $("resp_charge_hint");
   if (!node) return;
@@ -3277,6 +3300,7 @@ function syncMetMode(clear = true) {
 function updateChargeMethodUi(showNotice = true) {
   const am1bcc = $("charge_method").value === "antechamber";
   const fullResp = $("charge_method").value === "full_resp";
+  $("resp_include_metals").checked = fullResp;
   let qmChanged = false;
   for (const id of ["qm_functional", "qm_resp_functional", "qm_basis", "qm_resp_basis"]) {
     const select = $(id);
@@ -3435,7 +3459,7 @@ function mdStageField(stage, key, value) {
   const help = MD_FIELD_HELP[key] || `${key} override for this AMBER input stage.`;
   const attrs = `class="md-stage-field" title="${escapeHtml(help)}" data-stage="${escapeHtml(stage.name)}" data-key="${escapeHtml(key)}" data-type="${type}" data-default='${escapeHtml(JSON.stringify(value))}'`;
   if (key === "barostat") {
-    return `<select id="${id}" ${attrs}><option value="1">Monte Carlo</option><option value="2">Berendsen</option></select>`;
+    return `<select id="${id}" ${attrs}><option value="1">Berendsen</option><option value="2">Monte Carlo</option></select>`;
   }
   if (key === "ntt") {
     return `<select id="${id}" ${attrs}><option value="3">Langevin</option><option value="1">Berendsen</option><option value="0">None</option></select>`;
@@ -4259,6 +4283,7 @@ function setupEvents() {
   $("protein_insert_element").addEventListener("change", () => updateInsertionChargeControls("protein_insert"));
   $("protein_insert_charge").addEventListener("change", () => updateInsertionChargeControls("protein_insert"));
   $("charge_method").addEventListener("change", () => updateChargeMethodUi(true));
+  $("resp_include_metals").addEventListener("change", () => setRespMetalInclusion($("resp_include_metals").checked));
   $("net_charge").addEventListener("input", refreshRespChargeHint);
   $("multiplicity").addEventListener("input", refreshRespChargeHint);
   $("qm_geometry").addEventListener("change", updateQmGeometryUi);

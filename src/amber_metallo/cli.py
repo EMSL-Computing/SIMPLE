@@ -3039,14 +3039,9 @@ def _nonstandard_molecule_choices(amber_env, *, detected_resp_resume: bool = Fal
 def _charge_method_choices() -> list[WizardChoice]:
     return [
         WizardChoice(
-            ChargeMethod.FULL_RESP.value,
-            "Full RESP",
-            CHARGE_METHOD_DESCRIPTIONS[ChargeMethod.FULL_RESP.value],
-        ),
-        WizardChoice(
             ChargeMethod.RESP_ANTECHAMBER.value,
             "RESP + Antechamber",
-            CHARGE_METHOD_DESCRIPTIONS[ChargeMethod.RESP_ANTECHAMBER.value],
+            "Generate NWChem RESP inputs; choose whether to include metals in QM/RESP in the next step.",
         ),
         WizardChoice(
             ChargeMethod.ANTECHAMBER.value,
@@ -3064,7 +3059,20 @@ def _prompt_charge_method() -> ChargeMethod:
         choices,
         default_key=ChargeMethod.ANTECHAMBER.value,
     )
-    return normalize_charge_method(selected)
+    method = normalize_charge_method(selected)
+    if not charge_method_uses_resp(method):
+        return method
+    include_metals = typer.confirm("Include metals (including REEs) in the QM/RESP calculation?", default=False)
+    console.print(
+        "[dim]Metals are retained separately for the simulation in either case. "
+        + (
+            "In the RESP editor, enter the total metal-ligand complex charge and its spin multiplicity."
+            if include_metals else
+            "In the RESP editor, enter the ligand-only charge and its spin multiplicity, excluding metal charges."
+        )
+        + "[/dim]"
+    )
+    return ChargeMethod.FULL_RESP if include_metals else ChargeMethod.RESP_ANTECHAMBER
 
 
 def _prompt_resp_existing_action(*, has_completed_result: bool) -> RespApplyMode:
